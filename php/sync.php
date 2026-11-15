@@ -606,63 +606,120 @@ if ($method === 'HEAD') {
     respond_if_revoked($state, $now, $lockFp, $commonHeaders, true);
 
     $pubkey = isset($_SERVER['HTTP_X_DROP_PUBKEY']) ? strtolower(trim((string)$_SERVER['HTTP_X_DROP_PUBKEY'])) : '';
-    $channel = isset($_SERVER['HTTP_X_CHANNEL']) ? trim((string)$_SERVER['HTTP_X_CHANNEL']) : '';
-    $prefix = extract_and_validate_prefix();
-
-    if (!preg_match('/^[0-9a-f]{64}$/', $pubkey) || !preg_match('/^[a-z0-9_]{1,32}$/', $channel) || !isset($channels[$channel]) || $prefix === false || ($channel === 'media' && $prefix !== '')) {
+    if (!preg_match('/^[0-9a-f]{64}$/', $pubkey)) {
         if (!$disableRateLimit) {
             $bucket['failCount'] = min(100, $bucket['failCount'] + 1);
             write_ip_bucket($rlFp, $ipBucketIdx, $bucket);
         }
-        sync_respond(403, $lockFp, null, $commonHeaders);
+        sync_respond(400, $lockFp, null, $commonHeaders);
     }
 
-    $channelMembers = load_channel_members($configFile, $channel);
-    if (!in_array($pubkey, $channelMembers, true)) {
-        if (!$disableRateLimit) {
-            $bucket['failCount'] = min(100, $bucket['failCount'] + 1);
-            write_ip_bucket($rlFp, $ipBucketIdx, $bucket);
-        }
-        sync_respond(403, $lockFp, null, $commonHeaders);
+    $channelRaw = isset($_SERVER['HTTP_X_CHANNEL']) ? trim((string)$_SERVER['HTTP_X_CHANNEL']) : '';
+    $channel = ($channelRaw !== '') ? $channelRaw : null;
+    if ($channel !== null && (!preg_match('/^[a-z0-9_]{1,32}$/', $channel) || !isset($channels[$channel]))) {
+        sync_respond(400, $lockFp, null, $commonHeaders);
+    }
+
+    $prefix = extract_and_validate_prefix();
+    if ($prefix === false || ($channel === 'media' && $prefix !== '')) {
+        sync_respond(400, $lockFp, null, $commonHeaders);
+    }
+
+    $mediaIdRaw = isset($_SERVER['HTTP_X_MEDIA_ID']) ? strtolower(trim((string)$_SERVER['HTTP_X_MEDIA_ID'])) : '';
+    $mediaId = ($mediaIdRaw !== '') ? $mediaIdRaw : null;
+    if ($mediaId !== null && !preg_match('/^[0-9a-f]{64}$/', $mediaId)) {
+        sync_respond(400, $lockFp, null, $commonHeaders);
     }
 
     if (!$disableRateLimit) {
         write_ip_bucket($rlFp, $ipBucketIdx, $bucket);
     }
 
-    $slotPath = $dataDir . DIRECTORY_SEPARATOR . build_slot_filename($pubkey, $prefix, $channel);
-    $slotEtag = '';
-    if (file_exists($slotPath)) {
-        clearstatcache(true, $slotPath);
-        $mtime = filemtime($slotPath);
-        $ttlDays = isset($channels[$channel]['ttl_days']) ? (int)$channels[$channel]['ttl_days'] : 30;
-        if ($mtime !== false && ($now - $mtime <= $ttlDays * 86400)) {
-            $slotEtag = hash_file('sha256', $slotPath);
+    $allowedChannels = [];
+    foreach ($channels as $chName => $_chCfg) {
+        $chMembers = load_channel_members($configFile, (string)$chName);
+        if (in_array($pubkey, $chMembers, true)) {
+            $allowedChannels[] = (string)$chName;
+        }
+    }
+
+    $authorized = ($channel !== null)
+        ? in_array($channel, $allowedChannels, true)
+        : !empty($allowedChannels);
+
+    $usedCount = 0;
+    $usedBytes = 0;
+    if (isset($state['media_blobs']) && is_array($state['media_blobs'])) {
+        foreach ($state['media_blobs'] as $mInfo) {
+            if (isset($mInfo['owner']) && $mInfo['owner'] === $pubkey) {
+                $usedCount++;
+                $usedBytes += isset($mInfo['size']) ? (int)$mInfo['size'] : 0;
+            }
         }
     }
 
     $respHeaders = array_merge($commonHeaders, [
-        'X-Drop-Max-Bytes'  => (string)$channels[$channel]['max_bytes'],
-        'X-Drop-TTL-Days'   => (string)$channels[$channel]['ttl_days'],
-        'X-Drop-Slot-Etag'  => $slotEtag !== false ? $slotEtag : '',
+        'Cache-Control'     => 'no-store',
+        'X-Drop-Authorized' => $authorized ? 'true' : 'false',
     ]);
 
-    if ($channel === 'media') {
-        $usedCount = 0;
-        $usedBytes = 0;
-        if (isset($state['media_blobs']) && is_array($state['media_blobs'])) {
-            foreach ($state['media_blobs'] as $mInfo) {
-                if (isset($mInfo['owner']) && $mInfo['owner'] === $pubkey) {
-                    $usedCount++;
-                    $usedBytes += isset($mInfo['size']) ? (int)$mInfo['size'] : 0;
+    if (!empty($allowedChannels)) {
+        $respHeaders['X-Drop-Channels'] = implode(',', $allowedChannels);
+
+        if ($channel !== null && isset($channels[$channel])) {
+            $respHeaders['X-Channel-Max-Bytes'] = (string)$channels[$channel]['max_bytes'];
+            $ttlDays = isset($channels[$channel]['ttl_days']) ? (int)$channels[$channel]['ttl_days'] : 30;
+            if ($ttlDays > 0) {
+                $respHeaders['X-Channel-Ttl-Days'] = (string)$ttlDays;
+            }
+
+            if ($channel === 'media') {
+                if ($mediaId !== null) {
+                    if (isset($state['media_blobs'][$mediaId])) {
+                        $respHeaders['X-Slot-Occupied'] = 'true';
+                        if (isset($state['media_blobs'][$mediaId]['owner']) && $state['media_blobs'][$mediaId]['owner'] === $pubkey) {
+                            $mediaFile = $dataDir . DIRECTORY_SEPARATOR . $mediaId . '.media.bin';
+                            if (file_exists($mediaFile)) {
+                                $mediaEtag = hash_file('sha256', $mediaFile);
+                                if ($mediaEtag !== false) {
+                                    $respHeaders['ETag'] = '"' . $mediaEtag . '"';
+                                }
+                            }
+                        }
+                    } else {
+                        $respHeaders['X-Slot-Occupied'] = 'false';
+                    }
+                }
+            } else {
+                $slotPath = $dataDir . DIRECTORY_SEPARATOR . build_slot_filename($pubkey, $prefix, $channel);
+                $occupied = false;
+                $slotEtag = null;
+                if (file_exists($slotPath)) {
+                    clearstatcache(true, $slotPath);
+                    $mtime = filemtime($slotPath);
+                    if ($mtime !== false && ($ttlDays <= 0 || ($now - $mtime <= $ttlDays * 86400))) {
+                        $occupied = true;
+                        $hashVal = hash_file('sha256', $slotPath);
+                        if ($hashVal !== false) {
+                            $slotEtag = $hashVal;
+                        }
+                    }
+                }
+                $respHeaders['X-Slot-Occupied'] = $occupied ? 'true' : 'false';
+                if ($slotEtag !== null) {
+                    $respHeaders['ETag'] = '"' . $slotEtag . '"';
                 }
             }
         }
-        $respHeaders['X-Drop-Media-Max-Count'] = (string)(isset($channels['media']['max_user_count']) ? (int)$channels['media']['max_user_count'] : 5);
-        $respHeaders['X-Drop-Media-Max-User-Bytes'] = (string)(isset($channels['media']['max_user_bytes']) ? (int)$channels['media']['max_user_bytes'] : 409600);
-        $respHeaders['X-Drop-Media-Used-Count'] = (string)$usedCount;
-        $respHeaders['X-Drop-Media-Used-Bytes'] = (string)$usedBytes;
+
+        if (isset($channels['media'])) {
+            $respHeaders['X-Media-Max-Count'] = (string)(isset($channels['media']['max_user_count']) ? (int)$channels['media']['max_user_count'] : 5);
+            $respHeaders['X-Media-Max-Bytes'] = (string)(isset($channels['media']['max_user_bytes']) ? (int)$channels['media']['max_user_bytes'] : 409600);
+        }
     }
+
+    $respHeaders['X-Media-Count'] = (string)$usedCount;
+    $respHeaders['X-Media-Bytes'] = (string)$usedBytes;
 
     sync_respond(200, $lockFp, null, $respHeaders);
 }

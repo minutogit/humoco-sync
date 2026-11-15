@@ -62,8 +62,8 @@ return [
 
     // Configured channels: max byte sizes and retention TTL
     'channels' => [
-        'card'   => ['max_bytes' => 65536,   'ttl_days' => 30],
-        'wot'    => ['max_bytes' => 131072,  'ttl_days' => 30],
+        'card'   => ['max_bytes' => 524288,  'ttl_days' => 30],
+        'wot'    => ['max_bytes' => 524288,  'ttl_days' => 30],
         'backup' => ['max_bytes' => 5242880, 'ttl_days' => 180],
         'post'   => ['max_bytes' => 524288,  'ttl_days' => 21],
     ],
@@ -79,7 +79,7 @@ All mutating requests must use custom HTTP headers:
 | Method & Route | Required Headers | Description |
 |---|---|---|
 | `GET sync.php?info` | – | Self-description: returns `drop_pub`, `read_url`, `register_url`, `channels`. |
-| `HEAD sync.php` | `X-Drop-Pubkey`, `X-Channel` | Capability check: returns `200 OK` with `X-Drop-Max-Bytes`, `X-Drop-TTL-Days`, `X-Drop-Slot-Etag` if member; `403` otherwise. |
+| `HEAD sync.php` | `X-Drop-Pubkey` *(optional: `X-Channel`, `X-Drop-Prefix`, `X-Media-Id`)* | Capability check: returns `200 OK` with `X-Drop-Authorized: true\|false`, `X-Drop-Channels`, `X-Channel-Max-Bytes`, `X-Channel-Ttl-Days`, `X-Slot-Occupied`, `ETag`, and `X-Media-*` headers (`400` on invalid header syntax). |
 | `PUT sync.php` | `X-Drop-Pubkey`, `X-Channel`, `X-Drop-Timestamp`, `X-Drop-Nonce`, `X-Drop-Signature`, optional `If-Match` | Raw binary slot upload. Enforces content length, replay nonce, `If-Match` concurrency, and global quota. |
 | `DELETE sync.php` | `X-Drop-Pubkey`, `X-Channel`, `X-Drop-Timestamp`, `X-Drop-Nonce`, `X-Drop-Signature` | Member slot deletion. |
 | `PUT sync.php?members&channel=<name>` | `X-Drop-Pubkey`, `X-Drop-Timestamp`, `X-Drop-Nonce`, `X-Drop-Signature`, Body: `{"pubkeys": [...]}` | Admin updates member list. Prunes slots for removed keys. |

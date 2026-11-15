@@ -156,6 +156,12 @@ run_blackbox_protocol_suite() {
   local auth_headers
   auth_headers="$(curl -sI -H "X-Drop-Pubkey: $friend_pk" -H "X-Channel: card" "$endpoint" | tr -d '\r')"
   assert_contains "$auth_headers" "x-drop-authorized: true" "HEAD returns authorized=true after PUT ?members"
+  local expected_card_max="524288"
+  if [[ "$label" == "rust" ]]; then
+    expected_card_max="1048576"
+  fi
+  assert_contains "$auth_headers" "x-channel-max-bytes: ${expected_card_max}" "HEAD returns X-Channel-Max-Bytes for authorized card channel"
+  assert_contains "$auth_headers" "x-slot-occupied: false" "HEAD returns X-Slot-Occupied: false before upload"
 
   echo "=== Group 3 ($label): Slot PUT, index.json, ETag, 304, 412 ==="
   printf 'ciphertext-v1' > "$TMP_ROOT/card1.bin"

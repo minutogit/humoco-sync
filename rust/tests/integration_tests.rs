@@ -193,6 +193,28 @@ async fn test_1_wire_parity_and_delete_account() {
         .unwrap();
     assert_eq!(pm_resp.status().as_u16(), 200);
 
+    let head_auth = srv
+        .client
+        .head(format!("{}/sync.php", srv.base_url))
+        .header("X-Drop-Pubkey", &friend_pk)
+        .header("X-Channel", "card")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head_auth.status().as_u16(), 200);
+    assert_eq!(
+        head_auth.headers().get("X-Drop-Authorized").unwrap().to_str().unwrap(),
+        "true"
+    );
+    assert_eq!(
+        head_auth.headers().get("X-Channel-Max-Bytes").unwrap().to_str().unwrap(),
+        "1048576"
+    );
+    assert_eq!(
+        head_auth.headers().get("X-Slot-Occupied").unwrap().to_str().unwrap(),
+        "false"
+    );
+
     // Replay same nonce -> 409 Conflict
     let nonce_replay_body =
         serde_json::to_vec(&serde_json::json!({ "pubkeys": [friend_pk] })).unwrap();

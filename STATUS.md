@@ -10,6 +10,7 @@
 
 | ID | Task | Status | Notes |
 |---|---|---|---|
+| `SYNC-005` | Raise PHP `card`/`wot` defaults to `512 KiB` & harmonize `HEAD` headers (`X-Channel-Max-Bytes`, `ETag`, `X-Drop-Authorized`) across PHP & Rust (`SPEC.md`) | ✅ **Done** | PHP `card`/`wot` defaults at `512 KiB` + unified `HEAD` headers across PHP/Rust/`SPEC.md`; 39/39 Rust blackbox assertions (`tests/run.sh --target rust`), 4/4 Rust integration tests, and `clippy` (0 warnings) passed (PHP CLI not installed locally) |
 | `SYNC-001` | Extract `php/` from `human-money-app`, author `SPEC.md`, add `DELETE ?account` | ✅ **Done** | Single source of truth for PHP & Rust |
 | `SYNC-002` | Rust Daemon Core (`axum`, `tokio`, `redb`, RAM rate-limiter, streaming `PUT`, Prio-3 eviction, Hybrid separation) | ✅ **Done** | `#![forbid(unsafe_code)]`, 100% `sync.php` wire parity (both `/sync.php` & `/sync`), pure-public `drop_pub` synthesis |
 | `SYNC-003` | Quota Profiles, Storage Pool Isolation, Anti-Spam Gates (Zero-PII Email HMAC, Codes, PoW), Built-in Web UI & Admin API | ✅ **Done** | `/register`, `/admin`, `/api/v1/admin/*`, `XChaCha20-Poly1305` optional email cipher, `downgrade_grace_days` |

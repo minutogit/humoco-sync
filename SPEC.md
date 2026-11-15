@@ -11,7 +11,7 @@ Both `/sync.php` and `/sync` accept identical query parameters and HTTP methods.
 | Operation | Method & Route | Auth Scope |
 |---|---|---|
 | Server discovery | `GET /sync.php?info` | Public (IP rate-limited) |
-| Slot capability & ETag check | `HEAD /sync.php` | Member pubkey header |
+| Slot capability & ETag check | `HEAD /sync.php` | Member pubkey header (`X-Drop-Authorized`) |
 | Upload binary slot or media | `PUT /sync.php` | Member Ed25519 signature |
 | Delete slot or media | `DELETE /sync.php` | Member Ed25519 signature |
 | Delete entire account & blobs | `DELETE /sync.php?account` | Account Ed25519 signature |
@@ -80,6 +80,18 @@ Empty body SHA-256 hex digest: `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934c
    ```text
    HUMOCO-DROP-REVOKE-V1\n<drop_pub>\n<issued_at>\n<effective_at>\n<rep_write>\n<rep_read>\n<rep_pub>\n<reason>
    ```
+
+### 2.3 Canonical `HEAD` Capability & Conditional `GET` Headers
+
+Both `php/sync.php` and `rust/humoco-sync-server` respond identically to `HEAD /sync.php` (`HEAD /sync`):
+
+- **Request Headers:** `X-Drop-Pubkey` (required, 64-hex); optional `X-Channel`, `X-Drop-Prefix` (disallowed on `media`), and `X-Media-Id`. Invalid header syntax returns `400 Bad Request`.
+- **Response (`200 OK`, `Cache-Control: no-store`):**
+  - `X-Drop-Authorized`: `true` or `false` (valid non-member pubkeys receive `200 OK` with `X-Drop-Authorized: false`, not `403`).
+  - `X-Drop-Channels` *(when member)*: comma-separated authorized channels.
+  - `X-Channel-Max-Bytes`, `X-Channel-Ttl-Days` *(if `ttl_days > 0`)*, `X-Slot-Occupied` (`true|false`), and `ETag` (`"<sha256_hex>"`, when slot exists and is owned by `X-Drop-Pubkey`) *(when authorized/configured and `X-Channel` is provided)*.
+  - `X-Media-Count`, `X-Media-Bytes`, plus `X-Media-Max-Count` and `X-Media-Max-Bytes` *(when authorized)*.
+- **Static Conditional Reads (`GET <read_url>/...`):** Servers emit `ETag: "<sha256_hex>"` and return `304 Not Modified` when `If-None-Match` matches. Default PHP quotas align `card` and `wot` at `524288` bytes (512 KiB).
 
 ---
 
