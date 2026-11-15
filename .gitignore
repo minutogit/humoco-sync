@@ -1,0 +1,24 @@
+# Rust build & test artifacts
+/rust/target/
+**/*.rs.bk
+
+# PHP runtime & state files
+*.state.php
+.state.php
+ratelimit.bin.php
+members.*.php
+.lock
+*.tmp*
+
+# Databases and slot storage
+*.db
+*.redb
+/data/
+/d-*
+/storage/
+/php/d-*
+/php/data/
+
+# Local configs containing secrets
+config.local.toml
+/php/config.local.php

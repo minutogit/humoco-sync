@@ -1,0 +1,27 @@
+# Multi-stage build for humoco-sync-server
+FROM rust:1.86-bookworm AS builder
+
+WORKDIR /src
+COPY rust/Cargo.toml rust/Cargo.lock* ./
+COPY rust/src ./src
+RUN cargo build --release --locked 2>/dev/null || cargo build --release
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 --create-home humoco
+
+WORKDIR /var/lib/humoco-sync
+COPY --from=builder /src/target/release/humoco-sync-server /usr/local/bin/humoco-sync-server
+COPY config.example.toml /etc/humoco-sync/config.example.toml
+
+RUN chown -R humoco:humoco /var/lib/humoco-sync /etc/humoco-sync
+USER humoco
+
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD curl -sf http://127.0.0.1:8080/sync.php?info >/dev/null || exit 1
+
+ENTRYPOINT ["/usr/local/bin/humoco-sync-server"]
+CMD ["serve", "--config", "/etc/humoco-sync/config.toml", "--bind", "0.0.0.0:8080"]

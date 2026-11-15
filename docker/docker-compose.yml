@@ -1,0 +1,29 @@
+services:
+  humoco-sync:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: humoco-sync-server
+    restart: unless-stopped
+    volumes:
+      - ../config.toml:/etc/humoco-sync/config.toml:ro
+      - humoco_sync_data:/var/lib/humoco-sync/data
+    ports:
+      - "127.0.0.1:8080:8080"
+
+  # Optional automatic HTTPS reverse proxy (uncomment & create Caddyfile):
+  # caddy:
+  #   image: caddy:2-alpine
+  #   restart: unless-stopped
+  #   ports:
+  #     - "80:80"
+  #     - "443:443"
+  #   volumes:
+  #     - ./Caddyfile:/etc/caddy/Caddyfile:ro
+  #     - caddy_data:/data
+  #     - caddy_config:/config
+  #   depends_on:
+  #     - humoco-sync
+
+volumes:
+  humoco_sync_data:

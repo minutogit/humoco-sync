@@ -1,0 +1,30 @@
+[Unit]
+Description=HuMoCo Sync Drop Server (Rust)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=humoco-sync
+Group=humoco-sync
+WorkingDirectory=/var/lib/humoco-sync
+ExecStart=/usr/local/bin/humoco-sync-server serve --config /etc/humoco-sync/config.toml
+Restart=on-failure
+RestartSec=3
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/humoco-sync
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target
