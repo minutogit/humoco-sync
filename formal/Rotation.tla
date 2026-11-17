@@ -17,7 +17,7 @@ CONSTANTS
     StandbyPool,      \* e.g. {"s4", "s5"} (s4 for Creator, s5 for Guarantor)
     CreatorExtra,     \* e.g. "s6" (creator-controlled server outside declared G1 successor)
     QOld,             \* e.g. 2 for 2/3
-    TimelockTicks,    \* e.g. 3 (abstracts 72h timelock)
+    TimelockTicks,    \* e.g. 2 (abstracts 72h timelock)
     MaxPreFreezeAge   \* e.g. 2 (abstracts 30 min pre-proposal freeze TTL)
 
 AllServers == OldCommittee \cup StandbyPool \cup {CreatorExtra}
@@ -27,9 +27,17 @@ Locks == {"L1", "L2"} \* Lock L1 has a QC on OldCommittee; L2 may be unconfirmed
 \* Initial slot ownership in Rev 1:
 \* Slot 1 ("s1") nominated by Creator (standby "s4")
 \* Slot 2 ("s2") nominated by Guarantor G1 (standby "s5")
-\* Slot 3 ("s3") nominated by Creator (no standby needed for small model)
+\* Slot 3 ("s3") nominated by Creator
 InitG1Server == "s2"
 DeclaredG1Successor == "s5"
+
+DummyProposal == [
+    proposer |-> "Creator",
+    target |-> OldCommittee,
+    g1SlotServer |-> InitG1Server,
+    coSignedG1 |-> FALSE,
+    retainMatch |-> TRUE
+]
 
 VARIABLES
     honestOldStore,   \* [OldCommittee -> SUBSET Locks]
@@ -37,16 +45,12 @@ VARIABLES
     freezeState,      \* [OldCommittee -> {"none", "pre", "permanent"}]
     freezeAge,        \* [OldCommittee -> 0..MaxPreFreezeAge]
     creatorInactive,  \* BOOLEAN (true after 30 days creator inactivity)
-    votedProposal,    \* Record or "NULL":
-                      \*   [proposer: {"Creator", "G1", "Holder"},
-                      \*    target: SUBSET AllServers,
-                      \*    g1SlotServer: AllServers,
-                      \*    coSignedG1: BOOLEAN,
-                      \*    usesDeclaredSuccessors: BOOLEAN,
-                      \*    retainMatch: BOOLEAN]
+    hasProposal,      \* BOOLEAN (whether votedProposal is populated)
+    votedProposal,    \* Record of Proposal structure
     timelockAge,      \* 0..TimelockTicks
     vetoed,           \* BOOLEAN
-    snapshots,        \* [OldCommittee -> SUBSET Locks \cup {"NONE"}]
+    hasSnapshot,      \* [OldCommittee -> BOOLEAN]
+    snapshots,        \* [OldCommittee -> SUBSET Locks]
     importAcks,       \* SUBSET AllServers (target servers that verified and acked import)
     importedUnion,    \* [AllServers -> SUBSET Locks]
     epochCommitted,   \* BOOLEAN
@@ -55,7 +59,8 @@ VARIABLES
 
 vars == <<
     honestOldStore, crashed, freezeState, freezeAge, creatorInactive,
-    votedProposal, timelockAge, vetoed, snapshots, importAcks,
+    hasProposal, votedProposal, timelockAge, vetoed,
+    hasSnapshot, snapshots, importAcks,
     importedUnion, epochCommitted, committedTargets, committedG1Server
 >>
 
@@ -70,10 +75,12 @@ Init ==
     /\ freezeState = [s \in OldCommittee |-> "none"]
     /\ freezeAge = [s \in OldCommittee |-> 0]
     /\ creatorInactive \in BOOLEAN
-    /\ votedProposal = "NULL"
+    /\ hasProposal = FALSE
+    /\ votedProposal = DummyProposal
     /\ timelockAge = 0
     /\ vetoed = FALSE
-    /\ snapshots = [s \in OldCommittee |-> "NONE"]
+    /\ hasSnapshot = [s \in OldCommittee |-> FALSE]
+    /\ snapshots = [s \in OldCommittee |-> {}]
     /\ importAcks = {}
     /\ importedUnion = [s \in AllServers |-> {}]
     /\ epochCommitted = FALSE
@@ -86,8 +93,16 @@ TypeOK ==
     /\ freezeState \in [OldCommittee -> {"none", "pre", "permanent"}]
     /\ freezeAge \in [OldCommittee -> 0..MaxPreFreezeAge]
     /\ creatorInactive \in BOOLEAN
+    /\ hasProposal \in BOOLEAN
+    /\ votedProposal.proposer \in {"Creator", "G1", "Holder"}
+    /\ votedProposal.target \subseteq AllServers
+    /\ votedProposal.g1SlotServer \in AllServers
+    /\ votedProposal.coSignedG1 \in BOOLEAN
+    /\ votedProposal.retainMatch \in BOOLEAN
     /\ timelockAge \in 0..TimelockTicks
     /\ vetoed \in BOOLEAN
+    /\ hasSnapshot \in [OldCommittee -> BOOLEAN]
+    /\ snapshots \in [OldCommittee -> SUBSET Locks]
     /\ importAcks \subseteq AllServers
     /\ importedUnion \in [AllServers -> SUBSET Locks]
     /\ epochCommitted \in BOOLEAN
@@ -99,31 +114,34 @@ CrashOldServer(s) ==
     /\ s \in OldCommittee \ crashed
     /\ Cardinality(OldCommittee \ (crashed \cup {s})) >= QOld
     /\ crashed' = crashed \cup {s}
-    /\ UNCHANGED <<honestOldStore, freezeState, freezeAge, creatorInactive, votedProposal,
-                   timelockAge, vetoed, snapshots, importAcks, importedUnion,
+    /\ UNCHANGED <<honestOldStore, freezeState, freezeAge, creatorInactive,
+                   hasProposal, votedProposal, timelockAge, vetoed,
+                   hasSnapshot, snapshots, importAcks, importedUnion,
                    epochCommitted, committedTargets, committedG1Server>>
 
 \* Pre-proposal freeze (phase 1a): allowed before proposal; expires after MaxPreFreezeAge
 PreProposalFreeze(s) ==
     /\ s \in OldCommittee \ crashed
     /\ ~epochCommitted
-    /\ votedProposal = "NULL"
+    /\ ~hasProposal
     /\ freezeState[s] = "none"
     /\ freezeState' = [freezeState EXCEPT ![s] = "pre"]
     /\ freezeAge' = [freezeAge EXCEPT ![s] = 0]
-    /\ UNCHANGED <<honestOldStore, crashed, creatorInactive, votedProposal,
-                   timelockAge, vetoed, snapshots, importAcks, importedUnion,
+    /\ UNCHANGED <<honestOldStore, crashed, creatorInactive,
+                   hasProposal, votedProposal, timelockAge, vetoed,
+                   hasSnapshot, snapshots, importAcks, importedUnion,
                    epochCommitted, committedTargets, committedG1Server>>
 
 PreProposalFreezeExpires(s) ==
     /\ s \in OldCommittee
-    /\ votedProposal = "NULL"
+    /\ ~hasProposal
     /\ freezeState[s] = "pre"
     /\ freezeAge[s] = MaxPreFreezeAge
     /\ freezeState' = [freezeState EXCEPT ![s] = "none"]
     /\ freezeAge' = [freezeAge EXCEPT ![s] = 0]
-    /\ UNCHANGED <<honestOldStore, crashed, creatorInactive, votedProposal,
-                   timelockAge, vetoed, snapshots, importAcks, importedUnion,
+    /\ UNCHANGED <<honestOldStore, crashed, creatorInactive,
+                   hasProposal, votedProposal, timelockAge, vetoed,
+                   hasSnapshot, snapshots, importAcks, importedUnion,
                    epochCommitted, committedTargets, committedG1Server>>
 
 \* Nomination binding predicate checked by servers and clients (Concept Section 5.4):
@@ -134,108 +152,117 @@ ValidNominationBinding(g1Srv, coSignedG1) ==
     \/ g1Srv = DeclaredG1Successor
     \/ coSignedG1 = TRUE
 
-\* Submit a rotation proposal (only 1 per revision via votedProposal = "NULL" guard).
+\* Submit a rotation proposal (only 1 per revision via ~hasProposal guard).
 SubmitProposal(proposer, g1Srv, coSignedG1, retainMatch) ==
     /\ ~epochCommitted
-    /\ votedProposal = "NULL"
+    /\ ~hasProposal
     /\ ~vetoed
     /\ ( \/ proposer = "Creator"
          \/ (proposer = "G1" /\ creatorInactive)
-         \/ (proposer = "Holder" /\ g1Srv \in {InitG1Server, DeclaredG1Successor}) )
+         \/ (proposer = "Holder" /\ g1Srv \in {InitG1Server, DeclaredG1Successor} /\ ~coSignedG1) )
     /\ retainMatch = TRUE
     \* Servers themselves verify Nomination Binding before accepting into votedProposal:
     /\ ValidNominationBinding(g1Srv, coSignedG1)
     /\ LET tgt == (OldCommittee \ {InitG1Server}) \cup {g1Srv}
-       IN  votedProposal' = [
-             proposer |-> proposer,
-             target |-> tgt,
-             g1SlotServer |-> g1Srv,
-             coSignedG1 |-> coSignedG1,
-             retainMatch |-> retainMatch
-           ]
+       IN  /\ hasProposal' = TRUE
+           /\ votedProposal' = [
+                proposer |-> proposer,
+                target |-> tgt,
+                g1SlotServer |-> g1Srv,
+                coSignedG1 |-> coSignedG1,
+                retainMatch |-> retainMatch
+              ]
     \* Any pre-existing freeze turns permanent while proposal is pending:
     /\ freezeState' = [s \in OldCommittee |->
           IF freezeState[s] = "pre" THEN "permanent" ELSE freezeState[s]]
     /\ timelockAge' = 0
     /\ UNCHANGED <<honestOldStore, crashed, freezeAge, creatorInactive, vetoed,
-                   snapshots, importAcks, importedUnion, epochCommitted,
-                   committedTargets, committedG1Server>>
+                   hasSnapshot, snapshots, importAcks, importedUnion,
+                   epochCommitted, committedTargets, committedG1Server>>
 
 \* Another authority vetoes during the 72h timelock window (Concept Section 5.4/5.5)
 VetoProposal(vetoer) ==
     /\ ~epochCommitted
-    /\ votedProposal /= "NULL"
+    /\ hasProposal
     /\ timelockAge < TimelockTicks
     /\ vetoer \in Authorities
     /\ vetoer /= votedProposal.proposer
     /\ vetoed' = TRUE
-    /\ votedProposal' = "NULL"
+    /\ hasProposal' = FALSE
     /\ freezeState' = [s \in OldCommittee |-> "none"]
-    /\ snapshots' = [s \in OldCommittee |-> "NONE"]
+    /\ freezeAge' = [s \in OldCommittee |-> 0]
+    /\ hasSnapshot' = [s \in OldCommittee |-> FALSE]
+    /\ snapshots' = [s \in OldCommittee |-> {}]
     /\ importAcks' = {}
-    /\ UNCHANGED <<honestOldStore, crashed, freezeAge, creatorInactive,
+    /\ UNCHANGED <<honestOldStore, crashed, creatorInactive, votedProposal,
                    timelockAge, importedUnion, epochCommitted,
                    committedTargets, committedG1Server>>
 
 \* Time advances both pre-proposal freeze ages and proposal timelock
 TickTime ==
     /\ ~epochCommitted
-    /\ \/ /\ votedProposal = "NULL"
+    /\ \/ /\ ~hasProposal
           /\ \E s \in OldCommittee : freezeState[s] = "pre" /\ freezeAge[s] < MaxPreFreezeAge
           /\ freezeAge' = [s \in OldCommittee |->
                 IF freezeState[s] = "pre" /\ freezeAge[s] < MaxPreFreezeAge
                 THEN freezeAge[s] + 1 ELSE freezeAge[s]]
           /\ UNCHANGED timelockAge
-       \/ /\ votedProposal /= "NULL"
+       \/ /\ hasProposal
           /\ timelockAge < TimelockTicks
           /\ timelockAge' = timelockAge + 1
           /\ UNCHANGED freezeAge
-    /\ UNCHANGED <<honestOldStore, crashed, freezeState, creatorInactive, votedProposal,
-                   vetoed, snapshots, importAcks, importedUnion,
+    /\ UNCHANGED <<honestOldStore, crashed, freezeState, creatorInactive,
+                   hasProposal, votedProposal, vetoed,
+                   hasSnapshot, snapshots, importAcks, importedUnion,
                    epochCommitted, committedTargets, committedG1Server>>
 
 \* Phase 1 (?lock_freeze): Old servers permanently freeze after proposal and emit snapshot
 PermanentFreezeAndSnapshot(s) ==
     /\ ~epochCommitted
-    /\ votedProposal /= "NULL"
+    /\ hasProposal
     /\ s \in OldCommittee \ crashed
+    /\ (freezeState[s] /= "permanent" \/ ~hasSnapshot[s])
     /\ freezeState' = [freezeState EXCEPT ![s] = "permanent"]
+    /\ hasSnapshot' = [hasSnapshot EXCEPT ![s] = TRUE]
     /\ snapshots' = [snapshots EXCEPT ![s] = honestOldStore[s]]
-    /\ UNCHANGED <<honestOldStore, crashed, freezeAge, creatorInactive, votedProposal,
-                   timelockAge, vetoed, importAcks, importedUnion,
-                   epochCommitted, committedTargets, committedG1Server>>
+    /\ UNCHANGED <<honestOldStore, crashed, freezeAge, creatorInactive,
+                   hasProposal, votedProposal, timelockAge, vetoed,
+                   importAcks, importedUnion, epochCommitted,
+                   committedTargets, committedG1Server>>
 
 \* Phase 2 (?lock_import): Target server validates timelock, nomination binding,
 \* QOld snapshots, and computes union over all surviving snapshots.
 TargetImport(t) ==
     /\ ~epochCommitted
-    /\ votedProposal /= "NULL"
+    /\ hasProposal
     /\ timelockAge >= TimelockTicks
     /\ t \in votedProposal.target
     /\ t \notin importAcks
     /\ votedProposal.retainMatch = TRUE
     /\ ValidNominationBinding(votedProposal.g1SlotServer, votedProposal.coSignedG1)
-    /\ LET readyOld == {s \in OldCommittee : snapshots[s] /= "NONE"}
+    /\ LET readyOld == {s \in OldCommittee : hasSnapshot[s]}
        IN  /\ Cardinality(readyOld) >= QOld
            /\ LET unionLocks == UNION {snapshots[s] : s \in readyOld}
               IN  /\ importedUnion' = [importedUnion EXCEPT ![t] = unionLocks]
                   /\ importAcks' = importAcks \cup {t}
     /\ UNCHANGED <<honestOldStore, crashed, freezeState, freezeAge, creatorInactive,
-                   votedProposal, timelockAge, vetoed, snapshots, epochCommitted,
+                   hasProposal, votedProposal, timelockAge, vetoed,
+                   hasSnapshot, snapshots, epochCommitted,
                    committedTargets, committedG1Server>>
 
 \* Phase 3 (?lock_commit): Once all targets acked, QOld old servers commit MigrationCert
 CommitMigration ==
     /\ ~epochCommitted
-    /\ votedProposal /= "NULL"
+    /\ hasProposal
     /\ votedProposal.target \subseteq importAcks
-    /\ LET frozenOld == {s \in OldCommittee \ crashed : freezeState[s] = "permanent" /\ snapshots[s] /= "NONE"}
+    /\ LET frozenOld == {s \in OldCommittee \ crashed : freezeState[s] = "permanent" /\ hasSnapshot[s]}
        IN  Cardinality(frozenOld) >= QOld
     /\ epochCommitted' = TRUE
     /\ committedTargets' = committedTargets \cup {votedProposal.target}
     /\ committedG1Server' = votedProposal.g1SlotServer
     /\ UNCHANGED <<honestOldStore, crashed, freezeState, freezeAge, creatorInactive,
-                   votedProposal, timelockAge, vetoed, snapshots, importAcks, importedUnion>>
+                   hasProposal, votedProposal, timelockAge, vetoed,
+                   hasSnapshot, snapshots, importAcks, importedUnion>>
 
 Next ==
     \/ \E s \in OldCommittee : CrashOldServer(s)
@@ -265,23 +292,29 @@ UniqueCommittedNextRevision ==
 \* 3. A Guarantor slot is NEVER replaced by an unendorsed Creator-controlled server:
 GuarantorNominationBindingPreserved ==
     epochCommitted =>
-      (committedG1Server /= CreatorExtra \/ (votedProposal /= "NULL" /\ votedProposal.coSignedG1))
+      (committedG1Server /= CreatorExtra \/ (hasProposal /\ votedProposal.coSignedG1))
 
 \* 4. No permanent freeze without an active proposal:
 NoPermanentFreezeWithoutProposal ==
     \A s \in OldCommittee :
-      (freezeState[s] = "permanent") => (votedProposal /= "NULL")
+      (freezeState[s] = "permanent") => hasProposal
 
 \* --- LIVENESS ---
 
-\* Under weak fairness, once a non-vetoed valid proposal is submitted and at least
-\* QOld old servers remain alive, rotation eventually commits.
+\* Under weak fairness:
+\*   1) Once a non-vetoed valid proposal is submitted and >= QOld old servers survive,
+\*      rotation eventually commits (unless vetoed).
+\*   2) Any pre-proposal freeze without a proposal eventually expires (no permanent DoS).
 LiveSpec == Spec /\ WF_vars(TickTime)
-                 /\ \A s \in OldCommittee : WF_vars(PermanentFreezeAndSnapshot(s))
+                 /\ \A sp \in OldCommittee : WF_vars(PreProposalFreezeExpires(sp))
+                 /\ \A sf \in OldCommittee : WF_vars(PermanentFreezeAndSnapshot(sf))
                  /\ \A t \in AllServers : WF_vars(TargetImport(t))
                  /\ WF_vars(CommitMigration)
 
 RotationEventuallyCompletes ==
-    (votedProposal /= "NULL" /\ ~vetoed) ~> (epochCommitted \/ vetoed)
+    (hasProposal /\ ~vetoed) ~> (epochCommitted \/ vetoed)
+
+PreFreezeEventuallyExpires ==
+    \A s \in OldCommittee : (freezeState[s] = "pre") ~> (freezeState[s] /= "pre")
 
 =============================================================================

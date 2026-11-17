@@ -18,7 +18,7 @@ CONSTANTS
     Q,                \* Quorum threshold, e.g. 3 for 3/4 (2Q - N >= 1)
     MaxHop            \* Max hop depth modeled, e.g. 3
 
-TxValues == {"TxA", "TxB"}
+TxValues == {"TxP", "TxA", "TxB"}
 Hops == 1..MaxHop
 
 ASSUME ByzServers \subseteq Servers
@@ -30,27 +30,34 @@ ASSUME MaxHop \in 1..3
 
 \* Honest servers hold at most one Write-Once entry per slot (first writer wins).
 \* Byzantine servers can record distinct receipts issued to different merchants.
+\* forkHop models the hop depth where two conflicting branches ("TxA" vs "TxB")
+\* diverge after sharing an honest Leap-Lock prefix ("TxP") on 1..(forkHop - 1).
 VARIABLES
+    forkHop,          \* Depth in Hops where M1 ("TxA") and M2 ("TxB") diverge
     honestStore,      \* [Servers -> [Hops -> TxValues \cup {"NONE"}]]
-    crashed,          \* Subset of Servers currently unreachable / offline
+    crashed,          \* Subset of Servers currently unreachable / offline (<= 1)
     receiptsM1,       \* Subset of [server: Servers, hop: Hops, tx: TxValues]
     receiptsM2,       \* Subset of [server: Servers, hop: Hops, tx: TxValues]
     conflictsSeenM1,  \* Subset of [server: Servers, hop: Hops, tx: TxValues]
     conflictsSeenM2,  \* Subset of [server: Servers, hop: Hops, tx: TxValues]
     greenM1,          \* Subset of Hops marked Green by Merchant 1
     greenM2,          \* Subset of Hops marked Green by Merchant 2
-    intentDoneM1,     \* Subset of Hops for which M1 finished completion to all live servers
-    intentDoneM2      \* Subset of Hops for which M2 finished completion to all live servers
+    intentDoneM1,     \* Subset of Hops for which M1 finished completion to all live honest servers
+    intentDoneM2      \* Subset of Hops for which M2 finished completion to all live honest servers
 
 vars == <<
-    honestStore, crashed,
+    forkHop, honestStore, crashed,
     receiptsM1, receiptsM2,
     conflictsSeenM1, conflictsSeenM2,
     greenM1, greenM2,
     intentDoneM1, intentDoneM2
 >>
 
+ExpectedTxM1(h) == IF h < forkHop THEN "TxP" ELSE "TxA"
+ExpectedTxM2(h) == IF h < forkHop THEN "TxP" ELSE "TxB"
+
 TypeOK ==
+    /\ forkHop \in Hops
     /\ honestStore \in [Servers -> [Hops -> TxValues \cup {"NONE"}]]
     /\ crashed \subseteq Servers
     /\ receiptsM1 \subseteq [server: Servers, hop: Hops, tx: TxValues]
@@ -63,6 +70,7 @@ TypeOK ==
     /\ intentDoneM2 \subseteq Hops
 
 Init ==
+    /\ forkHop \in Hops
     /\ honestStore = [s \in Servers |-> [h \in Hops |-> "NONE"]]
     /\ crashed = {}
     /\ receiptsM1 = {}
@@ -75,50 +83,53 @@ Init ==
     /\ intentDoneM2 = {}
 
 \* Causal prerequisite for Leap-Lock: locking hop h requires all ancestor hops
-\* 1..(h-1) to be either already locked with the same or ancestor chain.
-\* In a double-spend race on hop h, M1 submits TxA on hop h and M2 submits TxB on hop h.
-LockRequestM1(s, h, tx) ==
-    /\ s \notin crashed
-    /\ tx = "TxA"
-    /\ \A prev \in 1..(h - 1) :
-          (\E r \in receiptsM1 : r.server = s /\ r.hop = prev)
-          \/ (honestStore[s][prev] /= "NONE")
-    /\ IF s \notin ByzServers
-       THEN
-         IF honestStore[s][h] = "NONE" \/ honestStore[s][h] = tx
-         THEN /\ honestStore' = [honestStore EXCEPT ![s][h] = tx]
-              /\ receiptsM1' = receiptsM1 \cup {[server |-> s, hop |-> h, tx |-> tx]}
-              /\ UNCHANGED conflictsSeenM1
-         ELSE /\ conflictsSeenM1' = conflictsSeenM1 \cup {[server |-> s, hop |-> h, tx |-> honestStore[s][h]]}
-              /\ UNCHANGED <<honestStore, receiptsM1>>
-       ELSE
-         \* Byzantine server may arbitrarily issue FirstWrite for tx OR report conflict
-         \/ /\ receiptsM1' = receiptsM1 \cup {[server |-> s, hop |-> h, tx |-> tx]}
-            /\ UNCHANGED <<honestStore, conflictsSeenM1>>
-         \/ /\ conflictsSeenM1' = conflictsSeenM1 \cup {[server |-> s, hop |-> h, tx |-> "TxB"]}
-            /\ UNCHANGED <<honestStore, receiptsM1>>
-    /\ UNCHANGED <<crashed, receiptsM2, conflictsSeenM2, greenM1, greenM2, intentDoneM1, intentDoneM2>>
+\* 1..(h-1) on an honest server to hold the caller's exact ancestor chain.
+LockRequestM1(s, h) ==
+    LET tx == ExpectedTxM1(h)
+    IN  /\ s \notin crashed
+        /\ ~(\E r \in receiptsM1 : r.server = s /\ r.hop = h)
+        /\ ~(\E c \in conflictsSeenM1 : c.server = s /\ c.hop = h)
+        /\ \A prev \in 1..(h - 1) :
+              /\ (\E r \in receiptsM1 : r.server = s /\ r.hop = prev)
+              /\ (s \in ByzServers \/ honestStore[s][prev] = ExpectedTxM1(prev))
+        /\ IF s \notin ByzServers
+           THEN
+             IF honestStore[s][h] = "NONE" \/ honestStore[s][h] = tx
+             THEN /\ honestStore' = [honestStore EXCEPT ![s][h] = tx]
+                  /\ receiptsM1' = receiptsM1 \cup {[server |-> s, hop |-> h, tx |-> tx]}
+                  /\ UNCHANGED conflictsSeenM1
+             ELSE /\ conflictsSeenM1' = conflictsSeenM1 \cup {[server |-> s, hop |-> h, tx |-> honestStore[s][h]]}
+                  /\ UNCHANGED <<honestStore, receiptsM1>>
+           ELSE
+             \* Byzantine server may arbitrarily issue FirstWrite for tx OR report conflict
+             \/ /\ receiptsM1' = receiptsM1 \cup {[server |-> s, hop |-> h, tx |-> tx]}
+                /\ UNCHANGED <<honestStore, conflictsSeenM1>>
+             \/ /\ conflictsSeenM1' = conflictsSeenM1 \cup {[server |-> s, hop |-> h, tx |-> "TxB"]}
+                /\ UNCHANGED <<honestStore, receiptsM1>>
+        /\ UNCHANGED <<forkHop, crashed, receiptsM2, conflictsSeenM2, greenM1, greenM2, intentDoneM1, intentDoneM2>>
 
-LockRequestM2(s, h, tx) ==
-    /\ s \notin crashed
-    /\ tx = "TxB"
-    /\ \A prev \in 1..(h - 1) :
-          (\E r \in receiptsM2 : r.server = s /\ r.hop = prev)
-          \/ (honestStore[s][prev] /= "NONE")
-    /\ IF s \notin ByzServers
-       THEN
-         IF honestStore[s][h] = "NONE" \/ honestStore[s][h] = tx
-         THEN /\ honestStore' = [honestStore EXCEPT ![s][h] = tx]
-              /\ receiptsM2' = receiptsM2 \cup {[server |-> s, hop |-> h, tx |-> tx]}
-              /\ UNCHANGED conflictsSeenM2
-         ELSE /\ conflictsSeenM2' = conflictsSeenM2 \cup {[server |-> s, hop |-> h, tx |-> honestStore[s][h]]}
-              /\ UNCHANGED <<honestStore, receiptsM2>>
-       ELSE
-         \/ /\ receiptsM2' = receiptsM2 \cup {[server |-> s, hop |-> h, tx |-> tx]}
-            /\ UNCHANGED <<honestStore, conflictsSeenM2>>
-         \/ /\ conflictsSeenM2' = conflictsSeenM2 \cup {[server |-> s, hop |-> h, tx |-> "TxA"]}
-            /\ UNCHANGED <<honestStore, receiptsM2>>
-    /\ UNCHANGED <<crashed, receiptsM1, conflictsSeenM1, greenM1, greenM2, intentDoneM1, intentDoneM2>>
+LockRequestM2(s, h) ==
+    LET tx == ExpectedTxM2(h)
+    IN  /\ s \notin crashed
+        /\ ~(\E r \in receiptsM2 : r.server = s /\ r.hop = h)
+        /\ ~(\E c \in conflictsSeenM2 : c.server = s /\ c.hop = h)
+        /\ \A prev \in 1..(h - 1) :
+              /\ (\E r \in receiptsM2 : r.server = s /\ r.hop = prev)
+              /\ (s \in ByzServers \/ honestStore[s][prev] = ExpectedTxM2(prev))
+        /\ IF s \notin ByzServers
+           THEN
+             IF honestStore[s][h] = "NONE" \/ honestStore[s][h] = tx
+             THEN /\ honestStore' = [honestStore EXCEPT ![s][h] = tx]
+                  /\ receiptsM2' = receiptsM2 \cup {[server |-> s, hop |-> h, tx |-> tx]}
+                  /\ UNCHANGED conflictsSeenM2
+             ELSE /\ conflictsSeenM2' = conflictsSeenM2 \cup {[server |-> s, hop |-> h, tx |-> honestStore[s][h]]}
+                  /\ UNCHANGED <<honestStore, receiptsM2>>
+           ELSE
+             \/ /\ receiptsM2' = receiptsM2 \cup {[server |-> s, hop |-> h, tx |-> tx]}
+                /\ UNCHANGED <<honestStore, conflictsSeenM2>>
+             \/ /\ conflictsSeenM2' = conflictsSeenM2 \cup {[server |-> s, hop |-> h, tx |-> "TxA"]}
+                /\ UNCHANGED <<honestStore, receiptsM2>>
+        /\ UNCHANGED <<forkHop, crashed, receiptsM1, conflictsSeenM1, greenM1, greenM2, intentDoneM1, intentDoneM2>>
 
 \* Evaluate checkout Green-Rule (Concept Section 5.3):
 \*   #FirstWrite_receipts >= Q /\ #Trusted_FirstWrite_receipts >= N - Q + 1 /\ 0 conflicts
@@ -127,54 +138,60 @@ MinTrusted == N - Q + 1
 
 CheckGreenM1(h) ==
     LET rSet == {r.server : r \in {x \in receiptsM1 : x.hop = h /\ x.tx = "TxA"}}
-        cSet == {c \in conflictsSeenM1 : c.hop = h}
-    IN  /\ cSet = {}
+        cSet == {c \in conflictsSeenM1 : c.hop <= h}
+    IN  /\ h \notin greenM1
+        /\ cSet = {}
         /\ Cardinality(rSet) >= Q
         /\ Cardinality(rSet \cap TrustedM1) >= MinTrusted
         /\ greenM1' = greenM1 \cup {h}
-        /\ UNCHANGED <<honestStore, crashed, receiptsM1, receiptsM2, conflictsSeenM1, conflictsSeenM2, greenM2, intentDoneM1, intentDoneM2>>
+        /\ UNCHANGED <<forkHop, honestStore, crashed, receiptsM1, receiptsM2, conflictsSeenM1, conflictsSeenM2, greenM2, intentDoneM1, intentDoneM2>>
 
 CheckGreenM2(h) ==
     LET rSet == {r.server : r \in {x \in receiptsM2 : x.hop = h /\ x.tx = "TxB"}}
-        cSet == {c \in conflictsSeenM2 : c.hop = h}
-    IN  /\ cSet = {}
+        cSet == {c \in conflictsSeenM2 : c.hop <= h}
+    IN  /\ h \notin greenM2
+        /\ cSet = {}
         /\ Cardinality(rSet) >= Q
         /\ Cardinality(rSet \cap TrustedM2) >= MinTrusted
         /\ greenM2' = greenM2 \cup {h}
-        /\ UNCHANGED <<honestStore, crashed, receiptsM1, receiptsM2, conflictsSeenM1, conflictsSeenM2, greenM1, intentDoneM1, intentDoneM2>>
+        /\ UNCHANGED <<forkHop, honestStore, crashed, receiptsM1, receiptsM2, conflictsSeenM1, conflictsSeenM2, greenM1, intentDoneM1, intentDoneM2>>
 
-\* Crash and recover transitions (servers never lose honestStore when recovering)
+\* Crash and recover transitions (bounded crash model <= N - Q concurrent crashes;
+\* servers never lose honestStore when recovering).
 CrashServer(s) ==
     /\ s \notin crashed
+    /\ Cardinality(crashed) < N - Q
     /\ crashed' = crashed \cup {s}
-    /\ UNCHANGED <<honestStore, receiptsM1, receiptsM2, conflictsSeenM1, conflictsSeenM2, greenM1, greenM2, intentDoneM1, intentDoneM2>>
+    /\ UNCHANGED <<forkHop, honestStore, receiptsM1, receiptsM2, conflictsSeenM1, conflictsSeenM2, greenM1, greenM2, intentDoneM1, intentDoneM2>>
 
 RecoverServer(s) ==
     /\ s \in crashed
     /\ crashed' = crashed \ {s}
-    /\ UNCHANGED <<honestStore, receiptsM1, receiptsM2, conflictsSeenM1, conflictsSeenM2, greenM1, greenM2, intentDoneM1, intentDoneM2>>
+    /\ UNCHANGED <<forkHop, honestStore, receiptsM1, receiptsM2, conflictsSeenM1, conflictsSeenM2, greenM1, greenM2, intentDoneM1, intentDoneM2>>
 
 \* Mandatory completion via DurableIntent: merchant only marks intentDone(h)
-\* once every non-Byzantine server has returned either FirstWrite or ConflictSeen.
+\* once every non-Byzantine server has returned FirstWrite for h or ConflictSeen at <= h.
 CompleteIntentM1(h) ==
     /\ h \in greenM1
+    /\ h \notin intentDoneM1
     /\ \A s \in (Servers \ ByzServers) :
-          (\E r \in receiptsM1 : r.server = s /\ r.hop = h)
-          \/ (\E c \in conflictsSeenM1 : c.server = s /\ c.hop = h)
+          (\E r \in receiptsM1 : r.server = s /\ r.hop = h /\ r.tx = "TxA")
+          \/ (\E c \in conflictsSeenM1 : c.server = s /\ c.hop <= h)
     /\ intentDoneM1' = intentDoneM1 \cup {h}
-    /\ UNCHANGED <<honestStore, crashed, receiptsM1, receiptsM2, conflictsSeenM1, conflictsSeenM2, greenM1, greenM2, intentDoneM2>>
+    /\ UNCHANGED <<forkHop, honestStore, crashed, receiptsM1, receiptsM2, conflictsSeenM1, conflictsSeenM2, greenM1, greenM2, intentDoneM2>>
 
 CompleteIntentM2(h) ==
     /\ h \in greenM2
+    /\ h \notin intentDoneM2
     /\ \A s \in (Servers \ ByzServers) :
-          (\E r \in receiptsM2 : r.server = s /\ r.hop = h)
-          \/ (\E c \in conflictsSeenM2 : c.server = s /\ c.hop = h)
+          (\E r \in receiptsM2 : r.server = s /\ r.hop = h /\ r.tx = "TxB")
+          \/ (\E c \in conflictsSeenM2 : c.server = s /\ c.hop <= h)
     /\ intentDoneM2' = intentDoneM2 \cup {h}
-    /\ UNCHANGED <<honestStore, crashed, receiptsM1, receiptsM2, conflictsSeenM1, conflictsSeenM2, greenM1, greenM2, intentDoneM1>>
+    /\ UNCHANGED <<forkHop, honestStore, crashed, receiptsM1, receiptsM2, conflictsSeenM1, conflictsSeenM2, greenM1, greenM2, intentDoneM1>>
 
 Next ==
-    \/ \E s \in Servers, h \in Hops : LockRequestM1(s, h, "TxA")
-    \/ \E s \in Servers, h \in Hops : LockRequestM2(s, h, "TxB")
+    \/ \E s \in Servers, h \in Hops : LockRequestM1(s, h)
+    \/ \E s \in Servers, h \in Hops : LockRequestM2(s, h)
     \/ \E h \in Hops : CheckGreenM1(h)
     \/ \E h \in Hops : CheckGreenM2(h)
     \/ \E s \in Servers : CrashServer(s)
@@ -186,23 +203,23 @@ Spec == Init /\ [][Next]_vars
 
 \* --- SAFETY INVARIANTS ---
 
-\* Under the Green-Rule trust assumption:
-\*   Either 2Q - N >= |ByzServers| + 1 (safety by quorum intersection alone, e.g. 3/4 with f=1),
-\*   OR merchants' trusted sets contain at most 2Q - N - 1 Byzantine servers.
-\* With |ByzServers| <= 1 and Q = 3, N = 4: 2Q - N = 2 > 1, so even if BOTH merchants
-\* trusted the Byzantine server, two Green quorums CANNOT form on the same slot!
+\* Under 2Q - N >= |ByzServers| + 1 (here N=4, Q=3, |ByzServers|=1 -> 2 >= 2),
+\* two Green quorums CANNOT form on the same slot even if both merchants trust "s4".
 NoDoubleGreenOnSameSlot ==
     \A h \in Hops : ~(h \in greenM1 /\ h \in greenM2)
 
-\* If M1 went Green and completed its DurableIntent to all honest servers, and
-\* M2 also received a FirstWrite receipt on the same slot from some server,
-\* either M1 observed a conflict, M2 observed a conflict, or an honest server saw both,
-\* or a Byzantine server issued conflicting FirstWrites (EquivocationProof).
+\* An honest server never signs conflicting FirstWrite receipts on the same slot.
+SameServerDoubleSignImpliesByzantine ==
+    \A r1 \in receiptsM1, r2 \in receiptsM2 :
+      (r1.hop = r2.hop /\ r1.server = r2.server /\ r1.tx /= r2.tx) =>
+        r1.server \in ByzServers
+
+\* If M1 went Green and finished DurableIntent to all honest servers, any competing
+\* FirstWrite seen by M2 on h triggers a ConflictSeen on an honest server or identifies ByzServers.
 CompletionDetectsEquivocationOrConflict ==
-    \A h \in Hops :
-      (h \in intentDoneM1 /\ (\E r2 \in receiptsM2 : r2.hop = h)) =>
-        (\E c1 \in conflictsSeenM1 : c1.hop = h)
-        \/ (\E r1 \in receiptsM1, r2 \in receiptsM2 :
-              r1.hop = h /\ r2.hop = h /\ r1.server = r2.server /\ r1.tx /= r2.tx)
+    \A h \in Hops, r2 \in receiptsM2 :
+      (h \in intentDoneM1 /\ r2.hop = h /\ r2.tx = "TxB") =>
+        \/ (\E c1 \in conflictsSeenM1 : c1.hop <= h /\ c1.server = r2.server)
+        \/ (r2.server \in ByzServers)
 
 =============================================================================
