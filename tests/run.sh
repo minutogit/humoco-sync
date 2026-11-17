@@ -413,6 +413,93 @@ run_blackbox_protocol_suite() {
       -H "X-Drop-Signature: $sig" \
       "${endpoint}?account")" "200" "DELETE ?account wipes registered user and blobs"
     assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "${data_url}/${intruder_pk}.card.bin")" "404" "Wiped registered user slot returns 404"
+
+    echo "=== Group 10 ($label): Lock Channel Blackbox (SYNC-006b) ==="
+    local info_lock_json
+    info_lock_json="$(curl -sf "${endpoint}?info")"
+    assert_contains "$info_lock_json" '"lock"' "GET ?info includes lock metadata"
+    assert_contains "$info_lock_json" '"selftest"' "GET ?info includes cached selftest report"
+
+    local selftest_json lock_pub_bb
+    selftest_json="$(curl -sf "${endpoint}?lock_selftest")"
+    assert_contains "$selftest_json" '"all_passed":true' "GET ?lock_selftest reports all_passed=true"
+    lock_pub_bb="$(printf '%s' "$selftest_json" | sed -n 's/.*"lock_pub":"\([0-9a-f]\{64\}\)".*/\1/p')"
+    if [[ ${#lock_pub_bb} -ne 64 ]]; then
+      fail "Failed to parse lock_pub from ?lock_selftest: $selftest_json"
+    else
+      ok "Extracted 64-hex lock_pub from ?lock_selftest"
+    fi
+
+    # PUT ?lock_delegate (admin-signed + inner HUMOCO-LOCK-DELEGATE-V1)
+    local issued_bb
+    issued_bb="$(date +%s)"
+    "$helper_bin" sign-test sign-lock-delegate --sk "$admin_sk" --lock-pub "$lock_pub_bb" --issued "$issued_bb" > "$TMP_ROOT/lock_delegate.json"
+    ts="$(date +%s)"
+    nonce="$(rand_nonce)"
+    sig="$("$helper_bin" sign-test sign-admin --sk "$admin_sk" --action PUT_LOCK_DELEGATE --ts "$ts" --nonce "$nonce" --body-file "$TMP_ROOT/lock_delegate.json")"
+    assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+      -H "X-Drop-Pubkey: $admin_pk" \
+      -H "X-Drop-Timestamp: $ts" \
+      -H "X-Drop-Nonce: $nonce" \
+      -H "X-Drop-Signature: $sig" \
+      --data-binary "@$TMP_ROOT/lock_delegate.json" \
+      "${endpoint}?lock_delegate")" "200" "PUT ?lock_delegate persists signed admin delegation"
+
+    # Zero-write WAF probe
+    local probe_nonce probe_resp
+    probe_nonce="$(rand_nonce)$(rand_nonce)"
+    probe_resp="$(curl -sf -X POST -H 'Content-Type: application/json' \
+      -d "{\"probe\":true,\"client_nonce\":\"${probe_nonce}\"}" \
+      "${endpoint}?lock")"
+    assert_contains "$probe_resp" '"probe_ok":true' "POST ?lock WAF probe returns signed probe_ok"
+
+    # Grant friend_pk 'lock' channel membership & request GenesisTicket
+    printf '{"pubkeys":["%s"]}' "$friend_pk" > "$TMP_ROOT/lock_members.json"
+    ts="$(date +%s)"
+    nonce="$(rand_nonce)"
+    sig="$("$helper_bin" sign-test sign-admin --sk "$admin_sk" --action PUT_MEMBERS --channel lock --ts "$ts" --nonce "$nonce" --body-file "$TMP_ROOT/lock_members.json")"
+    assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+      -H "X-Drop-Pubkey: $admin_pk" \
+      -H "X-Drop-Timestamp: $ts" \
+      -H "X-Drop-Nonce: $nonce" \
+      -H "X-Drop-Signature: $sig" \
+      --data-binary "@$TMP_ROOT/lock_members.json" \
+      "${endpoint}?members&channel=lock")" "200" "PUT ?members&channel=lock authorizes lock member"
+
+    local bb_quarter=8125 anchor_bb
+    anchor_bb="$("$helper_bin" sign-test make-lock-sample --lock-pub "$lock_pub_bb" --admin-pub "$admin_pk" --quarter "$bb_quarter" --variant anchor_id)"
+    printf '{"anchor_id":"%s","retain_until_quarter":%s,"pow_timestamp":null,"pow_nonce":null}' "$anchor_bb" "$bb_quarter" > "$TMP_ROOT/ticket_req.json"
+    ts="$(date +%s)"
+    nonce="$(rand_nonce)"
+    sig="$("$helper_bin" sign-test sign-member --sk "$friend_sk" --method POST --channel lock_ticket --ts "$ts" --nonce "$nonce" --body-file "$TMP_ROOT/ticket_req.json")"
+    assert_eq "$(curl -s -o "$TMP_ROOT/ticket_resp.json" -w '%{http_code}' -X POST \
+      -H "X-Drop-Pubkey: $friend_pk" \
+      -H "X-Drop-Timestamp: $ts" \
+      -H "X-Drop-Nonce: $nonce" \
+      -H "X-Drop-Signature: $sig" \
+      -H 'Content-Type: application/json' \
+      --data-binary "@$TMP_ROOT/ticket_req.json" \
+      "${endpoint}?lock_ticket")" "200" "POST ?lock_ticket issues signed GenesisTicket"
+
+    # Submit unauthenticated PoS batch (depth=0 + depth=1), verify idempotency, conflict, and 605B static read
+    "$helper_bin" sign-test make-lock-sample --lock-pub "$lock_pub_bb" --admin-pub "$admin_pk" --quarter "$bb_quarter" --ticket-json "$TMP_ROOT/ticket_resp.json" --variant init > "$TMP_ROOT/lock_batch.json"
+    local lock_batch_resp
+    lock_batch_resp="$(curl -sf -X POST -H 'Content-Type: application/json' --data-binary "@$TMP_ROOT/lock_batch.json" "${endpoint}?lock")"
+    assert_contains "$lock_batch_resp" '"status":"ok"' "POST ?lock commits batch with FirstWrite receipts"
+
+    local lock_retry_resp
+    lock_retry_resp="$(curl -sf -X POST -H 'Content-Type: application/json' --data-binary "@$TMP_ROOT/lock_batch.json" "${endpoint}?lock")"
+    assert_contains "$lock_retry_resp" '"write_seq":2' "POST ?lock retry is idempotent at write_seq=2"
+
+    "$helper_bin" sign-test make-lock-sample --lock-pub "$lock_pub_bb" --admin-pub "$admin_pk" --quarter "$bb_quarter" --ticket-json "$TMP_ROOT/ticket_resp.json" --variant conflict > "$TMP_ROOT/lock_conflict.json"
+    local lock_conflict_resp
+    lock_conflict_resp="$(curl -sf -X POST -H 'Content-Type: application/json' --data-binary "@$TMP_ROOT/lock_conflict.json" "${endpoint}?lock")"
+    assert_contains "$lock_conflict_resp" '"status":"conflict"' "POST ?lock double-spend returns ConflictSeen"
+
+    local lock_read_rel static_len
+    lock_read_rel="$("$helper_bin" sign-test make-lock-sample --lock-pub "$lock_pub_bb" --admin-pub "$admin_pk" --quarter "$bb_quarter" --variant read_path)"
+    static_len="$(curl -sf "${data_url}/${lock_read_rel}" | wc -c | tr -d ' ')"
+    assert_eq "$static_len" "605" "Static lock read returns exact 605-byte wire entry"
   fi
 }
 

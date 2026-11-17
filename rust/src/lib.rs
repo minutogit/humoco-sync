@@ -4,6 +4,7 @@ pub mod admin_api;
 pub mod config;
 pub mod crypto;
 pub mod db;
+pub mod locks;
 pub mod mailer;
 pub mod ratelimit;
 pub mod state;

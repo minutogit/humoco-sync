@@ -17,13 +17,28 @@ pub fn admin_api_router() -> Router<AppState> {
             "/api/v1/admin/users/:pubkey",
             get(api_get_user).delete(api_delete_user),
         )
-        .route("/api/v1/admin/users/:pubkey/profile", post(api_set_user_profile))
-        .route("/api/v1/admin/users/:pubkey/status", post(api_set_user_status))
-        .route("/api/v1/admin/codes", get(api_list_codes).post(api_create_codes))
+        .route(
+            "/api/v1/admin/users/:pubkey/profile",
+            post(api_set_user_profile),
+        )
+        .route(
+            "/api/v1/admin/users/:pubkey/status",
+            post(api_set_user_status),
+        )
+        .route(
+            "/api/v1/admin/codes",
+            get(api_list_codes).post(api_create_codes),
+        )
 }
 
 fn check_bearer_auth(state: &AppState, headers: &HeaderMap) -> Option<Response> {
-    let configured_hash = if !state.config.security.api_bearer_token_hash.trim().is_empty() {
+    let configured_hash = if !state
+        .config
+        .security
+        .api_bearer_token_hash
+        .trim()
+        .is_empty()
+    {
         &state.config.security.api_bearer_token_hash
     } else {
         &state.config.security.admin_token_hash
@@ -34,11 +49,20 @@ fn check_bearer_auth(state: &AppState, headers: &HeaderMap) -> Option<Response> 
             "Admin API token not configured",
         ));
     }
-    let Some(auth) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) else {
-        return Some(json_error(StatusCode::UNAUTHORIZED, "Missing Authorization header"));
+    let Some(auth) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return Some(json_error(
+            StatusCode::UNAUTHORIZED,
+            "Missing Authorization header",
+        ));
     };
     let Some(token) = auth.strip_prefix("Bearer ").map(str::trim) else {
-        return Some(json_error(StatusCode::UNAUTHORIZED, "Expected Bearer token"));
+        return Some(json_error(
+            StatusCode::UNAUTHORIZED,
+            "Expected Bearer token",
+        ));
     };
     if !state.token_verifier.verify_token(configured_hash, token) {
         return Some(json_error(StatusCode::FORBIDDEN, "Invalid Bearer token"));
@@ -236,7 +260,11 @@ async fn api_create_codes(
         payload.prefix.as_deref(),
         now,
     ) {
-        Ok(codes) => (StatusCode::CREATED, Json(serde_json::json!({ "codes": codes }))).into_response(),
+        Ok(codes) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "codes": codes })),
+        )
+            .into_response(),
         Err(e) => db_err_to_response(e),
     }
 }

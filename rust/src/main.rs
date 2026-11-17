@@ -14,11 +14,14 @@ use tracing::{error, info};
 use humoco_sync_server::build_router;
 use humoco_sync_server::config::Config;
 use humoco_sync_server::crypto::{
-    canonical_revocation_message, format_admin_put_members_message,
+    canonical_revocation_message, format_admin_post_lock_selftest_message,
+    format_admin_put_lock_delegate_message, format_admin_put_members_message,
     format_admin_put_revoke_message, format_admin_status_message, format_delete_account_message,
-    hash_admin_token, leading_zero_bits, parse_member_message, random_hex, sha256_hex, unix_now,
-    RevocationNotice, RevocationReplacementTarget,
+    format_lock_delegate_signature_message, hash_admin_token, leading_zero_bits,
+    parse_member_message, random_hex, sha256_hex, unix_now, RevocationNotice,
+    RevocationReplacementTarget,
 };
+use humoco_sync_server::locks::LockDelegation;
 use humoco_sync_server::state::AppState;
 
 #[derive(Parser)]
@@ -139,6 +142,28 @@ enum SignTestCmd {
         #[arg(long)]
         bits: u8,
     },
+    /// Generate signed LockDelegation JSON payload for PUT ?lock_delegate
+    SignLockDelegate {
+        #[arg(long)]
+        sk: String,
+        #[arg(long)]
+        lock_pub: String,
+        #[arg(long)]
+        issued: u64,
+    },
+    /// Generate complete valid AnchorManifest + 605B LockEntry batch JSON for blackbox HTTP tests
+    MakeLockSample {
+        #[arg(long)]
+        lock_pub: String,
+        #[arg(long)]
+        admin_pub: String,
+        #[arg(long)]
+        quarter: u16,
+        #[arg(long)]
+        ticket_json: Option<PathBuf>,
+        #[arg(long)]
+        variant: String,
+    },
 }
 
 #[tokio::main]
@@ -204,7 +229,10 @@ async fn run_serve(config_opt: Option<PathBuf>, bind_override: Option<String>) -
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         loop {
             interval.tick().await;
-            if let Err(e) = maint_state.db.run_maintenance(&maint_state.config, unix_now()) {
+            if let Err(e) = maint_state
+                .db
+                .run_maintenance(&maint_state.config, unix_now())
+            {
                 error!(error = %e, "Background maintenance pass failed");
             }
         }
@@ -405,6 +433,12 @@ fn run_sign_test(cmd: SignTestCmd) -> i32 {
                 "PUT_MEMBERS" => format_admin_put_members_message(&channel, ts, &nonce, &body_hash),
                 "STATUS" => format_admin_status_message(ts, &nonce),
                 "PUT_REVOKE" => format_admin_put_revoke_message(ts, &nonce, &body_hash),
+                "PUT_LOCK_DELEGATE" => {
+                    format_admin_put_lock_delegate_message(ts, &nonce, &body_hash)
+                }
+                "POST_LOCK_SELFTEST" => {
+                    format_admin_post_lock_selftest_message(ts, &nonce, &body_hash)
+                }
                 other => {
                     eprintln!("Unsupported admin action '{}'", other);
                     return 1;
@@ -475,5 +509,238 @@ fn run_sign_test(cmd: SignTestCmd) -> i32 {
             }
             1
         }
+        SignTestCmd::SignLockDelegate {
+            sk,
+            lock_pub,
+            issued,
+        } => {
+            let sk = match parse_sk(&sk) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    return 1;
+                }
+            };
+            let Ok(lock_pub_bytes) = humoco_proto::decode_hex_fixed::<32>(lock_pub.trim()) else {
+                eprintln!("Invalid lowercase 64-hex lock_pub");
+                return 1;
+            };
+            let admin_pub_bytes = sk.verifying_key().to_bytes();
+            let admin_pub_hex = hex::encode(admin_pub_bytes);
+            let msg =
+                format_lock_delegate_signature_message(&admin_pub_hex, lock_pub.trim(), issued);
+            let sig_bytes = sk.sign(msg.as_bytes()).to_bytes();
+            let del = LockDelegation {
+                admin_pub: admin_pub_bytes,
+                lock_pub: lock_pub_bytes,
+                issued_at: issued,
+                sig: sig_bytes,
+            };
+            println!("{}", serde_json::to_string(&del).unwrap());
+            0
+        }
+        SignTestCmd::MakeLockSample {
+            lock_pub,
+            admin_pub,
+            quarter,
+            ticket_json,
+            variant,
+        } => run_make_lock_sample(
+            &lock_pub,
+            &admin_pub,
+            quarter,
+            ticket_json.as_ref(),
+            &variant,
+        ),
     }
+}
+
+fn run_make_lock_sample(
+    lock_pub_hex: &str,
+    admin_pub_hex: &str,
+    quarter: u16,
+    ticket_json_path: Option<&PathBuf>,
+    variant: &str,
+) -> i32 {
+    use humoco_proto::{
+        compute_root_mig_auth_digest, derive_bucket, derive_slot, derive_slot_file_id,
+        hash_pubkey_sha3, solve_lock_pow, AnchorAuthority, AnchorManifest, CausalOutputProof,
+        GenesisTicket, LockEntry, NominatedBy, ServerEntry, HOP_ENCRYPTED_PAYLOAD_LEN,
+    };
+
+    let Ok(lock_pub) = humoco_proto::decode_hex_fixed::<32>(lock_pub_hex.trim()) else {
+        eprintln!("Invalid lock_pub");
+        return 1;
+    };
+    let Ok(admin_pub) = humoco_proto::decode_hex_fixed::<32>(admin_pub_hex.trim()) else {
+        eprintln!("Invalid admin_pub");
+        return 1;
+    };
+    let creator_mig_sk = SigningKey::from_bytes(&[91u8; 32]);
+    let creator_mig_pub = creator_mig_sk.verifying_key().to_bytes();
+    let manifest = AnchorManifest {
+        revision: 1,
+        threshold: 1,
+        servers: vec![ServerEntry {
+            write_url: "https://sync1.example/sync.php".to_string(),
+            read_url: "https://sync1.example/data".to_string(),
+            admin_pub,
+            lock_pub,
+            nominated_by: NominatedBy::Creator,
+        }],
+        successors: Vec::new(),
+        authority: AnchorAuthority {
+            creator_mig_pub,
+            guarantor_mig_pubs: Vec::new(),
+        },
+        migration_chain: Vec::new(),
+        issued_at_ms: 1_794_916_800_000,
+        retain_until_quarter: quarter,
+    };
+    let anchor_id = match manifest.rev1_anchor_id() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("anchor_id error: {}", e);
+            return 1;
+        }
+    };
+
+    if variant == "anchor_id" {
+        println!("{}", hex::encode(anchor_id));
+        return 0;
+    }
+
+    let bucket = derive_bucket(&anchor_id, &lock_pub);
+    let slot0 = derive_slot(&anchor_id, &[0x11; 32]);
+    if variant == "read_path" {
+        let q_str = humoco_proto::format_quarter(quarter).unwrap();
+        let file_s = derive_slot_file_id(&slot0, &lock_pub);
+        println!(
+            "locks/{}/{}/{}.lock",
+            q_str,
+            hex::encode(bucket),
+            hex::encode(file_s)
+        );
+        return 0;
+    }
+
+    let ticket_path = match ticket_json_path {
+        Some(p) => p,
+        None => {
+            eprintln!("--ticket-json is required for variant '{}'", variant);
+            return 1;
+        }
+    };
+    let ticket_raw = match fs::read_to_string(ticket_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("ticket read error: {}", e);
+            return 1;
+        }
+    };
+    let ticket_val: serde_json::Value = match serde_json::from_str(&ticket_raw) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("ticket parse error: {}", e);
+            return 1;
+        }
+    };
+    let ticket_inner = ticket_val.get("ticket").unwrap_or(&ticket_val);
+    let ticket: GenesisTicket = match serde_json::from_value(ticket_inner.clone()) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("ticket decode error: {}", e);
+            return 1;
+        }
+    };
+
+    let genesis_sk = SigningKey::from_bytes(&[92u8; 32]);
+    let genesis_pub = genesis_sk.verifying_key().to_bytes();
+    let recv1_sk = SigningKey::from_bytes(&[93u8; 32]);
+    let recv1_pub = recv1_sk.verifying_key().to_bytes();
+    let recv1_hash = hash_pubkey_sha3(&recv1_pub);
+    let child0 = if variant == "conflict" {
+        [0x99; 32]
+    } else {
+        [0x11; 32]
+    };
+    let mut causal0 = CausalOutputProof {
+        anchor_id,
+        slot: slot0,
+        parent_slot: [0u8; 32],
+        output_branch: 0,
+        depth: 0,
+        child_lock: child0,
+        sender_pubkey: genesis_pub,
+        receiver_pubkey_hash: recv1_hash,
+        change_pubkey_hash: None,
+        causal_sig: [0u8; 64],
+    };
+    causal0.causal_sig = genesis_sk.sign(&causal0.digest().unwrap()).to_bytes();
+    let root_mig_digest = compute_root_mig_auth_digest(&anchor_id, &slot0, &genesis_pub);
+    let root_mig_sig = creator_mig_sk.sign(&root_mig_digest).to_bytes();
+    let pow0 = solve_lock_pow(&slot0, &child0, 0, 8, 0, 100_000).unwrap();
+    let entry0 = LockEntry {
+        slot: slot0,
+        parent_slot: [0u8; 32],
+        output_branch: 0,
+        depth: 0,
+        child_lock: child0,
+        sender_pubkey: genesis_pub,
+        receiver_pubkey_hash: recv1_hash,
+        change_pubkey_hash: None,
+        causal_sig: causal0.causal_sig,
+        root_mig_sig: Some(root_mig_sig),
+        encrypted_payload: [0x55; HOP_ENCRYPTED_PAYLOAD_LEN],
+        pow_nonce: pow0,
+    };
+
+    let entries = if variant == "conflict" {
+        vec![entry0.to_wire_hex().unwrap()]
+    } else {
+        let slot1 = derive_slot(&anchor_id, &[0x22; 32]);
+        let child1 = [0x22; 32];
+        let recv2_hash = [0x77; 32];
+        let mut causal1 = CausalOutputProof {
+            anchor_id,
+            slot: slot1,
+            parent_slot: slot0,
+            output_branch: 0,
+            depth: 1,
+            child_lock: child1,
+            sender_pubkey: recv1_pub,
+            receiver_pubkey_hash: recv2_hash,
+            change_pubkey_hash: None,
+            causal_sig: [0u8; 64],
+        };
+        causal1.causal_sig = recv1_sk.sign(&causal1.digest().unwrap()).to_bytes();
+        let pow1 = solve_lock_pow(&slot1, &child1, 1, 8, 0, 100_000).unwrap();
+        let entry1 = LockEntry {
+            slot: slot1,
+            parent_slot: slot0,
+            output_branch: 0,
+            depth: 1,
+            child_lock: child1,
+            sender_pubkey: recv1_pub,
+            receiver_pubkey_hash: recv2_hash,
+            change_pubkey_hash: None,
+            causal_sig: causal1.causal_sig,
+            root_mig_sig: None,
+            encrypted_payload: [0x66; HOP_ENCRYPTED_PAYLOAD_LEN],
+            pow_nonce: pow1,
+        };
+        vec![entry0.to_wire_hex().unwrap(), entry1.to_wire_hex().unwrap()]
+    };
+
+    let req = serde_json::json!({
+        "anchor_id": hex::encode(anchor_id),
+        "bucket": hex::encode(bucket),
+        "recipient_nonce": hex::encode([0x44; 32]),
+        "entries": entries,
+        "manifest": manifest,
+        "genesis_ticket": ticket,
+        "known_head_receipt": serde_json::Value::Null,
+    });
+    println!("{}", req);
+    0
 }

@@ -41,7 +41,11 @@ impl Mailer {
     }
 
     pub async fn send_mail(&self, to: &str, subject: &str, body: &str) -> Result<(), String> {
-        if to.contains('\r') || to.contains('\n') || subject.contains('\r') || subject.contains('\n') {
+        if to.contains('\r')
+            || to.contains('\n')
+            || subject.contains('\r')
+            || subject.contains('\n')
+        {
             return Err("Invalid email header characters".to_string());
         }
 
@@ -133,7 +137,8 @@ impl Mailer {
         }
 
         warn!("Using plaintext SMTP without TLS");
-        self.run_smtp_session(stream, false, to, subject, body).await
+        self.run_smtp_session(stream, false, to, subject, body)
+            .await
     }
 
     async fn run_smtp_session<S>(
@@ -155,16 +160,17 @@ impl Mailer {
         read_smtp_expect(&mut reader, 250).await?;
 
         if !self.cfg.smtp_username.is_empty() {
-            let auth_plain = format!(
-                "\0{}\0{}",
-                self.cfg.smtp_username, self.cfg.smtp_password
-            );
+            let auth_plain = format!("\0{}\0{}", self.cfg.smtp_username, self.cfg.smtp_password);
             let encoded = STANDARD.encode(auth_plain.as_bytes());
             write_smtp_line(&mut reader, &format!("AUTH PLAIN {}", encoded)).await?;
             read_smtp_expect(&mut reader, 235).await?;
         }
 
-        write_smtp_line(&mut reader, &format!("MAIL FROM:<{}>", self.cfg.from_address)).await?;
+        write_smtp_line(
+            &mut reader,
+            &format!("MAIL FROM:<{}>", self.cfg.from_address),
+        )
+        .await?;
         read_smtp_expect(&mut reader, 250).await?;
         write_smtp_line(&mut reader, &format!("RCPT TO:<{}>", to)).await?;
         read_smtp_expect(&mut reader, 250).await?;

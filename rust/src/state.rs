@@ -22,7 +22,13 @@ pub struct AppState {
 
 impl AppState {
     pub fn from_config(cfg: Config) -> Result<Self, DbError> {
-        let db = Arc::new(SyncDb::open(&cfg.server.db_path, &cfg.server.server_pepper_hex)?);
+        let db = Arc::new(SyncDb::open(
+            &cfg.server.db_path,
+            &cfg.server.server_pepper_hex,
+        )?);
+        if cfg.lock.enabled {
+            let _ = db.get_or_run_lock_selftest(&cfg, crate::crypto::unix_now())?;
+        }
         let rate_limiter = Arc::new(RateLimiter::new(
             cfg.security.ip_requests_per_minute,
             cfg.security.pubkey_requests_per_minute,

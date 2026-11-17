@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const ALLOWED_CHANNELS: [&str; 5] = ["card", "wot", "backup", "post", "media"];
+pub const ADMIN_MEMBER_CHANNELS: [&str; 6] = ["card", "wot", "backup", "post", "media", "lock"];
 pub const ALLOWED_GATES: [&str; 4] = ["email", "code", "pow", "open"];
 
 #[derive(Debug, Error)]
@@ -31,6 +32,7 @@ pub struct Config {
     pub media: MediaConfig,
     pub security: SecurityConfig,
     pub email: EmailConfig,
+    pub lock: LockConfig,
     pub profiles: BTreeMap<String, ProfileConfig>,
 }
 
@@ -43,7 +45,32 @@ impl Default for Config {
             media: MediaConfig::default(),
             security: SecurityConfig::default(),
             email: EmailConfig::default(),
+            lock: LockConfig::default(),
             profiles: default_profiles(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LockConfig {
+    pub enabled: bool,
+    pub max_retention_quarter: u16,
+    pub pow_base_bits: u32,
+    pub allow_pow_tickets: bool,
+    pub ticket_pow_bits: u32,
+    pub max_inodes: u64,
+}
+
+impl Default for LockConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_retention_quarter: 8159, // 2039-Q4
+            pow_base_bits: humoco_proto::DEFAULT_LOCK_POW_BASE_BITS,
+            allow_pow_tickets: false,
+            ticket_pow_bits: 16,
+            max_inodes: 50_000,
         }
     }
 }
@@ -501,7 +528,10 @@ impl Config {
             )));
         }
 
-        if !self.profiles.contains_key(&self.mode.default_public_profile) {
+        if !self
+            .profiles
+            .contains_key(&self.mode.default_public_profile)
+        {
             return Err(ConfigError::Validation(format!(
                 "mode.default_public_profile '{}' not found in [profiles]",
                 self.mode.default_public_profile
@@ -550,6 +580,28 @@ impl Config {
             ));
         }
 
+        if humoco_proto::decode_quarter(self.lock.max_retention_quarter).is_err() {
+            return Err(ConfigError::Validation(
+                "lock.max_retention_quarter must encode YYYY-QN with year in 2020..=9999"
+                    .to_string(),
+            ));
+        }
+        if self.lock.pow_base_bits > humoco_proto::MAX_LOCK_POW_BITS {
+            return Err(ConfigError::Validation(
+                "lock.pow_base_bits must be <= 24".to_string(),
+            ));
+        }
+        if self.lock.ticket_pow_bits > 28 {
+            return Err(ConfigError::Validation(
+                "lock.ticket_pow_bits must be <= 28".to_string(),
+            ));
+        }
+        if self.lock.max_inodes == 0 {
+            return Err(ConfigError::Validation(
+                "lock.max_inodes must be >= 1".to_string(),
+            ));
+        }
+
         Ok(())
     }
 
@@ -569,7 +621,9 @@ impl Config {
     }
 
     pub fn max_total_bytes(&self) -> u64 {
-        self.storage.max_total_storage_mb.saturating_mul(1024 * 1024)
+        self.storage
+            .max_total_storage_mb
+            .saturating_mul(1024 * 1024)
     }
 
     pub fn max_free_pool_bytes(&self) -> u64 {
@@ -601,6 +655,9 @@ impl Config {
             if self.profiles.values().any(|p| p.channels.contains_key(ch)) || ch == "media" {
                 out.push(ch.to_string());
             }
+        }
+        if self.lock.enabled {
+            out.push("lock".to_string());
         }
         out
     }

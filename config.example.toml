@@ -157,3 +157,17 @@ max_bytes = 2097152
 ttl_days = 365
 max_user_count = 64
 max_user_bytes = 52428800
+
+[lock]
+# Voucher-pinned Sync Lock collision registry channel (SPEC Section 6)
+# Note: lock_sk/lock_pub are generated once in redb SERVER_META["lock_key"] — never configured here.
+enabled = true
+# Maximum accepted bucket retention quarter (year * 4 + (q - 1), 8159 = 2039-Q4)
+max_retention_quarter = 8159
+# Base leading-zero-bits PoW difficulty on POST ?lock (depth-progressive up to 24 bits)
+pow_base_bits = 8
+# Optional unauthenticated PoW admission for POST ?lock_ticket (in addition to member/registered/admin auth)
+allow_pow_tickets = false
+ticket_pow_bits = 16
+# Maximum lock slot inodes before rejecting new genesis tickets (active buckets continue)
+max_inodes = 50000

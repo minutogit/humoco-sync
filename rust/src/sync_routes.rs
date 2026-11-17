@@ -11,20 +11,25 @@ use serde::Deserialize;
 
 use crate::config::Config;
 use crate::crypto::{
-    check_timestamp_window, format_admin_put_members_message, format_admin_put_revoke_message,
-    format_admin_status_message, format_delete_account_message, normalize_pubkey_hex,
-    parse_member_message, sha256_hex, unix_now, validate_channel, validate_drop_prefix,
-    validate_nonce_hex, verify_ed25519_hex, verify_revocation_notice, RevocationNotice,
+    check_timestamp_window, format_admin_post_lock_selftest_message,
+    format_admin_put_lock_delegate_message, format_admin_put_members_message,
+    format_admin_put_revoke_message, format_admin_status_message, format_delete_account_message,
+    normalize_pubkey_hex, parse_member_message, sha256_hex, unix_now,
+    validate_admin_member_channel, validate_channel, validate_drop_prefix, validate_nonce_hex,
+    verify_ed25519_hex, verify_revocation_notice, RevocationNotice,
 };
 use crate::db::{normalize_etag, ConditionalPrecondition};
+use crate::locks::{LockBatchRequest, LockDelegation, LockTicketRequest, TicketCallerAuth};
 use crate::ratelimit::extract_client_ip;
 use crate::state::{db_err_to_response, json_error, AppState};
 
 pub fn sync_router(cfg: &Config) -> Router<AppState> {
     let data_route = format!("/{}/:filename", cfg.server.data_dir);
+    let lock_read_route = format!("/{}/locks/:quarter/:bucket/:filename", cfg.server.data_dir);
     Router::new()
         .route("/sync.php", any(handle_sync_endpoint))
         .route("/sync", any(handle_sync_endpoint))
+        .route(&lock_read_route, any(handle_static_lock))
         .route(&data_route, any(handle_static_data))
 }
 
@@ -57,6 +62,8 @@ async fn handle_sync_endpoint(
                 handle_get_info(&state).await
             } else if query_params.contains_key("status") && query_params.len() == 1 {
                 handle_get_status(&state, &headers).await
+            } else if query_params.contains_key("lock_selftest") && query_params.len() == 1 {
+                handle_get_lock_selftest(&state).await
             } else {
                 method_not_allowed()
             }
@@ -69,12 +76,28 @@ async fn handle_sync_endpoint(
         }
         Method::PUT => {
             if query_params.contains_key("members") {
-                let channel = query_params.get("channel").map(|s| s.as_str()).unwrap_or("");
+                let channel = query_params
+                    .get("channel")
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
                 handle_put_members(&state, &headers, channel, body).await
             } else if query_params.contains_key("revoke") && query_params.len() == 1 {
                 handle_put_revoke(&state, &headers, body).await
+            } else if query_params.contains_key("lock_delegate") && query_params.len() == 1 {
+                handle_put_lock_delegate(&state, &headers, body).await
             } else if query_params.is_empty() {
                 handle_put_slot(&state, &headers, body).await
+            } else {
+                method_not_allowed()
+            }
+        }
+        Method::POST => {
+            if query_params.contains_key("lock_ticket") && query_params.len() == 1 {
+                handle_post_lock_ticket(&state, &headers, body).await
+            } else if query_params.contains_key("lock_selftest") && query_params.len() == 1 {
+                handle_post_lock_selftest(&state, &headers, body).await
+            } else if query_params.contains_key("lock") && query_params.len() == 1 {
+                handle_post_lock(&state, body).await
             } else {
                 method_not_allowed()
             }
@@ -93,7 +116,10 @@ async fn handle_sync_endpoint(
 }
 
 fn method_not_allowed() -> Response {
-    let mut resp = json_error(StatusCode::METHOD_NOT_ALLOWED, "Method or query not allowed");
+    let mut resp = json_error(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "Method or query not allowed",
+    );
     resp.headers_mut().insert(
         header::ALLOW,
         HeaderValue::from_static("GET, HEAD, PUT, DELETE, POST"),
@@ -106,18 +132,21 @@ async fn handle_get_info(state: &AppState) -> Response {
         Ok(r) => r,
         Err(e) => return db_err_to_response(e),
     };
+    let lock_info = match state.db.get_lock_info_json(&state.config, unix_now()) {
+        Ok(v) => v,
+        Err(e) => return db_err_to_response(e),
+    };
     let payload = serde_json::json!({
         "drop_pub": state.db.effective_drop_pub(&state.config),
         "read_url": state.config.read_url(),
         "register_url": state.config.register_url(),
         "channels": state.config.supported_channels(),
         "revocation": revocation,
+        "lock": lock_info,
     });
     let mut resp = (StatusCode::OK, Json(payload)).into_response();
-    resp.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("no-store"),
-    );
+    resp.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     resp
 }
 
@@ -144,10 +173,8 @@ async fn handle_get_status(state: &AppState, headers: &HeaderMap) -> Response {
     match state.db.admin_status(&state.config, now) {
         Ok(status) => {
             let mut resp = (StatusCode::OK, Json(status)).into_response();
-            resp.headers_mut().insert(
-                header::CACHE_CONTROL,
-                HeaderValue::from_static("no-store"),
-            );
+            resp.headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
             resp
         }
         Err(e) => db_err_to_response(e),
@@ -257,8 +284,11 @@ async fn handle_put_members(
     raw_channel: &str,
     body: Body,
 ) -> Response {
-    let Some(channel) = validate_channel(raw_channel) else {
-        return json_error(StatusCode::BAD_REQUEST, "Missing or invalid channel query parameter");
+    let Some(channel) = validate_admin_member_channel(raw_channel) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "Missing or invalid channel query parameter",
+        );
     };
     let Ok((pubkey, ts, nonce, sig)) = extract_drop_auth_headers(headers) else {
         return json_error(StatusCode::BAD_REQUEST, "Missing or invalid auth headers");
@@ -331,7 +361,12 @@ async fn handle_put_revoke(state: &AppState, headers: &HeaderMap, body: Body) ->
 
     let bytes = match axum::body::to_bytes(body, 64 * 1024).await {
         Ok(b) => b,
-        Err(_) => return json_error(StatusCode::PAYLOAD_TOO_LARGE, "Revocation payload too large"),
+        Err(_) => {
+            return json_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Revocation payload too large",
+            )
+        }
     };
     let body_hash = sha256_hex(&bytes);
     let msg = format_admin_put_revoke_message(ts, &nonce, &body_hash);
@@ -506,13 +541,16 @@ async fn handle_put_slot(state: &AppState, headers: &HeaderMap, body: Body) -> R
     match outcome {
         Ok(out) => {
             let etag = out.etag.clone();
-            let mut resp = (StatusCode::OK, Json(serde_json::json!({
-                "status": "ok",
-                "channel": out.channel,
-                "bytes": out.bytes,
-                "etag": out.etag,
-                "evicted_media": out.evicted_media,
-            })))
+            let mut resp = (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "ok",
+                    "channel": out.channel,
+                    "bytes": out.bytes,
+                    "etag": out.etag,
+                    "evicted_media": out.evicted_media,
+                })),
+            )
                 .into_response();
             insert_header_str(resp.headers_mut(), "ETag", &format!("\"{}\"", etag));
             resp
@@ -652,10 +690,18 @@ async fn handle_delete_account(state: &AppState, headers: &HeaderMap, body: Body
     }
     let bytes = match axum::body::to_bytes(body, 1024).await {
         Ok(b) => b,
-        Err(_) => return json_error(StatusCode::BAD_REQUEST, "DELETE ?account body must be empty"),
+        Err(_) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "DELETE ?account body must be empty",
+            )
+        }
     };
     if !bytes.is_empty() {
-        return json_error(StatusCode::BAD_REQUEST, "DELETE ?account body must be empty");
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "DELETE ?account body must be empty",
+        );
     }
 
     let msg = format_delete_account_message(ts, &nonce);
@@ -680,6 +726,252 @@ async fn handle_delete_account(state: &AppState, headers: &HeaderMap, body: Body
             })),
         )
             .into_response(),
+        Err(e) => db_err_to_response(e),
+    }
+}
+
+async fn verify_admin_request_with_body<F>(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: Body,
+    max_body_bytes: usize,
+    format_msg: F,
+) -> Result<(Vec<u8>, u64), Response>
+where
+    F: FnOnce(i64, &str, &str) -> String,
+{
+    let Ok((pubkey, ts, nonce, sig)) = extract_drop_auth_headers(headers) else {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "Missing or invalid auth headers",
+        ));
+    };
+    if state.config.server.admin_pubkey.is_empty() || pubkey != state.config.server.admin_pubkey {
+        return Err(json_error(StatusCode::FORBIDDEN, "Admin pubkey required"));
+    }
+    let now = unix_now();
+    if !check_timestamp_window(ts, now) {
+        return Err(json_error(
+            StatusCode::UNAUTHORIZED,
+            "Timestamp outside allowed window",
+        ));
+    }
+    let bytes = match axum::body::to_bytes(body, max_body_bytes).await {
+        Ok(b) => b.to_vec(),
+        Err(_) => {
+            return Err(json_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Request body too large",
+            ));
+        }
+    };
+    let body_hash = sha256_hex(&bytes);
+    let msg = format_msg(ts, &nonce, &body_hash);
+    if !verify_ed25519_hex(&pubkey, &sig, msg.as_bytes()) {
+        return Err(json_error(
+            StatusCode::UNAUTHORIZED,
+            "Invalid admin signature",
+        ));
+    }
+    match state.db.check_and_consume_nonce(&nonce, now) {
+        Ok(true) => Ok((bytes, now)),
+        Ok(false) => Err(json_error(StatusCode::CONFLICT, "Nonce already used")),
+        Err(e) => Err(db_err_to_response(e)),
+    }
+}
+
+async fn handle_get_lock_selftest(state: &AppState) -> Response {
+    match state.db.get_or_run_lock_selftest(&state.config, unix_now()) {
+        Ok(report) => {
+            let mut resp = (StatusCode::OK, Json(report)).into_response();
+            resp.headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            resp
+        }
+        Err(e) => db_err_to_response(e),
+    }
+}
+
+async fn handle_post_lock_selftest(state: &AppState, headers: &HeaderMap, body: Body) -> Response {
+    let (_bytes, now) = match verify_admin_request_with_body(
+        state,
+        headers,
+        body,
+        4096,
+        format_admin_post_lock_selftest_message,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    match state.db.run_lock_selftest(&state.config, now) {
+        Ok(report) => {
+            let mut resp = (StatusCode::OK, Json(report)).into_response();
+            resp.headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            resp
+        }
+        Err(e) => db_err_to_response(e),
+    }
+}
+
+async fn handle_put_lock_delegate(state: &AppState, headers: &HeaderMap, body: Body) -> Response {
+    let (bytes, _now) = match verify_admin_request_with_body(
+        state,
+        headers,
+        body,
+        16 * 1024,
+        format_admin_put_lock_delegate_message,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    let del: LockDelegation = match serde_json::from_slice(&bytes) {
+        Ok(d) => d,
+        Err(_) => return json_error(StatusCode::BAD_REQUEST, "Invalid lock delegation JSON"),
+    };
+
+    match state.db.set_lock_delegation(&state.config, del) {
+        Ok(saved) => (StatusCode::OK, Json(saved)).into_response(),
+        Err(e) => db_err_to_response(e),
+    }
+}
+
+async fn handle_post_lock_ticket(state: &AppState, headers: &HeaderMap, body: Body) -> Response {
+    match state.db.get_revocation() {
+        Ok(Some(_)) => return gone_revoked_response(state),
+        Ok(None) => {}
+        Err(e) => return db_err_to_response(e),
+    }
+
+    let has_any_auth_header = headers.contains_key("x-drop-pubkey")
+        || headers.contains_key("x-drop-timestamp")
+        || headers.contains_key("x-drop-nonce")
+        || headers.contains_key("x-drop-signature");
+
+    let parsed_auth = if has_any_auth_header {
+        let Ok((pubkey, ts, nonce, sig)) = extract_drop_auth_headers(headers) else {
+            return json_error(StatusCode::BAD_REQUEST, "Missing or invalid auth headers");
+        };
+        if !state.rate_limiter.allow_pubkey(&pubkey) {
+            return json_error(StatusCode::TOO_MANY_REQUESTS, "Pubkey rate limit exceeded");
+        }
+        Some((pubkey, ts, nonce, sig))
+    } else {
+        None
+    };
+
+    let bytes = match axum::body::to_bytes(body, 16 * 1024).await {
+        Ok(b) => b,
+        Err(_) => return json_error(StatusCode::PAYLOAD_TOO_LARGE, "Ticket request too large"),
+    };
+
+    let req: LockTicketRequest = match serde_json::from_slice(&bytes) {
+        Ok(r) => r,
+        Err(_) => return json_error(StatusCode::BAD_REQUEST, "Invalid lock_ticket JSON"),
+    };
+
+    let caller = match &parsed_auth {
+        Some((pubkey, ts, nonce, sig)) => TicketCallerAuth::SignedMember {
+            pubkey_hex: pubkey,
+            timestamp: *ts,
+            nonce,
+            sig,
+            raw_body: &bytes,
+        },
+        None => TicketCallerAuth::UnauthenticatedPow,
+    };
+
+    match state
+        .db
+        .issue_genesis_ticket(&state.config, caller, req, unix_now())
+    {
+        Ok(ticket) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ticket": ticket })),
+        )
+            .into_response(),
+        Err(e) => db_err_to_response(e),
+    }
+}
+
+async fn handle_post_lock(state: &AppState, body: Body) -> Response {
+    let bytes = match axum::body::to_bytes(body, 256 * 1024).await {
+        Ok(b) => b,
+        Err(_) => return json_error(StatusCode::PAYLOAD_TOO_LARGE, "Lock payload too large"),
+    };
+
+    let val: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(_) => return json_error(StatusCode::BAD_REQUEST, "Invalid lock JSON"),
+    };
+
+    if val.get("probe").and_then(|v| v.as_bool()) == Some(true) {
+        let Some(client_nonce) = val.get("client_nonce").and_then(|v| v.as_str()) else {
+            return json_error(StatusCode::BAD_REQUEST, "Missing probe client_nonce");
+        };
+        return match state
+            .db
+            .sign_lock_probe(&state.config, client_nonce, unix_now())
+        {
+            Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
+            Err(e) => db_err_to_response(e),
+        };
+    }
+
+    let req: LockBatchRequest = match serde_json::from_value(val) {
+        Ok(r) => r,
+        Err(_) => return json_error(StatusCode::BAD_REQUEST, "Invalid lock batch request JSON"),
+    };
+
+    match state.db.process_lock_batch(&state.config, req, unix_now()) {
+        Ok((code, body)) => {
+            let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            (status, Json(body)).into_response()
+        }
+        Err(e) => db_err_to_response(e),
+    }
+}
+
+async fn handle_static_lock(
+    State(state): State<AppState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    method: Method,
+    Path((quarter, bucket, filename)): Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if method != Method::GET && method != Method::HEAD {
+        return method_not_allowed();
+    }
+    let peer_addr = peer.map(|ConnectInfo(s)| s);
+    let client_ip = extract_client_ip(peer_addr, &headers, state.config.server.trusted_proxy_hops);
+    if !state.rate_limiter.allow_ip(client_ip) {
+        return json_error(StatusCode::TOO_MANY_REQUESTS, "IP rate limit exceeded");
+    }
+    if !state.config.lock.enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Some(file_hex) = filename.strip_suffix(".lock") else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    match state.db.get_static_lock_entry(&quarter, &bucket, file_hex) {
+        Ok(Some(bytes)) => {
+            let etag = sha256_hex(&bytes);
+            binary_or_json_response(
+                method,
+                "application/octet-stream",
+                &etag,
+                "public, max-age=31536000, immutable",
+                bytes,
+            )
+        }
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => db_err_to_response(e),
     }
 }
@@ -742,13 +1034,7 @@ async fn handle_static_data(
                 if if_none_match.as_deref() == Some(etag.as_str()) {
                     return not_modified_with_etag(&etag, "no-cache");
                 }
-                binary_or_json_response(
-                    method,
-                    "application/json",
-                    &etag,
-                    "no-cache",
-                    bytes,
-                )
+                binary_or_json_response(method, "application/json", &etag, "no-cache", bytes)
             }
             Ok(None) => StatusCode::NOT_FOUND.into_response(),
             Err(e) => db_err_to_response(e),
@@ -796,7 +1082,10 @@ async fn handle_static_data(
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    match state.db.get_slot_blob(&state.config, channel, slot_or_media, now) {
+    match state
+        .db
+        .get_slot_blob(&state.config, channel, slot_or_media, now)
+    {
         Ok(Some((meta, data))) => {
             if if_none_match.as_deref() == Some(meta.etag.as_str()) {
                 return not_modified_with_etag(&meta.etag, "no-cache");
@@ -881,7 +1170,11 @@ fn extract_drop_auth_headers(headers: &HeaderMap) -> Result<(String, i64, String
         .get("x-drop-signature")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.trim().to_ascii_lowercase())
-        .filter(|s| s.len() == 128 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+        .filter(|s| {
+            s.len() == 128
+                && s.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
         .ok_or(())?;
     Ok((pubkey, ts, nonce, sig))
 }

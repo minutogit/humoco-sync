@@ -71,6 +71,15 @@ pub fn validate_channel(raw: &str) -> Option<String> {
     }
 }
 
+pub fn validate_admin_member_channel(raw: &str) -> Option<String> {
+    let clean = raw.trim();
+    if matches!(clean, "card" | "wot" | "backup" | "post" | "media" | "lock") {
+        Some(clean.to_string())
+    } else {
+        None
+    }
+}
+
 /// Validates `X-Drop-Prefix`: `[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?`, no `--`.
 pub fn validate_drop_prefix(raw: &str) -> Option<String> {
     let s = raw.trim();
@@ -147,6 +156,67 @@ pub fn format_admin_put_revoke_message(
     )
 }
 
+pub fn format_admin_put_lock_delegate_message(
+    timestamp: i64,
+    nonce: &str,
+    body_sha256_hex: &str,
+) -> String {
+    format!(
+        "HUMOCO-DROP-ADMIN-V1\nPUT_LOCK_DELEGATE\n{}\n{}\n{}",
+        timestamp, nonce, body_sha256_hex
+    )
+}
+
+pub fn format_admin_post_lock_selftest_message(
+    timestamp: i64,
+    nonce: &str,
+    body_sha256_hex: &str,
+) -> String {
+    format!(
+        "HUMOCO-DROP-ADMIN-V1\nPOST_LOCK_SELFTEST\n{}\n{}\n{}",
+        timestamp, nonce, body_sha256_hex
+    )
+}
+
+pub fn format_lock_delegate_signature_message(
+    admin_pub: &str,
+    lock_pub: &str,
+    issued_at: u64,
+) -> String {
+    format!(
+        "HUMOCO-LOCK-DELEGATE-V1\n{}\n{}\n{}",
+        admin_pub, lock_pub, issued_at
+    )
+}
+
+pub fn format_lock_probe_signature_message(
+    lock_pub: &str,
+    client_nonce: &str,
+    server_time: u64,
+) -> String {
+    format!(
+        "HUMOCO-LOCK-PROBE-V1\n{}\n{}\n{}",
+        lock_pub, client_nonce, server_time
+    )
+}
+
+pub fn format_lock_selftest_signature_message(
+    runtime: &str,
+    checked_at: u64,
+    lock_pub: &str,
+    all_passed: bool,
+    checks_digest_hex: &str,
+) -> String {
+    format!(
+        "HUMOCO-LOCK-SELFTEST-V1\n{}\n{}\n{}\n{}\n{}",
+        runtime,
+        checked_at,
+        lock_pub,
+        if all_passed { 1 } else { 0 },
+        checks_digest_hex
+    )
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct RevocationReplacementTarget {
     pub write_url: String,
@@ -200,7 +270,11 @@ pub fn verify_revocation_notice(
         return Err("Missing revocation timestamps".to_string());
     }
     if let Some(ref reason) = notice.reason {
-        if reason.len() > 200 || reason.contains('\n') || reason.contains('\r') || reason.contains('\0') {
+        if reason.len() > 200
+            || reason.contains('\n')
+            || reason.contains('\r')
+            || reason.contains('\0')
+        {
             return Err("Invalid revocation reason".to_string());
         }
     }
@@ -377,7 +451,12 @@ pub fn verify_stateless_token(
     Ok(claims)
 }
 
-pub fn create_pow_challenge(pepper: &[u8; 32], pubkey: &str, difficulty_bits: u8, now_secs: u64) -> String {
+pub fn create_pow_challenge(
+    pepper: &[u8; 32],
+    pubkey: &str,
+    difficulty_bits: u8,
+    now_secs: u64,
+) -> String {
     let rand_hex = random_hex(12);
     let exp = now_secs + 300;
     let body = format!("{}.{}.{}.{}", pubkey, difficulty_bits, exp, rand_hex);
@@ -417,7 +496,9 @@ pub fn verify_pow_solution(
     {
         return Err("Invalid PoW challenge signature".to_string());
     }
-    let exp: u64 = exp_str.parse().map_err(|_| "Invalid PoW expiry".to_string())?;
+    let exp: u64 = exp_str
+        .parse()
+        .map_err(|_| "Invalid PoW expiry".to_string())?;
     if now_secs > exp {
         return Err("PoW challenge expired".to_string());
     }

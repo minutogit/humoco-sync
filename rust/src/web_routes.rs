@@ -38,7 +38,10 @@ pub fn web_router(cfg: &Config) -> Router<AppState> {
             &format!("{}/delete-request", reg),
             post(register_delete_request),
         )
-        .route(&format!("{}/delete-confirm", reg), get(register_delete_confirm))
+        .route(
+            &format!("{}/delete-confirm", reg),
+            get(register_delete_confirm),
+        )
         .route("/admin", get(admin_dashboard))
         .route("/admin/login", post(admin_login_submit))
         .route("/admin/logout", post(admin_logout_submit))
@@ -207,10 +210,7 @@ struct RegisterQuery {
     err: Option<String>,
 }
 
-async fn register_page(
-    State(state): State<AppState>,
-    Query(q): Query<RegisterQuery>,
-) -> Response {
+async fn register_page(State(state): State<AppState>, Query(q): Query<RegisterQuery>) -> Response {
     if !state.config.mode.enable_public_registration {
         let html = layout_html(
             "Registration Disabled",
@@ -273,7 +273,11 @@ async fn register_page(
                 format_bytes(eff.profile.max_total_bytes)
             );
             if let Some(v) = eff.valid_until {
-                let _ = write!(body, r#"<p class="muted">Valid until UNIX timestamp: <code>{}</code></p>"#, v);
+                let _ = write!(
+                    body,
+                    r#"<p class="muted">Valid until UNIX timestamp: <code>{}</code></p>"#,
+                    v
+                );
             }
             if eff.in_grace_period {
                 let _ = write!(
@@ -285,7 +289,10 @@ async fn register_page(
             body.push_str(
                 r#"<p class="muted">You can now return to your Human Money App and click <strong>Re-check Activation</strong>.</p></div>"#,
             );
-        } else if reg_rec.as_ref().is_some_and(|r| r.status == AccountStatus::Suspended) {
+        } else if reg_rec
+            .as_ref()
+            .is_some_and(|r| r.status == AccountStatus::Suspended)
+        {
             body.push_str(r#"<div style="margin-top:1rem;"><span class="badge err">Suspended</span><p class="muted">This account has been suspended by the operator.</p></div>"#);
         } else {
             body.push_str(r#"<div style="margin-top:1rem;"><span class="badge warn">Not Activated Yet</span><p class="muted">Complete one of the activation methods below.</p></div>"#);
@@ -344,12 +351,7 @@ async fn register_page(
     // PoW Gate Card
     if state.config.gate_enabled("pow") && !key_for_forms.is_empty() {
         let difficulty = state.config.security.pow_difficulty_bits;
-        let challenge = create_pow_challenge(
-            state.db.pepper(),
-            key_for_forms,
-            difficulty,
-            now,
-        );
+        let challenge = create_pow_challenge(state.db.pepper(), key_for_forms, difficulty, now);
         let _ = write!(
             body,
             r#"<div class="card">
@@ -461,7 +463,11 @@ async fn register_email_submit(
     Form(form): Form<EmailRegisterForm>,
 ) -> Response {
     if !state.config.gate_enabled("email") {
-        return Redirect::to(&format!("{}?err=Email+registration+disabled", state.config.mode.register_path)).into_response();
+        return Redirect::to(&format!(
+            "{}?err=Email+registration+disabled",
+            state.config.mode.register_path
+        ))
+        .into_response();
     }
     let ip = extract_client_ip(
         peer.map(|ConnectInfo(s)| s),
@@ -469,10 +475,18 @@ async fn register_email_submit(
         state.config.server.trusted_proxy_hops,
     );
     if !state.rate_limiter.allow_ip(ip) {
-        return Redirect::to(&format!("{}?err=Rate+limit+exceeded", state.config.mode.register_path)).into_response();
+        return Redirect::to(&format!(
+            "{}?err=Rate+limit+exceeded",
+            state.config.mode.register_path
+        ))
+        .into_response();
     }
     let Some(pubkey) = normalize_pubkey_hex(&form.pubkey) else {
-        return Redirect::to(&format!("{}?err=Invalid+public+sync+key", state.config.mode.register_path)).into_response();
+        return Redirect::to(&format!(
+            "{}?err=Invalid+public+sync+key",
+            state.config.mode.register_path
+        ))
+        .into_response();
     };
     let Some(canon_email) = canonicalize_email(&form.email) else {
         return Redirect::to(&format!(
@@ -481,7 +495,10 @@ async fn register_email_submit(
         ))
         .into_response();
     };
-    if let Err(err) = state.db.check_email_not_used_by_other(&canon_email, &pubkey) {
+    if let Err(err) = state
+        .db
+        .check_email_not_used_by_other(&canon_email, &pubkey)
+    {
         return Redirect::to(&format!(
             "{}?key={}&err={}",
             state.config.mode.register_path,
@@ -533,7 +550,10 @@ async fn register_email_submit(
         .mailer
         .send_mail(
             form.email.trim(),
-            &format!("{} — Confirm Sync Key Activation", state.config.mode.service_name),
+            &format!(
+                "{} — Confirm Sync Key Activation",
+                state.config.mode.service_name
+            ),
             &mail_body,
         )
         .await
@@ -551,7 +571,9 @@ async fn register_email_submit(
         "{}?key={}&msg={}",
         state.config.mode.register_path,
         pubkey,
-        url_encode("Confirmation link dispatched. Check your inbox and click the link to activate.")
+        url_encode(
+            "Confirmation link dispatched. Check your inbox and click the link to activate."
+        )
     ))
     .into_response()
 }
@@ -562,15 +584,13 @@ struct TokenQuery {
     token: String,
 }
 
-async fn register_confirm(
-    State(state): State<AppState>,
-    Query(q): Query<TokenQuery>,
-) -> Response {
+async fn register_confirm(State(state): State<AppState>, Query(q): Query<TokenQuery>) -> Response {
     if !state.config.mode.enable_public_registration {
         return Redirect::to("/").into_response();
     }
     let now = unix_now();
-    let claims = match verify_stateless_token(state.db.pepper(), &q.token, "confirm_register", now) {
+    let claims = match verify_stateless_token(state.db.pepper(), &q.token, "confirm_register", now)
+    {
         Ok(c) => c,
         Err(e) => {
             return Redirect::to(&format!(
@@ -634,7 +654,11 @@ async fn register_redeem_submit(
     Form(form): Form<RedeemForm>,
 ) -> Response {
     if !state.config.gate_enabled("code") {
-        return Redirect::to(&format!("{}?err=Code+redemption+disabled", state.config.mode.register_path)).into_response();
+        return Redirect::to(&format!(
+            "{}?err=Code+redemption+disabled",
+            state.config.mode.register_path
+        ))
+        .into_response();
     }
     let ip = extract_client_ip(
         peer.map(|ConnectInfo(s)| s),
@@ -642,10 +666,18 @@ async fn register_redeem_submit(
         state.config.server.trusted_proxy_hops,
     );
     if !state.rate_limiter.allow_ip(ip) {
-        return Redirect::to(&format!("{}?err=Rate+limit+exceeded", state.config.mode.register_path)).into_response();
+        return Redirect::to(&format!(
+            "{}?err=Rate+limit+exceeded",
+            state.config.mode.register_path
+        ))
+        .into_response();
     }
     let Some(pubkey) = normalize_pubkey_hex(&form.pubkey) else {
-        return Redirect::to(&format!("{}?err=Invalid+public+sync+key", state.config.mode.register_path)).into_response();
+        return Redirect::to(&format!(
+            "{}?err=Invalid+public+sync+key",
+            state.config.mode.register_path
+        ))
+        .into_response();
     };
     let now = unix_now();
     match state
@@ -683,7 +715,11 @@ async fn register_pow_submit(
     Form(form): Form<PowForm>,
 ) -> Response {
     if !state.config.gate_enabled("pow") {
-        return Redirect::to(&format!("{}?err=PoW+registration+disabled", state.config.mode.register_path)).into_response();
+        return Redirect::to(&format!(
+            "{}?err=PoW+registration+disabled",
+            state.config.mode.register_path
+        ))
+        .into_response();
     }
     let ip = extract_client_ip(
         peer.map(|ConnectInfo(s)| s),
@@ -691,15 +727,27 @@ async fn register_pow_submit(
         state.config.server.trusted_proxy_hops,
     );
     if !state.rate_limiter.allow_ip(ip) {
-        return Redirect::to(&format!("{}?err=Rate+limit+exceeded", state.config.mode.register_path)).into_response();
+        return Redirect::to(&format!(
+            "{}?err=Rate+limit+exceeded",
+            state.config.mode.register_path
+        ))
+        .into_response();
     }
     let Some(pubkey) = normalize_pubkey_hex(&form.pubkey) else {
-        return Redirect::to(&format!("{}?err=Invalid+public+sync+key", state.config.mode.register_path)).into_response();
+        return Redirect::to(&format!(
+            "{}?err=Invalid+public+sync+key",
+            state.config.mode.register_path
+        ))
+        .into_response();
     };
     let now = unix_now();
-    if let Err(err) =
-        verify_pow_solution(state.db.pepper(), &form.challenge, &pubkey, &form.nonce, now)
-    {
+    if let Err(err) = verify_pow_solution(
+        state.db.pepper(),
+        &form.challenge,
+        &pubkey,
+        &form.nonce,
+        now,
+    ) {
         return Redirect::to(&format!(
             "{}?key={}&err={}",
             state.config.mode.register_path,
@@ -748,7 +796,11 @@ async fn register_open_submit(
     Form(form): Form<OpenForm>,
 ) -> Response {
     if !state.config.gate_enabled("open") {
-        return Redirect::to(&format!("{}?err=Open+registration+disabled", state.config.mode.register_path)).into_response();
+        return Redirect::to(&format!(
+            "{}?err=Open+registration+disabled",
+            state.config.mode.register_path
+        ))
+        .into_response();
     }
     let ip = extract_client_ip(
         peer.map(|ConnectInfo(s)| s),
@@ -756,10 +808,18 @@ async fn register_open_submit(
         state.config.server.trusted_proxy_hops,
     );
     if !state.rate_limiter.allow_ip(ip) {
-        return Redirect::to(&format!("{}?err=Rate+limit+exceeded", state.config.mode.register_path)).into_response();
+        return Redirect::to(&format!(
+            "{}?err=Rate+limit+exceeded",
+            state.config.mode.register_path
+        ))
+        .into_response();
     }
     let Some(pubkey) = normalize_pubkey_hex(&form.pubkey) else {
-        return Redirect::to(&format!("{}?err=Invalid+public+sync+key", state.config.mode.register_path)).into_response();
+        return Redirect::to(&format!(
+            "{}?err=Invalid+public+sync+key",
+            state.config.mode.register_path
+        ))
+        .into_response();
     };
     if !state.rate_limiter.check_and_record_registration_subnet(ip) {
         return Redirect::to(&format!(
@@ -807,10 +867,18 @@ async fn register_delete_request(
         state.config.server.trusted_proxy_hops,
     );
     if !state.rate_limiter.allow_ip(ip) {
-        return Redirect::to(&format!("{}?err=Rate+limit+exceeded", state.config.mode.register_path)).into_response();
+        return Redirect::to(&format!(
+            "{}?err=Rate+limit+exceeded",
+            state.config.mode.register_path
+        ))
+        .into_response();
     }
     let Some(pubkey) = normalize_pubkey_hex(&form.pubkey) else {
-        return Redirect::to(&format!("{}?err=Invalid+public+sync+key", state.config.mode.register_path)).into_response();
+        return Redirect::to(&format!(
+            "{}?err=Invalid+public+sync+key",
+            state.config.mode.register_path
+        ))
+        .into_response();
     };
     let Some(canon_email) = canonicalize_email(&form.email) else {
         return Redirect::to(&format!(
@@ -846,7 +914,10 @@ async fn register_delete_request(
                 .mailer
                 .send_mail(
                     form.email.trim(),
-                    &format!("{} — Confirm Account Deletion", state.config.mode.service_name),
+                    &format!(
+                        "{} — Confirm Account Deletion",
+                        state.config.mode.service_name
+                    ),
                     &mail_body,
                 )
                 .await;
@@ -962,7 +1033,10 @@ async fn admin_dashboard(
     let csrf = generate_session_csrf_pair(state.db.pepper(), &sid);
     let now = unix_now();
     let stats = state.db.admin_status(&state.config, now);
-    let users = state.db.list_admin_users(&state.config, now).unwrap_or_default();
+    let users = state
+        .db
+        .list_admin_users(&state.config, now)
+        .unwrap_or_default();
     let codes = state.db.list_redeem_codes().unwrap_or_default();
 
     let mut body = String::new();
@@ -1198,7 +1272,9 @@ async fn admin_logout_submit(
     let mut resp = Redirect::to("/admin").into_response();
     resp.headers_mut().insert(
         header::SET_COOKIE,
-        HeaderValue::from_static("humoco_admin_sess=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/admin"),
+        HeaderValue::from_static(
+            "humoco_admin_sess=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/admin",
+        ),
     );
     resp
 }
@@ -1240,7 +1316,9 @@ async fn admin_user_profile_submit(
         now,
     ) {
         Ok(_) => Redirect::to("/admin?msg=User+profile+updated").into_response(),
-        Err(e) => Redirect::to(&format!("/admin?err={}", url_encode(&e.to_string()))).into_response(),
+        Err(e) => {
+            Redirect::to(&format!("/admin?err={}", url_encode(&e.to_string()))).into_response()
+        }
     }
 }
 
@@ -1269,7 +1347,9 @@ async fn admin_user_status_submit(
     };
     match state.db.set_user_status(&pk, st, unix_now()) {
         Ok(()) => Redirect::to("/admin?msg=User+status+updated").into_response(),
-        Err(e) => Redirect::to(&format!("/admin?err={}", url_encode(&e.to_string()))).into_response(),
+        Err(e) => {
+            Redirect::to(&format!("/admin?err={}", url_encode(&e.to_string()))).into_response()
+        }
     }
 }
 
@@ -1292,7 +1372,9 @@ async fn admin_user_delete_submit(
     };
     match state.db.delete_account_and_data(&pk, false) {
         Ok(_) => Redirect::to("/admin?msg=User+deleted").into_response(),
-        Err(e) => Redirect::to(&format!("/admin?err={}", url_encode(&e.to_string()))).into_response(),
+        Err(e) => {
+            Redirect::to(&format!("/admin?err={}", url_encode(&e.to_string()))).into_response()
+        }
     }
 }
 
@@ -1316,7 +1398,12 @@ async fn admin_create_code_submit(
     if verify_admin_cookie_and_csrf(&state, &headers, &form.csrf).is_none() {
         return Redirect::to("/admin?err=Session+expired").into_response();
     }
-    let count = form.count.trim().parse::<usize>().unwrap_or(1).clamp(1, 100);
+    let count = form
+        .count
+        .trim()
+        .parse::<usize>()
+        .unwrap_or(1)
+        .clamp(1, 100);
     let dur = form
         .duration_days
         .trim()
@@ -1340,11 +1427,17 @@ async fn admin_create_code_submit(
             let preview: Vec<_> = created.iter().take(5).map(|c| c.code.as_str()).collect();
             Redirect::to(&format!(
                 "/admin?msg={}",
-                url_encode(&format!("Created {} code(s): {}", created.len(), preview.join(", ")))
+                url_encode(&format!(
+                    "Created {} code(s): {}",
+                    created.len(),
+                    preview.join(", ")
+                ))
             ))
             .into_response()
         }
-        Err(e) => Redirect::to(&format!("/admin?err={}", url_encode(&e.to_string()))).into_response(),
+        Err(e) => {
+            Redirect::to(&format!("/admin?err={}", url_encode(&e.to_string()))).into_response()
+        }
     }
 }
 

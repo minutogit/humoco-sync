@@ -170,7 +170,11 @@ pub fn extract_client_ip(
         return peer_ip;
     }
     if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        let parts: Vec<&str> = xff.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+        let parts: Vec<&str> = xff
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
         if !parts.is_empty() {
             let hops = trusted_proxy_hops as usize;
             let idx = parts.len().saturating_sub(hops);
