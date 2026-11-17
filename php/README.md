@@ -6,7 +6,7 @@ The **HuMoCo Sync-Dienst** is an ultra-lightweight, zero-dependency PHP script d
 
 ## 1. Architecture & Security Invariants
 
-* **Zero Dependencies:** Pure PHP (>= 7.4 with core `ext-sodium`). No Composer, no SQL or SQLite database, no background daemons, and no external extensions.
+* **Zero Dependencies:** Pure PHP (>= 8.1 with core `ext-sodium` and `hash('sha3-256')`, required for durable `fsync()`). No Composer, no SQL or SQLite database, no background daemons, and no external extensions. PHP 7.4 and 8.0 are unsupported (EOL).
 * **Zero Plaintext Knowledge:** The server operator, hoster, and network observers see only encrypted binary blobs (`SlotBlob` / `PostBoxEntry` / `.hmcbackup`). The server cannot decrypt contact cards, marketplace listings, trust lists, or messages.
 * **Strict 64-Hex Ed25519 Request Signatures:** Every mutating request is signed with detached Ed25519 signatures validated via `sodium_crypto_sign_verify_detached`:
   - **Private Sync Services:** Members sign with a stealth key derived via ECDH + `HUMOCO_DROP_STEALTH_SEED_V1` ($P$).

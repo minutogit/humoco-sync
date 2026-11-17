@@ -1,7 +1,7 @@
 # Project Status: `humoco-sync`
 
 **Version:** `v0.1.0`  
-**Last Updated:** 2026-11-15
+**Last Updated:** 2026-11-17
 
 ## Overview
 `humoco-sync` is the 6th repository in the HuMoCo ecosystem, housing both the lightweight PHP sync script (`php/`) and the high-performance Rust sync daemon (`rust/humoco-sync-server`), unified under [`SPEC.md`](SPEC.md) and verified by a shared blackbox integration test suite (`tests/run.sh`).
@@ -10,6 +10,7 @@
 
 | ID | Task | Status | Notes |
 |---|---|---|---|
+| `SYNC-006a` | Canonical Lock Channel wire specification (`SPEC.md` Section 6) & PHP >= 8.1 baseline (`README.md`, `SPEC.md`, `php/README.md`) | ✅ **Done** | Specified `?lock_delegate`, `?lock_selftest`, `?lock_ticket` (member + PoW), `?lock` (WAF probe + batch), fixed `605`-byte `LockEntry` wire layout, deterministic `XChaCha20-Poly1305` pro-hop AEAD (`265`B), `CausalOutputProof` + 1-child-per-output rule, `depth=0` `root_mig_sig`, quarterly retention GC (`init.deletable_at`), and `known_head_receipt` Self-Freeze |
 | `SYNC-005` | Raise PHP `card`/`wot` defaults to `512 KiB` & harmonize `HEAD` headers (`X-Channel-Max-Bytes`, `ETag`, `X-Drop-Authorized`) across PHP & Rust (`SPEC.md`) | ✅ **Done** | PHP `card`/`wot` defaults at `512 KiB` + unified `HEAD` headers across PHP/Rust/`SPEC.md`; 39/39 Rust blackbox assertions (`tests/run.sh --target rust`), 4/4 Rust integration tests, and `clippy` (0 warnings) passed (PHP CLI not installed locally) |
 | `SYNC-001` | Extract `php/` from `human-money-app`, author `SPEC.md`, add `DELETE ?account` | ✅ **Done** | Single source of truth for PHP & Rust |
 | `SYNC-002` | Rust Daemon Core (`axum`, `tokio`, `redb`, RAM rate-limiter, streaming `PUT`, Prio-3 eviction, Hybrid separation) | ✅ **Done** | `#![forbid(unsafe_code)]`, 100% `sync.php` wire parity (both `/sync.php` & `/sync`), pure-public `drop_pub` synthesis |

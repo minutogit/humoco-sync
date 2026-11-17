@@ -2,7 +2,7 @@
 
 **`humoco-sync`** provides two wire-compatible server implementations for privacy-preserving, zero-knowledge synchronization in the **Human Money (HuMoCo)** ecosystem:
 
-1. **`php/` (`sync.php`)** — Zero-dependency PHP ($\ge 7.4$ + `ext-sodium`) single-file drop-in for shared web hosting and small friend circles.
+1. **`php/` (`sync.php`)** — Zero-dependency PHP ($\ge 8.1$ + `ext-sodium`, `hash('sha3-256')`) single-file drop-in + `lock_handler.php` for shared web hosting and small friend circles.
 2. **`rust/` (`humoco-sync-server`)** — High-performance, `#![forbid(unsafe_code)]`, async Rust daemon (`axum` + `tokio` + `redb`) built for public community hosting, VPS deployments, hybrid friend+public operation, storage pool isolation, quota profiles, and web/API self-service.
 
 Both servers implement the exact protocol defined in [`SPEC.md`](SPEC.md), so **Human Money App** treats them identically.
@@ -24,7 +24,7 @@ See [`config.example.toml`](config.example.toml) and [`docker/`](docker/) for pr
 
 ## Quick Start: PHP (Shared Hosting)
 
-Upload the contents of `php/` (or export the pre-configured ZIP directly from **Settings → Own Sync Service** in `human-money-app`) to any PHP $\ge 7.4$ webspace with `ext-sodium`. For local development:
+Upload the contents of `php/` (or export the pre-configured ZIP directly from **Settings → Own Sync Service** in `human-money-app`) to any PHP $\ge 8.1$ webspace with `ext-sodium`. For local development:
 
 ```bash
 ./php/start-sync-server.sh
