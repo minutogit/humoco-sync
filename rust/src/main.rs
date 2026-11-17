@@ -71,6 +71,15 @@ enum Commands {
         #[command(subcommand)]
         action: SignTestCmd,
     },
+    /// Run lock quarterly retention garbage collection at a given Unix timestamp
+    LockGc {
+        /// Path to TOML configuration file (or set HUMOCO_SYNC_CONFIG)
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+        /// Simulated current Unix timestamp in seconds
+        #[arg(long)]
+        now_secs: u64,
+    },
 }
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -186,6 +195,7 @@ async fn main() {
             bind,
         } => run_generate_config(mode, admin_pubkey, public_url, bind),
         Commands::SignTest { action } => run_sign_test(action),
+        Commands::LockGc { config, now_secs } => run_lock_gc(config, now_secs),
     };
 
     if exit_code != 0 {
@@ -743,4 +753,37 @@ fn run_make_lock_sample(
     });
     println!("{}", req);
     0
+}
+
+fn run_lock_gc(config_opt: Option<PathBuf>, now_secs: u64) -> i32 {
+    let config_path = config_opt
+        .or_else(|| std::env::var_os("HUMOCO_SYNC_CONFIG").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("config.toml"));
+    let cfg = match Config::load_from_path(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Configuration error: {}", e);
+            return 1;
+        }
+    };
+    let state = match AppState::from_config(cfg) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Database initialization error: {}", e);
+            return 1;
+        }
+    };
+    match state.db.run_lock_gc(now_secs) {
+        Ok((purged_buckets, purged_inodes)) => {
+            println!(
+                "purged_buckets={} purged_inodes={}",
+                purged_buckets, purged_inodes
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("Lock GC failed: {}", e);
+            1
+        }
+    }
 }
