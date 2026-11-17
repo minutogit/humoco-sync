@@ -28,11 +28,16 @@ Both `/sync.php` and `/sync` accept identical query parameters and HTTP methods.
 | Re-run lock selftest live | `POST /sync.php?lock_selftest` | Admin Ed25519 signature (`HUMOCO-DROP-ADMIN-V1`) |
 | Issue offline GenesisTicket | `POST /sync.php?lock_ticket` | Member/Registered/Admin `HUMOCO-DROP-REQ-V1` or server ticket PoW |
 | Submit lock batch or WAF probe | `POST /sync.php?lock` | Public (IP rate-limited; cryptographic causal & PoW admission) |
+| Inspect rotation / freeze state | `GET /sync.php?lock_freeze&anchor_id=<64-hex>` | Public (IP rate-limited) |
+| Submit pre-freeze, proposal, veto, heartbeat | `POST /sync.php?lock_freeze` | Authority / holder per Concept §5.4 |
+| Target union import & `ImportAck` | `POST /sync.php?lock_import` | Public (IP rate-limited; verifies `>= Q_old` snapshots & timelock) |
+| Sign or finalize `MigrationCert` commit | `POST /sync.php?lock_commit` | Public (IP rate-limited; verifies all `ImportAck`s / chain) |
 | Static catalog (friends only) | `GET <read_url>/index.json` | Public |
 | Static revocation notice | `GET <read_url>/revocation.json` | Public |
+| Static anchor chain discovery manifest | `GET /anchors/<anchor_id>.bin` (or `<read_url>/anchors/<anchor_id>.bin`) | Public (`ETag` / `304 Not Modified`) |
 | Static encrypted slot | `GET <read_url>/<id>[_<prefix>].<ch>.bin` | Public |
 | Static encrypted media blob | `GET <read_url>/<blob_id>.media.bin` | Public |
-| Static blind collision lock entry | `GET <read_url>/locks/<YYYY-QN>/<bucket_hex64>/<file_hex64>.bin` | Public (with `ETag` / `304 Not Modified`) |
+| Static blind collision lock entry | `GET <read_url>/locks/<YYYY-QN>/<bucket_hex64>/<file_hex64>.lock` | Public (with `ETag` / `304 Not Modified`) |
 
 Any unrecognized method/query combination on `/sync.php` returns `405 Method Not Allowed` with `Allow: GET, HEAD, PUT, DELETE, POST`.
 
@@ -503,3 +508,38 @@ The Lock Channel provides a blind, write-once, voucher-pinned collision registry
    }
    ```
    Note: The prefix `0..idx` returns `"first_write"` receipts in `receipts` (true committed ancestors); the leaf conflict at `idx` returns `conflict.receipt` (`"conflict_seen"`) and `conflict.competing_entry`, and **no** entries `> idx` are executed.
+
+---
+
+## 7. Committee Rotation, Timelock, Veto & Anchor Discovery (`SYNC-007`)
+
+### 7.1 Bucket Freeze States & Revocation
+
+1. **Planned Server Move (Fall A / `PUT ?revoke`):** When a server revocation notice is active (`GET ?revoke` / `revocation.json`), `POST ?lock_ticket`, `POST ?lock`, and `?lock_freeze` / `?lock_import` / `?lock_commit` fail closed with **`410 Gone`** carrying the signed `SyncRevocationNotice` (`"revocation": { ... }`). Existing static `.lock` blobs remain readable unless decommissioned.
+2. **Pre-Proposal Freeze (`pre_proposal_frozen`, TTL `1800 s`):** Temporarily halts `POST ?lock` (`409 Conflict` with `"error": "pre_proposal_frozen"` and `"expires_at"`). Automatically reverts to `Active` on any request once `now >= expires_at` (`LÜCKE-04c`), preventing indefinite Freeze-DoS without an accepted proposal.
+3. **Epoch Freeze (`409 epoch_frozen`):** After `MigrationCert` commit removes an old server from the active committee, it responds to `POST ?lock` with **`409 Conflict`**:
+   ```json
+   {
+     "error": "epoch_frozen",
+     "bucket": "<64-hex>",
+     "current_revision": 2,
+     "latest_manifest": { "...": "verified AnchorManifest JSON incl. migration_chain" }
+   }
+   ```
+
+### 7.2 Rotation Endpoints
+
+1. **`GET /sync.php?lock_freeze&anchor_id=<64-hex>`:** Returns current freeze state, `active_manifest`, `last_creator_activity_secs`, `voted_proposal`, and signed `SnapshotExport` (when frozen).
+2. **`POST /sync.php?lock_freeze` (`{"action": ...}`):**
+   - `pre_freeze`: Freezes active bucket with TTL `lock.pre_freeze_ttl_secs` (`1800 s`) and returns non-permanent `SnapshotExport`.
+   - `heartbeat`: Verifies `CreatorHeartbeat` (`HUMOCO_CREATOR_HB_V1`) against `creator_mig_pub` and updates `last_creator_activity_secs`.
+   - `propose`: Enforces `voted_proposal[from_rev]` uniqueness (re-returns idempotently if identical digest, `409 Conflict` on differing proposal), authority/standby authorization, `CREATOR_INACTIVITY_TAKEOVER_SECS` (`30 d`) for `ProposalInitiator::Guarantor`, nomination binding (`humoco_proto::verify_nomination_binding`), binds `frozen_at = now` for the `72 h` (`259200 s`) timelock, permanently freezes the bucket, and returns signed `SnapshotExport` (`HUMOCO_FREEZE_SNAP_V1` + `HUMOCO_FREEZE_STATE_V1`).
+   - `veto`: Before `timelock` expiry, verifies `MigrationVeto` (`HUMOCO_MIGRATION_VETO_V1`) from an authority distinct from the proposer, blacklists `proposal_hash`, clears `voted_proposal[from_rev]`, and unfreezes the bucket back to `Active`.
+3. **`POST /sync.php?lock_import`:** Target server in `proposal.new_servers` verifies `active_manifest.verify_anchor_id(&anchor_id)`, `retain_until_quarter` invariance, `72 h` timelock elapsed against both `proposal.proposed_at` and `>= Q_old` snapshot `frozen_at` timestamps, nomination binding, and executes `humoco_proto::resolve_import_union`:
+   - Preserves every single-entry slot and resolves conflicting slots with a verified `QuorumCertificate` across historical committees `1..=from_rev`.
+   - Conflicting entries lacking a QC stay `CONFLICT([A, B, ...])` (`LOCK_CONFLICTS` table; future `POST ?lock` returns `ConflictSeen` carrying the competing wire entry, while valid children of surviving branches remain unblocked).
+   - Signs and returns `ImportAck` (`HUMOCO_IMPORT_ACK_V1`) committing `imported_state_hash` (`HUMOCO_IMPORT_STATE_V1`).
+4. **`POST /sync.php?lock_commit` (`{"action": ...}`):**
+   - `sign_commit`: Verifies `import_acks` cover every member of `proposal.new_servers` with identical `imported_state_hash`, then returns this server's `CommitteeSignature` (`HUMOCO_MIGRATION_CERT_V1`).
+   - `finalize`: Verifies completed `new_manifest.verify_anchor_id(&anchor_id)`, stores `new_manifest` for `/anchors/<anchor_id>.bin`, transitions active committee members back to `Active` (except `SelfFrozen`), and marks retired servers `EpochFrozen`.
+5. **Static Discovery (`GET /anchors/<anchor_id>.bin` and `<read_url>/anchors/<anchor_id>.bin`):** Serves the latest verified `AnchorManifest` JSON with `ETag` and `Cache-Control: no-cache`, purged only during bucket retention GC (`Quartalsende + 30 d`).

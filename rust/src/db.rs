@@ -30,12 +30,17 @@ const USED_ACTION_JTIS: TableDefinition<&str, u64> = TableDefinition::new("used_
 
 pub(crate) const LOCK_BUCKETS: TableDefinition<&str, &[u8]> = TableDefinition::new("lock_buckets");
 pub(crate) const LOCK_ENTRIES: TableDefinition<&str, &[u8]> = TableDefinition::new("lock_entries");
+pub(crate) const LOCK_CONFLICTS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("lock_conflicts");
 pub(crate) const LOCK_OUTPUT_CLAIMS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("lock_output_claims");
 pub(crate) const LOCK_FILE_INDEX: TableDefinition<&str, &[u8]> =
     TableDefinition::new("lock_file_index");
 pub(crate) const LOCK_QUARTER_INDEX: TableDefinition<&str, &[u8]> =
     TableDefinition::new("lock_quarter_index");
+pub(crate) const LOCK_ROTATIONS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("lock_rotations");
+pub(crate) const LOCK_ANCHORS: TableDefinition<&str, &[u8]> = TableDefinition::new("lock_anchors");
 
 #[derive(Debug, Error)]
 pub enum DbError {
@@ -294,9 +299,12 @@ impl SyncDb {
             let _ = write_txn.open_table(USED_ACTION_JTIS)?;
             let lock_buckets = write_txn.open_table(LOCK_BUCKETS)?;
             let _ = write_txn.open_table(LOCK_ENTRIES)?;
+            let _ = write_txn.open_table(LOCK_CONFLICTS)?;
             let _ = write_txn.open_table(LOCK_OUTPUT_CLAIMS)?;
             let _ = write_txn.open_table(LOCK_FILE_INDEX)?;
             let _ = write_txn.open_table(LOCK_QUARTER_INDEX)?;
+            let _ = write_txn.open_table(LOCK_ROTATIONS)?;
+            let _ = write_txn.open_table(LOCK_ANCHORS)?;
 
             // Anti-Amnesia guard (SPEC Section 6.1): if lock buckets exist, the persistent
             // lock signing keypair MUST already exist inside redb.

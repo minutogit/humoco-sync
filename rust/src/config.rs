@@ -60,6 +60,9 @@ pub struct LockConfig {
     pub allow_pow_tickets: bool,
     pub ticket_pow_bits: u32,
     pub max_inodes: u64,
+    pub pre_freeze_ttl_secs: u64,
+    pub proposal_timelock_secs: u64,
+    pub creator_inactivity_secs: u64,
 }
 
 impl Default for LockConfig {
@@ -71,6 +74,9 @@ impl Default for LockConfig {
             allow_pow_tickets: false,
             ticket_pow_bits: 16,
             max_inodes: 50_000,
+            pre_freeze_ttl_secs: humoco_proto::PRE_PROPOSAL_FREEZE_TTL_SECS,
+            proposal_timelock_secs: humoco_proto::PROPOSAL_TIMELOCK_SECS,
+            creator_inactivity_secs: humoco_proto::CREATOR_INACTIVITY_TAKEOVER_SECS,
         }
     }
 }

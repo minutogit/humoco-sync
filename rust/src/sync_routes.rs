@@ -19,17 +19,21 @@ use crate::crypto::{
     verify_ed25519_hex, verify_revocation_notice, RevocationNotice,
 };
 use crate::db::{normalize_etag, ConditionalPrecondition};
+use crate::lock_rotation::{LockCommitRequest, LockFreezeRequest, LockImportRequest};
 use crate::locks::{LockBatchRequest, LockDelegation, LockTicketRequest, TicketCallerAuth};
 use crate::ratelimit::extract_client_ip;
 use crate::state::{db_err_to_response, json_error, AppState};
 
 pub fn sync_router(cfg: &Config) -> Router<AppState> {
     let data_route = format!("/{}/:filename", cfg.server.data_dir);
+    let anchor_data_route = format!("/{}/anchors/:filename", cfg.server.data_dir);
     let lock_read_route = format!("/{}/locks/:quarter/:bucket/:filename", cfg.server.data_dir);
     Router::new()
         .route("/sync.php", any(handle_sync_endpoint))
         .route("/sync", any(handle_sync_endpoint))
         .route(&lock_read_route, any(handle_static_lock))
+        .route(&anchor_data_route, any(handle_static_anchor))
+        .route("/anchors/:filename", any(handle_static_anchor))
         .route(&data_route, any(handle_static_data))
 }
 
@@ -64,6 +68,15 @@ async fn handle_sync_endpoint(
                 handle_get_status(&state, &headers).await
             } else if query_params.contains_key("lock_selftest") && query_params.len() == 1 {
                 handle_get_lock_selftest(&state).await
+            } else if query_params.contains_key("lock_freeze")
+                && query_params.contains_key("anchor_id")
+                && query_params.len() == 2
+            {
+                let anchor_hex = query_params
+                    .get("anchor_id")
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                handle_get_lock_freeze(&state, anchor_hex).await
             } else {
                 method_not_allowed()
             }
@@ -96,6 +109,12 @@ async fn handle_sync_endpoint(
                 handle_post_lock_ticket(&state, &headers, body).await
             } else if query_params.contains_key("lock_selftest") && query_params.len() == 1 {
                 handle_post_lock_selftest(&state, &headers, body).await
+            } else if query_params.contains_key("lock_freeze") && query_params.len() == 1 {
+                handle_post_lock_freeze(&state, body).await
+            } else if query_params.contains_key("lock_import") && query_params.len() == 1 {
+                handle_post_lock_import(&state, body).await
+            } else if query_params.contains_key("lock_commit") && query_params.len() == 1 {
+                handle_post_lock_commit(&state, body).await
             } else if query_params.contains_key("lock") && query_params.len() == 1 {
                 handle_post_lock(&state, body).await
             } else {
@@ -901,6 +920,12 @@ async fn handle_post_lock_ticket(state: &AppState, headers: &HeaderMap, body: Bo
 }
 
 async fn handle_post_lock(state: &AppState, body: Body) -> Response {
+    match state.db.get_revocation() {
+        Ok(Some(_)) => return gone_revoked_response(state),
+        Ok(None) => {}
+        Err(e) => return db_err_to_response(e),
+    }
+
     let bytes = match axum::body::to_bytes(body, 256 * 1024).await {
         Ok(b) => b,
         Err(_) => return json_error(StatusCode::PAYLOAD_TOO_LARGE, "Lock payload too large"),
@@ -934,6 +959,150 @@ async fn handle_post_lock(state: &AppState, body: Body) -> Response {
             let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             (status, Json(body)).into_response()
         }
+        Err(e) => db_err_to_response(e),
+    }
+}
+
+async fn handle_get_lock_freeze(state: &AppState, anchor_hex: &str) -> Response {
+    match state.db.get_revocation() {
+        Ok(Some(_)) => return gone_revoked_response(state),
+        Ok(None) => {}
+        Err(e) => return db_err_to_response(e),
+    }
+    let Ok(anchor_id) = humoco_proto::decode_hex_fixed::<32>(anchor_hex) else {
+        return json_error(StatusCode::BAD_REQUEST, "Invalid anchor_id hex");
+    };
+    match state
+        .db
+        .get_lock_freeze_status(&state.config, anchor_id, unix_now())
+    {
+        Ok(val) => (StatusCode::OK, Json(val)).into_response(),
+        Err(e) => db_err_to_response(e),
+    }
+}
+
+async fn handle_post_lock_freeze(state: &AppState, body: Body) -> Response {
+    match state.db.get_revocation() {
+        Ok(Some(_)) => return gone_revoked_response(state),
+        Ok(None) => {}
+        Err(e) => return db_err_to_response(e),
+    }
+    let bytes = match axum::body::to_bytes(body, 256 * 1024).await {
+        Ok(b) => b,
+        Err(_) => {
+            return json_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Lock freeze payload too large",
+            )
+        }
+    };
+    let req: LockFreezeRequest = match serde_json::from_slice(&bytes) {
+        Ok(r) => r,
+        Err(_) => return json_error(StatusCode::BAD_REQUEST, "Invalid lock_freeze JSON"),
+    };
+    match state.db.process_lock_freeze(&state.config, req, unix_now()) {
+        Ok((code, val)) => {
+            let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            (status, Json(val)).into_response()
+        }
+        Err(e) => db_err_to_response(e),
+    }
+}
+
+async fn handle_post_lock_import(state: &AppState, body: Body) -> Response {
+    match state.db.get_revocation() {
+        Ok(Some(_)) => return gone_revoked_response(state),
+        Ok(None) => {}
+        Err(e) => return db_err_to_response(e),
+    }
+    let bytes = match axum::body::to_bytes(body, 8 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => {
+            return json_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Lock import payload too large",
+            )
+        }
+    };
+    let req: LockImportRequest = match serde_json::from_slice(&bytes) {
+        Ok(r) => r,
+        Err(_) => return json_error(StatusCode::BAD_REQUEST, "Invalid lock_import JSON"),
+    };
+    match state.db.process_lock_import(&state.config, req, unix_now()) {
+        Ok((code, val)) => {
+            let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            (status, Json(val)).into_response()
+        }
+        Err(e) => db_err_to_response(e),
+    }
+}
+
+async fn handle_post_lock_commit(state: &AppState, body: Body) -> Response {
+    match state.db.get_revocation() {
+        Ok(Some(_)) => return gone_revoked_response(state),
+        Ok(None) => {}
+        Err(e) => return db_err_to_response(e),
+    }
+    let bytes = match axum::body::to_bytes(body, 2 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => {
+            return json_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Lock commit payload too large",
+            )
+        }
+    };
+    let req: LockCommitRequest = match serde_json::from_slice(&bytes) {
+        Ok(r) => r,
+        Err(_) => return json_error(StatusCode::BAD_REQUEST, "Invalid lock_commit JSON"),
+    };
+    match state.db.process_lock_commit(&state.config, req, unix_now()) {
+        Ok((code, val)) => {
+            let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            (status, Json(val)).into_response()
+        }
+        Err(e) => db_err_to_response(e),
+    }
+}
+
+async fn handle_static_anchor(
+    State(state): State<AppState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    method: Method,
+    Path(filename): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if method != Method::GET && method != Method::HEAD {
+        return method_not_allowed();
+    }
+    let peer_addr = peer.map(|ConnectInfo(s)| s);
+    let client_ip = extract_client_ip(peer_addr, &headers, state.config.server.trusted_proxy_hops);
+    if !state.rate_limiter.allow_ip(client_ip) {
+        return json_error(StatusCode::TOO_MANY_REQUESTS, "IP rate limit exceeded");
+    }
+    if !state.config.lock.enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Some(anchor_hex) = filename.strip_suffix(".bin") else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if humoco_proto::decode_hex_fixed::<32>(anchor_hex).is_err() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let if_none_match = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(normalize_etag);
+
+    match state.db.get_static_anchor_manifest(anchor_hex) {
+        Ok(Some(bytes)) => {
+            let etag = sha256_hex(&bytes);
+            if if_none_match.as_deref() == Some(etag.as_str()) {
+                return not_modified_with_etag(&etag, "no-cache");
+            }
+            binary_or_json_response(method, "application/json", &etag, "no-cache", bytes)
+        }
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => db_err_to_response(e),
     }
 }

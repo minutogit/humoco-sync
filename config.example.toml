@@ -171,3 +171,9 @@ allow_pow_tickets = false
 ticket_pow_bits = 16
 # Maximum lock slot inodes before rejecting new genesis tickets (active buckets continue)
 max_inodes = 50000
+# Pre-proposal freeze expiration TTL in seconds (default 1800s = 30m)
+pre_freeze_ttl_secs = 1800
+# Proposal timelock window in seconds for authority vetoes (default 259200s = 72h)
+proposal_timelock_secs = 259200
+# Creator inactivity duration before guarantors may initiate rotation (default 2592000s = 30d)
+creator_inactivity_secs = 2592000

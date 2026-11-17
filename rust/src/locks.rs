@@ -18,15 +18,16 @@ use crate::crypto::{
     format_lock_selftest_signature_message, sha256_hex, verify_ed25519_hex,
 };
 use crate::db::{
-    AccountStatus, DbError, RegisteredUserRecord, SyncDb, ADMIN_MEMBERS, LOCK_BUCKETS,
-    LOCK_ENTRIES, LOCK_FILE_INDEX, LOCK_OUTPUT_CLAIMS, LOCK_QUARTER_INDEX, NONCES,
-    REGISTERED_USERS, SERVER_META,
+    AccountStatus, DbError, RegisteredUserRecord, SyncDb, ADMIN_MEMBERS, LOCK_ANCHORS,
+    LOCK_BUCKETS, LOCK_CONFLICTS, LOCK_ENTRIES, LOCK_FILE_INDEX, LOCK_OUTPUT_CLAIMS,
+    LOCK_QUARTER_INDEX, LOCK_ROTATIONS, NONCES, REGISTERED_USERS, SERVER_META,
 };
+use crate::lock_rotation::{AnchorRotationRecord, LockEntryStorageExt};
 
-const LOCK_KEY_META: &str = "lock_key";
+pub(crate) const LOCK_KEY_META: &str = "lock_key";
 const LOCK_DELEGATION_META: &str = "lock_delegation";
 const LOCK_SELFTEST_META: &str = "lock_selftest";
-const LOCK_USED_INODES_META: &str = "lock_used_inodes";
+pub(crate) const LOCK_USED_INODES_META: &str = "lock_used_inodes";
 const LOCK_SELFTEST_PROBE_META: &str = "lock_selftest_probe";
 const TICKET_POW_WINDOW_SECS: i64 = 300;
 const TICKET_POW_REPLAY_TTL_SECS: u64 = 600;
@@ -117,8 +118,25 @@ pub struct LockBatchResponse {
 #[serde(rename_all = "snake_case")]
 pub enum BucketFreezeState {
     Active,
-    SelfFrozen { frozen_at: u64, reason: String },
-    EpochFrozen { frozen_at: u64 },
+    PreProposal {
+        frozen_at: u64,
+        expires_at: u64,
+    },
+    PermanentProposal {
+        from_rev: u64,
+        #[serde(with = "humoco_proto::types::serde_hex_32")]
+        proposal_hash: [u8; 32],
+        frozen_at: u64,
+        effective_at: u64,
+    },
+    SelfFrozen {
+        frozen_at: u64,
+        reason: String,
+    },
+    EpochFrozen {
+        committed_rev: u64,
+        frozen_at: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,8 +171,8 @@ struct PendingReceipt {
 
 enum LockBatchTxOutcome {
     Frozen {
-        error: &'static str,
-        bucket_hex: String,
+        status_code: u16,
+        body: serde_json::Value,
     },
     OutputBranchClaimed {
         parent_slot: String,
@@ -167,7 +185,7 @@ enum LockBatchTxOutcome {
     },
 }
 
-fn load_lock_signing_key_read(
+pub(crate) fn load_lock_signing_key_read(
     meta: &impl ReadableTable<&'static str, &'static [u8]>,
 ) -> Result<SigningKey, DbError> {
     let raw = meta
@@ -182,7 +200,7 @@ fn load_lock_signing_key_read(
     Ok(SigningKey::from_bytes(&seed))
 }
 
-fn read_used_inodes(
+pub(crate) fn read_used_inodes(
     meta: &impl ReadableTable<&'static str, &'static [u8]>,
 ) -> Result<u64, DbError> {
     match meta.get(LOCK_USED_INODES_META)? {
@@ -222,27 +240,31 @@ fn sign_lock_receipt(
     r
 }
 
-fn bucket_entry_prefix(bucket_hex: &str) -> String {
+pub(crate) fn bucket_entry_prefix(bucket_hex: &str) -> String {
     format!("{}:", bucket_hex)
 }
 
-fn bucket_slot_key(bucket_hex: &str, slot_hex: &str) -> String {
+pub(crate) fn bucket_slot_key(bucket_hex: &str, slot_hex: &str) -> String {
     format!("{}:{}", bucket_hex, slot_hex)
 }
 
-fn output_claim_key(bucket_hex: &str, parent_slot_hex: &str, output_branch: u8) -> String {
+pub(crate) fn output_claim_key(
+    bucket_hex: &str,
+    parent_slot_hex: &str,
+    output_branch: u8,
+) -> String {
     format!("{}:{}:{}", bucket_hex, parent_slot_hex, output_branch)
 }
 
-fn quarter_index_key(quarter: u16, bucket_hex: &str) -> String {
+pub(crate) fn quarter_index_key(quarter: u16, bucket_hex: &str) -> String {
     format!("{:05}:{}", quarter, bucket_hex)
 }
 
-fn file_index_key(quarter_str: &str, bucket_hex: &str, file_hex: &str) -> String {
+pub(crate) fn file_index_key(quarter_str: &str, bucket_hex: &str, file_hex: &str) -> String {
     format!("{}/{}/{}", quarter_str, bucket_hex, file_hex)
 }
 
-fn remove_keys_with_prefix(
+pub(crate) fn remove_keys_with_prefix(
     table: &mut redb::Table<'_, &str, &[u8]>,
     prefix: &str,
 ) -> Result<Vec<(String, Vec<u8>)>, DbError> {
@@ -655,7 +677,13 @@ impl SyncDb {
                     BucketFreezeState::EpochFrozen { .. } => {
                         return Err(DbError::http(409, "epoch_frozen"));
                     }
-                    BucketFreezeState::Active => {}
+                    BucketFreezeState::PreProposal { expires_at, .. } if now_secs < expires_at => {
+                        return Err(DbError::http(409, "pre_proposal_frozen"));
+                    }
+                    BucketFreezeState::PermanentProposal { .. } => {
+                        return Err(DbError::http(409, "proposal_frozen"));
+                    }
+                    BucketFreezeState::Active | BucketFreezeState::PreProposal { .. } => {}
                 }
             }
 
@@ -743,13 +771,7 @@ impl SyncDb {
         write_txn.commit()?;
 
         match outcome {
-            LockBatchTxOutcome::Frozen { error, bucket_hex } => Ok((
-                409,
-                serde_json::json!({
-                    "error": error,
-                    "bucket": bucket_hex,
-                }),
-            )),
+            LockBatchTxOutcome::Frozen { status_code, body } => Ok((status_code, body)),
             LockBatchTxOutcome::OutputBranchClaimed {
                 parent_slot,
                 output_branch,
@@ -830,9 +852,12 @@ impl SyncDb {
         let mut meta = write_txn.open_table(SERVER_META)?;
         let mut buckets = write_txn.open_table(LOCK_BUCKETS)?;
         let mut entries_tbl = write_txn.open_table(LOCK_ENTRIES)?;
+        let conflicts_tbl = write_txn.open_table(LOCK_CONFLICTS)?;
         let mut claims_tbl = write_txn.open_table(LOCK_OUTPUT_CLAIMS)?;
         let mut file_idx = write_txn.open_table(LOCK_FILE_INDEX)?;
         let mut quarter_idx = write_txn.open_table(LOCK_QUARTER_INDEX)?;
+        let mut rotations_tbl = write_txn.open_table(LOCK_ROTATIONS)?;
+        let mut anchors_tbl = write_txn.open_table(LOCK_ANCHORS)?;
 
         let mut existing_bucket: Option<LockBucketRecord> = match buckets.get(bucket_hex)? {
             Some(g) => Some(serde_json::from_slice(g.value())?),
@@ -861,8 +886,11 @@ impl SyncDb {
                         &[] as &[u8],
                     )?;
                     return Ok(LockBatchTxOutcome::Frozen {
-                        error: "bucket_self_frozen",
-                        bucket_hex: bucket_hex.to_string(),
+                        status_code: 409,
+                        body: serde_json::json!({
+                            "error": "bucket_self_frozen",
+                            "bucket": bucket_hex,
+                        }),
                     });
                 }
                 Some(ref mut b) => {
@@ -877,39 +905,90 @@ impl SyncDb {
                         let bytes = serde_json::to_vec(&b)?;
                         buckets.insert(bucket_hex, bytes.as_slice())?;
                         return Ok(LockBatchTxOutcome::Frozen {
-                            error: "bucket_self_frozen",
-                            bucket_hex: bucket_hex.to_string(),
+                            status_code: 409,
+                            body: serde_json::json!({
+                                "error": "bucket_self_frozen",
+                                "bucket": bucket_hex,
+                            }),
                         });
                     }
                 }
             }
         }
 
-        // Step 2: Frozen check
+        let anchor_hex = hex::encode(req.anchor_id);
+
+        // Step 2: Frozen check (incl. pre-proposal TTL expiration & 409 epoch_frozen chain)
         let mut bucket = match existing_bucket {
-            Some(b) => match &b.freeze_state {
-                BucketFreezeState::SelfFrozen { .. } => {
-                    return Ok(LockBatchTxOutcome::Frozen {
-                        error: "bucket_self_frozen",
-                        bucket_hex: bucket_hex.to_string(),
-                    });
-                }
-                BucketFreezeState::EpochFrozen { .. } => {
-                    return Ok(LockBatchTxOutcome::Frozen {
-                        error: "epoch_frozen",
-                        bucket_hex: bucket_hex.to_string(),
-                    });
-                }
-                BucketFreezeState::Active => {
-                    if let Some(ref m) = req.manifest {
-                        let aid = m.rev1_anchor_id().map_err(|e| DbError::http(400, e))?;
-                        if aid != b.anchor_id {
-                            return Err(DbError::http(400, "Manifest anchor_id mismatch"));
-                        }
+            Some(mut b) => {
+                if let BucketFreezeState::PreProposal { expires_at, .. } = b.freeze_state {
+                    if now_secs >= expires_at {
+                        b.freeze_state = BucketFreezeState::Active;
                     }
-                    b
                 }
-            },
+                match &b.freeze_state {
+                    BucketFreezeState::SelfFrozen { .. } => {
+                        return Ok(LockBatchTxOutcome::Frozen {
+                            status_code: 409,
+                            body: serde_json::json!({
+                                "error": "bucket_self_frozen",
+                                "bucket": bucket_hex,
+                            }),
+                        });
+                    }
+                    BucketFreezeState::PreProposal { expires_at, .. } => {
+                        return Ok(LockBatchTxOutcome::Frozen {
+                            status_code: 409,
+                            body: serde_json::json!({
+                                "error": "pre_proposal_frozen",
+                                "bucket": bucket_hex,
+                                "expires_at": *expires_at,
+                            }),
+                        });
+                    }
+                    BucketFreezeState::PermanentProposal {
+                        from_rev,
+                        proposal_hash,
+                        effective_at,
+                        ..
+                    } => {
+                        return Ok(LockBatchTxOutcome::Frozen {
+                            status_code: 409,
+                            body: serde_json::json!({
+                                "error": "proposal_frozen",
+                                "bucket": bucket_hex,
+                                "from_rev": *from_rev,
+                                "proposal_hash": hex::encode(proposal_hash),
+                                "effective_at": *effective_at,
+                            }),
+                        });
+                    }
+                    BucketFreezeState::EpochFrozen { committed_rev, .. } => {
+                        let latest_manifest = match anchors_tbl.get(anchor_hex.as_str())? {
+                            Some(g) => Some(serde_json::from_slice::<AnchorManifest>(g.value())?),
+                            None => None,
+                        };
+                        return Ok(LockBatchTxOutcome::Frozen {
+                            status_code: 409,
+                            body: serde_json::json!({
+                                "error": "epoch_frozen",
+                                "bucket": bucket_hex,
+                                "current_revision": *committed_rev,
+                                "latest_manifest": latest_manifest,
+                            }),
+                        });
+                    }
+                    BucketFreezeState::Active => {
+                        if let Some(ref m) = req.manifest {
+                            let aid = m.effective_anchor_id().map_err(|e| DbError::http(400, e))?;
+                            if aid != b.anchor_id {
+                                return Err(DbError::http(400, "Manifest anchor_id mismatch"));
+                            }
+                        }
+                        b
+                    }
+                }
+            }
             None => {
                 // Step 3: Bucket Creation
                 let manifest = req.manifest.as_ref().ok_or_else(|| {
@@ -955,6 +1034,15 @@ impl SyncDb {
                 let used_inodes = read_used_inodes(&meta)?;
                 if used_inodes >= cfg.lock.max_inodes {
                     return Err(DbError::http(507, "Lock inode budget exhausted"));
+                }
+
+                if rotations_tbl.get(anchor_hex.as_str())?.is_none() {
+                    let init_activity = (manifest.issued_at_ms / 1_000).min(now_secs);
+                    let rot = AnchorRotationRecord::new(manifest.clone(), init_activity);
+                    let rot_bytes = serde_json::to_vec(&rot)?;
+                    rotations_tbl.insert(anchor_hex.as_str(), rot_bytes.as_slice())?;
+                    let m_bytes = serde_json::to_vec(manifest)?;
+                    anchors_tbl.insert(anchor_hex.as_str(), m_bytes.as_slice())?;
                 }
 
                 let b = LockBucketRecord {
@@ -1004,34 +1092,54 @@ impl SyncDb {
                 return Err(DbError::http(422, "Insufficient lock entry proof-of-work"));
             }
 
-            // Load parent if depth >= 1 (either committed earlier in batch OR already in DB)
-            let parent_opt: Option<LockEntry> = if entry.depth == 0 {
-                None
+            // Load parent if depth >= 1 (batch prefix, LOCK_ENTRIES, or surviving LOCK_CONFLICTS)
+            let parent_candidates: Vec<LockEntry> = if entry.depth == 0 {
+                Vec::new()
             } else if let Some(p) = batch_accepted.get(&entry.parent_slot) {
-                Some(p.clone())
+                vec![p.clone()]
             } else {
                 let p_key = bucket_slot_key(bucket_hex, &hex::encode(entry.parent_slot));
-                match entries_tbl.get(p_key.as_str())? {
-                    Some(g) => Some(LockEntry::from_wire_bytes(g.value()).map_err(|e| {
+                if let Some(g) = entries_tbl.get(p_key.as_str())? {
+                    vec![LockEntry::from_wire_bytes(g.value()).map_err(|e| {
                         DbError::Backend(format!("Corrupted stored parent lock entry: {}", e))
-                    })?),
-                    None => {
-                        return Err(DbError::http(
-                            422,
-                            "Missing causal parent lock entry for spend depth >= 1",
-                        ));
-                    }
+                    })?]
+                } else if let Some(cg) = conflicts_tbl.get(p_key.as_str())? {
+                    LockEntryStorageExt::decode_conflict_group(cg.value())?
+                } else {
+                    return Err(DbError::http(
+                        422,
+                        "Missing causal parent lock entry for spend depth >= 1",
+                    ));
                 }
             };
 
-            entry
-                .verify_entry(
-                    &bucket.anchor_id,
-                    &bucket.creator_mig_pub,
-                    cfg.lock.pow_base_bits,
-                    parent_opt.as_ref(),
-                )
-                .map_err(|e| DbError::http(422, format!("Causal validation failed: {}", e)))?;
+            if entry.depth == 0 {
+                entry
+                    .verify_entry(
+                        &bucket.anchor_id,
+                        &bucket.creator_mig_pub,
+                        cfg.lock.pow_base_bits,
+                        None,
+                    )
+                    .map_err(|e| DbError::http(422, format!("Causal validation failed: {}", e)))?;
+            } else {
+                let matched_ok = parent_candidates.iter().any(|p| {
+                    entry
+                        .verify_entry(
+                            &bucket.anchor_id,
+                            &bucket.creator_mig_pub,
+                            cfg.lock.pow_base_bits,
+                            Some(p),
+                        )
+                        .is_ok()
+                });
+                if !matched_ok {
+                    return Err(DbError::http(
+                        422,
+                        "Causal validation failed against parent",
+                    ));
+                }
+            }
 
             // Check max-1-child-slot per (parent_slot, output_branch) for depth >= 1
             let parent_slot_hex = hex::encode(entry.parent_slot);
@@ -1064,10 +1172,43 @@ impl SyncDb {
                 }
             }
 
-            // Write-Once check on entry.slot
+            // Write-Once check on entry.slot (check LOCK_CONFLICTS first!)
             let e_key = bucket_slot_key(bucket_hex, &slot_hex);
             let incoming_wire = entry.to_wire_bytes().map_err(|e| DbError::http(400, e))?;
             let incoming_entry_hash = entry.entry_hash().map_err(|e| DbError::http(400, e))?;
+
+            if let Some(cg) = conflicts_tbl.get(e_key.as_str())? {
+                let group = LockEntryStorageExt::decode_conflict_group(cg.value())?;
+                let competing = group
+                    .iter()
+                    .find(|stored| {
+                        stored
+                            .to_wire_bytes()
+                            .map(|w| {
+                                w[..LOCK_ENTRY_IDENTITY_LEN]
+                                    != incoming_wire[..LOCK_ENTRY_IDENTITY_LEN]
+                            })
+                            .unwrap_or(false)
+                    })
+                    .or_else(|| group.first())
+                    .ok_or_else(|| DbError::Backend("Empty LOCK_CONFLICTS entry".to_string()))?;
+                let stored_wire = competing
+                    .to_wire_bytes()
+                    .map_err(|e| DbError::Backend(e.to_string()))?;
+                let stored_hash = competing
+                    .entry_hash()
+                    .map_err(|e| DbError::Backend(e.to_string()))?;
+                let c_pending = PendingReceipt {
+                    kind: LockReceiptKind::ConflictSeen,
+                    slot: competing.slot,
+                    child_lock: competing.child_lock,
+                    entry_hash: stored_hash,
+                    write_seq: bucket.write_seq,
+                    bucket_head: bucket.bucket_head,
+                };
+                conflict = Some((idx, entry.slot, c_pending, hex::encode(stored_wire)));
+                break;
+            }
 
             let existing_raw = entries_tbl.get(e_key.as_str())?.map(|g| g.value().to_vec());
             match existing_raw {
@@ -1204,9 +1345,12 @@ impl SyncDb {
             let mut meta = write_txn.open_table(SERVER_META)?;
             let mut buckets = write_txn.open_table(LOCK_BUCKETS)?;
             let mut entries_tbl = write_txn.open_table(LOCK_ENTRIES)?;
+            let mut conflicts_tbl = write_txn.open_table(LOCK_CONFLICTS)?;
             let mut claims_tbl = write_txn.open_table(LOCK_OUTPUT_CLAIMS)?;
             let mut file_idx = write_txn.open_table(LOCK_FILE_INDEX)?;
             let mut quarter_idx = write_txn.open_table(LOCK_QUARTER_INDEX)?;
+            let mut rotations_tbl = write_txn.open_table(LOCK_ROTATIONS)?;
+            let mut anchors_tbl = write_txn.open_table(LOCK_ANCHORS)?;
 
             let mut expired: Vec<(String, u16, String)> = Vec::new();
             for entry in quarter_idx.iter()? {
@@ -1228,9 +1372,18 @@ impl SyncDb {
             let mut used_inodes = read_used_inodes(&meta)?;
 
             for (q_key, quarter, bucket_hex) in expired {
+                let expired_anchor_hex = match buckets.get(bucket_hex.as_str())? {
+                    Some(g) => serde_json::from_slice::<LockBucketRecord>(g.value())
+                        .ok()
+                        .map(|b| hex::encode(b.anchor_id)),
+                    None => None,
+                };
+
                 let prefix = bucket_entry_prefix(&bucket_hex);
                 let deleted_slots = remove_keys_with_prefix(&mut entries_tbl, &prefix)?;
-                removed_entries = removed_entries.saturating_add(deleted_slots.len() as u64);
+                let deleted_conflicts = remove_keys_with_prefix(&mut conflicts_tbl, &prefix)?;
+                let total_removed_inodes = (deleted_slots.len() + deleted_conflicts.len()) as u64;
+                removed_entries = removed_entries.saturating_add(total_removed_inodes);
                 let _ = remove_keys_with_prefix(&mut claims_tbl, &prefix)?;
 
                 if let Ok(quarter_label) = format_quarter(quarter) {
@@ -1240,7 +1393,11 @@ impl SyncDb {
 
                 let _ = buckets.remove(bucket_hex.as_str())?;
                 let _ = quarter_idx.remove(q_key.as_str())?;
-                used_inodes = used_inodes.saturating_sub(deleted_slots.len() as u64);
+                if let Some(ah) = expired_anchor_hex {
+                    let _ = rotations_tbl.remove(ah.as_str())?;
+                    let _ = anchors_tbl.remove(ah.as_str())?;
+                }
+                used_inodes = used_inodes.saturating_sub(total_removed_inodes);
                 removed_buckets += 1;
             }
 
