@@ -93,6 +93,11 @@ enum ConfigPreset {
 enum SignTestCmd {
     /// Generate a fresh Ed25519 keypair: prints "<priv_hex64> <pub_hex64>"
     Keygen,
+    /// Derive 64-hex lowercase verifying pubkey from 64-hex signing key
+    Pubkey {
+        #[arg(long)]
+        sk: String,
+    },
     /// Sign a member/account request and print 128-hex signature
     SignMember {
         #[arg(long)]
@@ -171,7 +176,110 @@ enum SignTestCmd {
         #[arg(long)]
         ticket_json: Option<PathBuf>,
         #[arg(long)]
+        receipt_json: Option<PathBuf>,
+        #[arg(long)]
+        manifest_json: Option<PathBuf>,
+        #[arg(long)]
+        anchor_tag: Option<String>,
+        #[arg(long, default_value_t = 8)]
+        pow_bits: u32,
+        #[arg(long)]
         variant: String,
+    },
+    /// Generate & cryptographically verify 3-phase rotation payloads against Rust/PHP HTTP APIs
+    Rotation {
+        #[command(subcommand)]
+        sub: RotationTestCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum RotationTestCmd {
+    MakeManifest {
+        #[arg(long)]
+        s1_lock_pub: String,
+        #[arg(long)]
+        s1_admin_pub: String,
+        #[arg(long)]
+        s1_url: String,
+        #[arg(long)]
+        s2_lock_pub: String,
+        #[arg(long)]
+        s2_admin_pub: String,
+        #[arg(long)]
+        s2_url: String,
+        #[arg(long)]
+        quarter: u16,
+        #[arg(long)]
+        anchor_tag: Option<String>,
+    },
+    MakePreFreeze {
+        #[arg(long)]
+        manifest_json: PathBuf,
+    },
+    MakePropose {
+        #[arg(long)]
+        manifest_json: PathBuf,
+        #[arg(long)]
+        ts: u64,
+    },
+    MakeVeto {
+        #[arg(long)]
+        manifest_json: PathBuf,
+        #[arg(long)]
+        propose_json: PathBuf,
+        #[arg(long)]
+        ts: u64,
+    },
+    VerifyFreeze {
+        #[arg(long)]
+        freeze_json: PathBuf,
+        #[arg(long)]
+        expected_lock_pub: String,
+        #[arg(long, default_value_t = 0)]
+        min_entries: usize,
+    },
+    MakeImport {
+        #[arg(long)]
+        manifest_json: PathBuf,
+        #[arg(long)]
+        propose_json: PathBuf,
+        #[arg(long)]
+        freeze_json: PathBuf,
+    },
+    VerifyImportAck {
+        #[arg(long)]
+        import_resp_json: PathBuf,
+        #[arg(long)]
+        expected_lock_pub: String,
+    },
+    MakeSignCommit {
+        #[arg(long)]
+        manifest_json: PathBuf,
+        #[arg(long)]
+        propose_json: PathBuf,
+        #[arg(long)]
+        import_resp_json: Option<PathBuf>,
+    },
+    MakeFinalize {
+        #[arg(long)]
+        manifest_json: PathBuf,
+        #[arg(long)]
+        propose_json: PathBuf,
+        #[arg(long)]
+        import_resp_json: PathBuf,
+        #[arg(long)]
+        sign_commit_resp_json: PathBuf,
+    },
+    VerifyManifest {
+        #[arg(long)]
+        manifest_json: PathBuf,
+        #[arg(long)]
+        expected_anchor_id: String,
+        #[arg(long)]
+        expected_rev: u64,
+        #[arg(long)]
+        wrapped_field: Option<String>,
     },
 }
 
@@ -373,6 +481,16 @@ fn run_sign_test(cmd: SignTestCmd) -> i32 {
             );
             0
         }
+        SignTestCmd::Pubkey { sk } => match parse_sk(&sk) {
+            Ok(k) => {
+                println!("{}", hex::encode(k.verifying_key().to_bytes()));
+                0
+            }
+            Err(e) => {
+                eprintln!("{}", e);
+                1
+            }
+        },
         SignTestCmd::SignMember {
             sk,
             method,
@@ -554,77 +672,149 @@ fn run_sign_test(cmd: SignTestCmd) -> i32 {
             admin_pub,
             quarter,
             ticket_json,
+            receipt_json,
+            manifest_json,
+            anchor_tag,
+            pow_bits,
             variant,
-        } => run_make_lock_sample(
-            &lock_pub,
-            &admin_pub,
+        } => run_make_lock_sample(MakeLockSampleArgs {
+            lock_pub_hex: &lock_pub,
+            admin_pub_hex: &admin_pub,
             quarter,
-            ticket_json.as_ref(),
-            &variant,
-        ),
+            ticket_json_path: ticket_json.as_ref(),
+            receipt_json_path: receipt_json.as_ref(),
+            manifest_json_path: manifest_json.as_ref(),
+            anchor_tag: anchor_tag.as_deref(),
+            pow_bits,
+            variant: &variant,
+        }),
+        SignTestCmd::Rotation { sub } => run_rotation_test(sub),
     }
 }
 
-fn run_make_lock_sample(
-    lock_pub_hex: &str,
-    admin_pub_hex: &str,
+struct MakeLockSampleArgs<'a> {
+    lock_pub_hex: &'a str,
+    admin_pub_hex: &'a str,
     quarter: u16,
-    ticket_json_path: Option<&PathBuf>,
-    variant: &str,
-) -> i32 {
+    ticket_json_path: Option<&'a PathBuf>,
+    receipt_json_path: Option<&'a PathBuf>,
+    manifest_json_path: Option<&'a PathBuf>,
+    anchor_tag: Option<&'a str>,
+    pow_bits: u32,
+    variant: &'a str,
+}
+
+fn derive_sample_creator_sk(anchor_tag: Option<&str>) -> SigningKey {
+    match anchor_tag {
+        Some(tag) if !tag.is_empty() => {
+            let dig: [u8; 32] = Sha256::digest(format!("HUMOCO_TEST_CREATOR_V1:{tag}")).into();
+            SigningKey::from_bytes(&dig)
+        }
+        _ => SigningKey::from_bytes(&[91u8; 32]),
+    }
+}
+
+fn derive_sample_guarantor_sk(anchor_tag: Option<&str>) -> SigningKey {
+    match anchor_tag {
+        Some(tag) if !tag.is_empty() => {
+            let dig: [u8; 32] = Sha256::digest(format!("HUMOCO_TEST_GUARANTOR_V1:{tag}")).into();
+            SigningKey::from_bytes(&dig)
+        }
+        _ => SigningKey::from_bytes(&[94u8; 32]),
+    }
+}
+
+fn read_json_value(path: &PathBuf) -> Result<serde_json::Value, String> {
+    let raw =
+        fs::read_to_string(path).map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+    serde_json::from_str(&raw).map_err(|e| format!("Failed to parse {}: {e}", path.display()))
+}
+
+fn run_make_lock_sample(args: MakeLockSampleArgs<'_>) -> i32 {
     use humoco_proto::{
         compute_root_mig_auth_digest, derive_bucket, derive_slot, derive_slot_file_id,
         hash_pubkey_sha3, solve_lock_pow, AnchorAuthority, AnchorManifest, CausalOutputProof,
-        GenesisTicket, LockEntry, NominatedBy, ServerEntry, HOP_ENCRYPTED_PAYLOAD_LEN,
+        GenesisTicket, LockEntry, LockReceipt, NominatedBy, ServerEntry, HOP_ENCRYPTED_PAYLOAD_LEN,
     };
 
-    let Ok(lock_pub) = humoco_proto::decode_hex_fixed::<32>(lock_pub_hex.trim()) else {
+    let Ok(lock_pub) = humoco_proto::decode_hex_fixed::<32>(args.lock_pub_hex.trim()) else {
         eprintln!("Invalid lock_pub");
         return 1;
     };
-    let Ok(admin_pub) = humoco_proto::decode_hex_fixed::<32>(admin_pub_hex.trim()) else {
+    let Ok(admin_pub) = humoco_proto::decode_hex_fixed::<32>(args.admin_pub_hex.trim()) else {
         eprintln!("Invalid admin_pub");
         return 1;
     };
-    let creator_mig_sk = SigningKey::from_bytes(&[91u8; 32]);
+    let creator_mig_sk = derive_sample_creator_sk(args.anchor_tag);
     let creator_mig_pub = creator_mig_sk.verifying_key().to_bytes();
-    let manifest = AnchorManifest {
-        revision: 1,
-        threshold: 1,
-        servers: vec![ServerEntry {
-            write_url: "https://sync1.example/sync.php".to_string(),
-            read_url: "https://sync1.example/data".to_string(),
-            admin_pub,
-            lock_pub,
-            nominated_by: NominatedBy::Creator,
-        }],
-        successors: Vec::new(),
-        authority: AnchorAuthority {
-            creator_mig_pub,
-            guarantor_mig_pubs: Vec::new(),
-        },
-        migration_chain: Vec::new(),
-        issued_at_ms: 1_794_916_800_000,
-        retain_until_quarter: quarter,
+
+    let manifest: AnchorManifest = if let Some(m_path) = args.manifest_json_path {
+        match read_json_value(m_path).and_then(|v| {
+            let inner = v.get("manifest").cloned().unwrap_or(v);
+            serde_json::from_value(inner).map_err(|e| e.to_string())
+        }) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("manifest error: {e}");
+                return 1;
+            }
+        }
+    } else {
+        AnchorManifest {
+            revision: 1,
+            threshold: 1,
+            servers: vec![ServerEntry {
+                write_url: "https://sync1.example/sync.php".to_string(),
+                read_url: "https://sync1.example/data".to_string(),
+                admin_pub,
+                lock_pub,
+                nominated_by: NominatedBy::Creator,
+            }],
+            successors: Vec::new(),
+            authority: AnchorAuthority {
+                creator_mig_pub,
+                guarantor_mig_pubs: Vec::new(),
+            },
+            migration_chain: Vec::new(),
+            issued_at_ms: 1_794_916_800_000,
+            retain_until_quarter: args.quarter,
+        }
     };
     let anchor_id = match manifest.rev1_anchor_id() {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("anchor_id error: {}", e);
+            eprintln!("anchor_id error: {e}");
             return 1;
         }
     };
 
+    let variant = args.variant;
     if variant == "anchor_id" {
         println!("{}", hex::encode(anchor_id));
         return 0;
     }
 
     let bucket = derive_bucket(&anchor_id, &lock_pub);
+    if variant == "bucket_info" {
+        println!("{} {}", hex::encode(anchor_id), hex::encode(bucket));
+        return 0;
+    }
+
+    let seq_ds_tag =
+        |idx: u32| -> [u8; 32] { Sha256::digest(format!("HUMOCO_SEQ_SLOT:{idx}")).into() };
     let slot0 = derive_slot(&anchor_id, &[0x11; 32]);
-    if variant == "read_path" {
-        let q_str = humoco_proto::format_quarter(quarter).unwrap();
-        let file_s = derive_slot_file_id(&slot0, &lock_pub);
+    let chosen_slot = if let Some(idx_s) = variant.strip_prefix("read_path_seq:") {
+        let Ok(idx) = idx_s.parse::<u32>() else {
+            eprintln!("Invalid read_path_seq index");
+            return 1;
+        };
+        derive_slot(&anchor_id, &seq_ds_tag(idx))
+    } else {
+        slot0
+    };
+    if variant == "read_path" || variant.starts_with("read_path_seq:") {
+        let q_str = humoco_proto::format_quarter(manifest.retain_until_quarter).unwrap();
+        let file_s = derive_slot_file_id(&chosen_slot, &lock_pub);
         println!(
             "locks/{}/{}/{}.lock",
             q_str,
@@ -634,24 +824,14 @@ fn run_make_lock_sample(
         return 0;
     }
 
-    let ticket_path = match ticket_json_path {
-        Some(p) => p,
-        None => {
-            eprintln!("--ticket-json is required for variant '{}'", variant);
-            return 1;
-        }
+    let Some(ticket_path) = args.ticket_json_path else {
+        eprintln!("--ticket-json is required for variant '{variant}'");
+        return 1;
     };
-    let ticket_raw = match fs::read_to_string(ticket_path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("ticket read error: {}", e);
-            return 1;
-        }
-    };
-    let ticket_val: serde_json::Value = match serde_json::from_str(&ticket_raw) {
+    let ticket_val = match read_json_value(ticket_path) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("ticket parse error: {}", e);
+            eprintln!("{e}");
             return 1;
         }
     };
@@ -659,9 +839,28 @@ fn run_make_lock_sample(
     let ticket: GenesisTicket = match serde_json::from_value(ticket_inner.clone()) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("ticket decode error: {}", e);
+            eprintln!("ticket decode error: {e}");
             return 1;
         }
+    };
+
+    let known_head_receipt: Option<LockReceipt> = match args.receipt_json_path {
+        Some(r_path) => match read_json_value(r_path).and_then(|v| {
+            let inner = v
+                .get("receipts")
+                .and_then(|r| r.as_array())
+                .and_then(|a| a.last())
+                .cloned()
+                .unwrap_or(v);
+            serde_json::from_value(inner).map_err(|e| e.to_string())
+        }) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                eprintln!("receipt decode error: {e}");
+                return 1;
+            }
+        },
+        None => None,
     };
 
     let genesis_sk = SigningKey::from_bytes(&[92u8; 32]);
@@ -669,14 +868,33 @@ fn run_make_lock_sample(
     let recv1_sk = SigningKey::from_bytes(&[93u8; 32]);
     let recv1_pub = recv1_sk.verifying_key().to_bytes();
     let recv1_hash = hash_pubkey_sha3(&recv1_pub);
-    let child0 = if variant == "conflict" {
-        [0x99; 32]
+
+    let (target_slot, child0, single_only) = if let Some(idx_s) = variant.strip_prefix("race:") {
+        let Ok(idx) = idx_s.parse::<u32>() else {
+            eprintln!("Invalid race index");
+            return 1;
+        };
+        let mut c = [0xA0; 32];
+        c[..4].copy_from_slice(&idx.to_le_bytes());
+        (slot0, c, true)
+    } else if let Some(idx_s) = variant.strip_prefix("seq:") {
+        let Ok(idx) = idx_s.parse::<u32>() else {
+            eprintln!("Invalid seq index");
+            return 1;
+        };
+        let s = derive_slot(&anchor_id, &seq_ds_tag(idx));
+        let mut c = [0xB0; 32];
+        c[..4].copy_from_slice(&idx.to_le_bytes());
+        (s, c, true)
+    } else if variant == "conflict" {
+        (slot0, [0x99; 32], true)
     } else {
-        [0x11; 32]
+        (slot0, [0x11; 32], false)
     };
+
     let mut causal0 = CausalOutputProof {
         anchor_id,
-        slot: slot0,
+        slot: target_slot,
         parent_slot: [0u8; 32],
         output_branch: 0,
         depth: 0,
@@ -687,11 +905,11 @@ fn run_make_lock_sample(
         causal_sig: [0u8; 64],
     };
     causal0.causal_sig = genesis_sk.sign(&causal0.digest().unwrap()).to_bytes();
-    let root_mig_digest = compute_root_mig_auth_digest(&anchor_id, &slot0, &genesis_pub);
+    let root_mig_digest = compute_root_mig_auth_digest(&anchor_id, &target_slot, &genesis_pub);
     let root_mig_sig = creator_mig_sk.sign(&root_mig_digest).to_bytes();
-    let pow0 = solve_lock_pow(&slot0, &child0, 0, 8, 0, 100_000).unwrap();
+    let pow0 = solve_lock_pow(&target_slot, &child0, 0, args.pow_bits, 0, 10_000_000).unwrap();
     let entry0 = LockEntry {
-        slot: slot0,
+        slot: target_slot,
         parent_slot: [0u8; 32],
         output_branch: 0,
         depth: 0,
@@ -705,7 +923,7 @@ fn run_make_lock_sample(
         pow_nonce: pow0,
     };
 
-    let entries = if variant == "conflict" {
+    let entries = if single_only {
         vec![entry0.to_wire_hex().unwrap()]
     } else {
         let slot1 = derive_slot(&anchor_id, &[0x22; 32]);
@@ -714,7 +932,7 @@ fn run_make_lock_sample(
         let mut causal1 = CausalOutputProof {
             anchor_id,
             slot: slot1,
-            parent_slot: slot0,
+            parent_slot: target_slot,
             output_branch: 0,
             depth: 1,
             child_lock: child1,
@@ -724,10 +942,10 @@ fn run_make_lock_sample(
             causal_sig: [0u8; 64],
         };
         causal1.causal_sig = recv1_sk.sign(&causal1.digest().unwrap()).to_bytes();
-        let pow1 = solve_lock_pow(&slot1, &child1, 1, 8, 0, 100_000).unwrap();
+        let pow1 = solve_lock_pow(&slot1, &child1, 1, args.pow_bits, 0, 10_000_000).unwrap();
         let entry1 = LockEntry {
             slot: slot1,
-            parent_slot: slot0,
+            parent_slot: target_slot,
             output_branch: 0,
             depth: 1,
             child_lock: child1,
@@ -749,10 +967,334 @@ fn run_make_lock_sample(
         "entries": entries,
         "manifest": manifest,
         "genesis_ticket": ticket,
-        "known_head_receipt": serde_json::Value::Null,
+        "known_head_receipt": known_head_receipt,
     });
     println!("{}", req);
     0
+}
+
+fn run_rotation_test(sub: RotationTestCmd) -> i32 {
+    use humoco_proto::{
+        verify_anchor_manifest_chain, AnchorAuthority, AnchorManifest, CommitteeSignature,
+        ImportAck, LockEntry, MigrationCert, MigrationProposal, MigrationVeto, NominatedBy,
+        ProposalInitiator, ServerEntry, SnapshotExport,
+    };
+
+    let res: Result<String, String> = (|| match sub {
+        RotationTestCmd::MakeManifest {
+            s1_lock_pub,
+            s1_admin_pub,
+            s1_url,
+            s2_lock_pub,
+            s2_admin_pub,
+            s2_url,
+            quarter,
+            anchor_tag,
+        } => {
+            let s1_lp = humoco_proto::decode_hex_fixed::<32>(s1_lock_pub.trim())?;
+            let s1_ap = humoco_proto::decode_hex_fixed::<32>(s1_admin_pub.trim())?;
+            let s2_lp = humoco_proto::decode_hex_fixed::<32>(s2_lock_pub.trim())?;
+            let s2_ap = humoco_proto::decode_hex_fixed::<32>(s2_admin_pub.trim())?;
+            let tag = anchor_tag.as_deref();
+            let c_sk = derive_sample_creator_sk(tag);
+            let g_sk = derive_sample_guarantor_sk(tag);
+            let manifest = AnchorManifest {
+                revision: 1,
+                threshold: 1,
+                servers: vec![ServerEntry {
+                    write_url: format!("{}/sync.php", s1_url.trim_end_matches('/')),
+                    read_url: format!("{}/humoco_sync_data", s1_url.trim_end_matches('/')),
+                    admin_pub: s1_ap,
+                    lock_pub: s1_lp,
+                    nominated_by: NominatedBy::Creator,
+                }],
+                successors: vec![ServerEntry {
+                    write_url: format!("{}/sync.php", s2_url.trim_end_matches('/')),
+                    read_url: format!("{}/humoco_sync_data", s2_url.trim_end_matches('/')),
+                    admin_pub: s2_ap,
+                    lock_pub: s2_lp,
+                    nominated_by: NominatedBy::Creator,
+                }],
+                authority: AnchorAuthority {
+                    creator_mig_pub: c_sk.verifying_key().to_bytes(),
+                    guarantor_mig_pubs: vec![g_sk.verifying_key().to_bytes()],
+                },
+                migration_chain: Vec::new(),
+                issued_at_ms: 1_794_916_800_000,
+                retain_until_quarter: quarter,
+            };
+            let anchor_id = manifest.rev1_anchor_id()?;
+            Ok(serde_json::json!({
+                "anchor_id": hex::encode(anchor_id),
+                "anchor_tag": tag.unwrap_or(""),
+                "manifest": manifest,
+            })
+            .to_string())
+        }
+        RotationTestCmd::MakePreFreeze { manifest_json } => {
+            let v = read_json_value(&manifest_json)?;
+            let manifest: AnchorManifest =
+                serde_json::from_value(v.get("manifest").cloned().unwrap_or(v))
+                    .map_err(|e| e.to_string())?;
+            let anchor_id = manifest.rev1_anchor_id()?;
+            Ok(serde_json::json!({
+                "action": "pre_freeze",
+                "anchor_id": hex::encode(anchor_id),
+                "current_manifest": manifest,
+            })
+            .to_string())
+        }
+        RotationTestCmd::MakePropose { manifest_json, ts } => {
+            let v = read_json_value(&manifest_json)?;
+            let tag = v
+                .get("anchor_tag")
+                .and_then(|t| t.as_str())
+                .filter(|s| !s.is_empty());
+            let c_sk = derive_sample_creator_sk(tag);
+            let manifest: AnchorManifest =
+                serde_json::from_value(v.get("manifest").cloned().unwrap_or_else(|| v.clone()))
+                    .map_err(|e| e.to_string())?;
+            let anchor_id = manifest.rev1_anchor_id()?;
+            let mut prop = MigrationProposal {
+                anchor_id,
+                from_rev: manifest.revision,
+                to_rev: manifest.revision + 1,
+                new_threshold: 1,
+                new_servers: vec![manifest
+                    .successors
+                    .first()
+                    .ok_or("Missing successor s2")?
+                    .clone()],
+                new_successors: Vec::new(),
+                retain_until_quarter: manifest.retain_until_quarter,
+                proposed_at: ts,
+                initiator: ProposalInitiator::Creator,
+                proposer_sig: None,
+                guarantor_cosigs: Vec::new(),
+            };
+            let dig = prop.core_digest().map_err(|e| e.to_string())?;
+            prop.proposer_sig = Some(c_sk.sign(&dig).to_bytes());
+            Ok(serde_json::json!({
+                "action": "propose",
+                "proposal": prop,
+                "current_manifest": manifest,
+            })
+            .to_string())
+        }
+        RotationTestCmd::MakeVeto {
+            manifest_json,
+            propose_json,
+            ts,
+        } => {
+            let mv = read_json_value(&manifest_json)?;
+            let tag = mv
+                .get("anchor_tag")
+                .and_then(|t| t.as_str())
+                .filter(|s| !s.is_empty());
+            let g_sk = derive_sample_guarantor_sk(tag);
+            let pv = read_json_value(&propose_json)?;
+            let prop: MigrationProposal =
+                serde_json::from_value(pv["proposal"].clone()).map_err(|e| e.to_string())?;
+            let prop_hash = prop.core_digest().map_err(|e| e.to_string())?;
+            let mut veto = MigrationVeto {
+                anchor_id: prop.anchor_id,
+                from_rev: prop.from_rev,
+                proposal_hash: prop_hash,
+                vetoer_pub: g_sk.verifying_key().to_bytes(),
+                vetoed_at: ts,
+                sig: [0u8; 64],
+            };
+            veto.sig = g_sk.sign(&veto.digest()).to_bytes();
+            Ok(serde_json::json!({
+                "action": "veto",
+                "veto": veto,
+            })
+            .to_string())
+        }
+        RotationTestCmd::VerifyFreeze {
+            freeze_json,
+            expected_lock_pub,
+            min_entries,
+        } => {
+            let fv = read_json_value(&freeze_json)?;
+            let exp: SnapshotExport =
+                serde_json::from_value(fv.get("snapshot_export").cloned().unwrap_or(fv))
+                    .map_err(|e| e.to_string())?;
+            let expected_lp = humoco_proto::decode_hex_fixed::<32>(expected_lock_pub.trim())?;
+            if exp.snapshot.lock_pub != expected_lp {
+                return Err("Snapshot lock_pub mismatch".to_string());
+            }
+            if exp.entries.len() < min_entries {
+                return Err(format!(
+                    "Expected at least {min_entries} entries, got {}",
+                    exp.entries.len()
+                ));
+            }
+            let entries: Vec<LockEntry> = exp
+                .entries
+                .iter()
+                .map(|h| LockEntry::from_wire_hex(h))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            let conflicts: Vec<Vec<LockEntry>> = exp
+                .conflicts
+                .iter()
+                .map(|g| {
+                    g.iter()
+                        .map(|h| LockEntry::from_wire_hex(h))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            exp.snapshot
+                .verify_with_entries(&entries, &conflicts)
+                .map_err(|e| e.to_string())?;
+            Ok("verified_snapshot".to_string())
+        }
+        RotationTestCmd::MakeImport {
+            manifest_json,
+            propose_json,
+            freeze_json,
+        } => {
+            let mv = read_json_value(&manifest_json)?;
+            let manifest: AnchorManifest =
+                serde_json::from_value(mv.get("manifest").cloned().unwrap_or(mv))
+                    .map_err(|e| e.to_string())?;
+            let pv = read_json_value(&propose_json)?;
+            let prop: MigrationProposal =
+                serde_json::from_value(pv["proposal"].clone()).map_err(|e| e.to_string())?;
+            let fv = read_json_value(&freeze_json)?;
+            let exp: SnapshotExport =
+                serde_json::from_value(fv.get("snapshot_export").cloned().unwrap_or(fv))
+                    .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({
+                "anchor_id": hex::encode(prop.anchor_id),
+                "active_manifest": manifest,
+                "proposal": prop,
+                "snapshots": [exp],
+                "quorum_certificates": [],
+            })
+            .to_string())
+        }
+        RotationTestCmd::VerifyImportAck {
+            import_resp_json,
+            expected_lock_pub,
+        } => {
+            let iv = read_json_value(&import_resp_json)?;
+            let ack: ImportAck =
+                serde_json::from_value(iv["import_ack"].clone()).map_err(|e| e.to_string())?;
+            let expected_lp = humoco_proto::decode_hex_fixed::<32>(expected_lock_pub.trim())?;
+            if ack.lock_pub != expected_lp {
+                return Err("ImportAck lock_pub mismatch".to_string());
+            }
+            if !ack.verify() {
+                return Err("ImportAck signature verification failed".to_string());
+            }
+            Ok(hex::encode(ack.imported_state_hash))
+        }
+        RotationTestCmd::MakeSignCommit {
+            manifest_json: _,
+            propose_json,
+            import_resp_json,
+        } => {
+            let pv = read_json_value(&propose_json)?;
+            let prop: MigrationProposal =
+                serde_json::from_value(pv["proposal"].clone()).map_err(|e| e.to_string())?;
+            let (ish_hex, acks) = match import_resp_json {
+                Some(path) => {
+                    let iv = read_json_value(&path)?;
+                    let ack: ImportAck = serde_json::from_value(iv["import_ack"].clone())
+                        .map_err(|e| e.to_string())?;
+                    (hex::encode(ack.imported_state_hash), vec![ack])
+                }
+                None => (hex::encode([0u8; 32]), Vec::new()),
+            };
+            Ok(serde_json::json!({
+                "action": "sign_commit",
+                "anchor_id": hex::encode(prop.anchor_id),
+                "proposal": prop,
+                "imported_state_hash": ish_hex,
+                "import_acks": acks,
+            })
+            .to_string())
+        }
+        RotationTestCmd::MakeFinalize {
+            manifest_json,
+            propose_json,
+            import_resp_json,
+            sign_commit_resp_json,
+        } => {
+            let mv = read_json_value(&manifest_json)?;
+            let prev: AnchorManifest =
+                serde_json::from_value(mv.get("manifest").cloned().unwrap_or(mv))
+                    .map_err(|e| e.to_string())?;
+            let pv = read_json_value(&propose_json)?;
+            let prop: MigrationProposal =
+                serde_json::from_value(pv["proposal"].clone()).map_err(|e| e.to_string())?;
+            let iv = read_json_value(&import_resp_json)?;
+            let ack: ImportAck =
+                serde_json::from_value(iv["import_ack"].clone()).map_err(|e| e.to_string())?;
+            let cv = read_json_value(&sign_commit_resp_json)?;
+            let cs: CommitteeSignature = serde_json::from_value(cv["committee_signature"].clone())
+                .map_err(|e| e.to_string())?;
+            let cert = MigrationCert {
+                anchor_id: prop.anchor_id,
+                genesis_manifest: Some(Box::new(prev.clone())),
+                proposal: prop,
+                imported_state_hash: ack.imported_state_hash,
+                import_acks: vec![ack],
+                commit_sigs: vec![cs],
+            };
+            let (new_manifest, _) = cert
+                .verify_step(&cert.anchor_id, &prev)
+                .map_err(|e| e.to_string())?;
+            verify_anchor_manifest_chain(&new_manifest, &cert.anchor_id)
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({
+                "action": "finalize",
+                "anchor_id": hex::encode(cert.anchor_id),
+                "new_manifest": new_manifest,
+            })
+            .to_string())
+        }
+        RotationTestCmd::VerifyManifest {
+            manifest_json,
+            expected_anchor_id,
+            expected_rev,
+            wrapped_field,
+        } => {
+            let mv = read_json_value(&manifest_json)?;
+            let val = if let Some(field) = wrapped_field {
+                mv.get(&field)
+                    .cloned()
+                    .ok_or_else(|| format!("Missing field {field}"))?
+            } else {
+                mv
+            };
+            let manifest: AnchorManifest =
+                serde_json::from_value(val).map_err(|e| e.to_string())?;
+            let anchor_id = humoco_proto::decode_hex_fixed::<32>(expected_anchor_id.trim())?;
+            verify_anchor_manifest_chain(&manifest, &anchor_id).map_err(|e| e.to_string())?;
+            if manifest.revision != expected_rev {
+                return Err(format!(
+                    "Expected revision {expected_rev}, got {}",
+                    manifest.revision
+                ));
+            }
+            Ok(format!("verified_rev_{}", manifest.revision))
+        }
+    })();
+
+    match res {
+        Ok(out) => {
+            println!("{out}");
+            0
+        }
+        Err(e) => {
+            eprintln!("Rotation helper error: {e}");
+            1
+        }
+    }
 }
 
 fn run_lock_gc(config_opt: Option<PathBuf>, now_secs: u64) -> i32 {

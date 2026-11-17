@@ -23,4 +23,14 @@ return [
             'ttl_days'       => 180,    // 180 days (matches max Ad duration)
         ],
     ],
+
+    // Lock channel settings (SPEC.md Section 6, Concept Sections 5 & 6)
+    'lock' => [
+        'enabled'               => true,
+        'max_retention_quarter' => 8159,  // 2039-Q4
+        'max_inodes'            => 50000, // 80% soft warning in ?info, hard 507 on new tickets at 100%
+        'pow_base_bits'         => 8,
+        'allow_pow_tickets'     => false,
+        'ticket_pow_bits'       => 16,
+    ],
 ];

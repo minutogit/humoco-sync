@@ -2,7 +2,7 @@
 
 **`humoco-sync`** provides two wire-compatible server implementations for privacy-preserving, zero-knowledge synchronization in the **Human Money (HuMoCo)** ecosystem:
 
-1. **`php/` (`sync.php`)** — Zero-dependency PHP ($\ge 8.1$ + `ext-sodium`, `hash('sha3-256')`) single-file drop-in + `lock_handler.php` for shared web hosting and small friend circles.
+1. **`php/` (`sync.php`)** — Zero-dependency PHP ($\ge 8.1$ + `ext-sodium`, `hash('sha3-256')`) drop-in (`sync.php`, `lock_handler.php`, lazy-loaded `lock_rotation.php`) for shared web hosting and small friend circles.
 2. **`rust/` (`humoco-sync-server`)** — High-performance, `#![forbid(unsafe_code)]`, async Rust daemon (`axum` + `tokio` + `redb`) built for public community hosting, VPS deployments, hybrid friend+public operation, storage pool isolation, quota profiles, and web/API self-service.
 
 Both servers implement the exact protocol defined in [`SPEC.md`](SPEC.md), so **Human Money App** treats them identically.
@@ -32,13 +32,15 @@ Upload the contents of `php/` (or export the pre-configured ZIP directly from **
 
 ---
 
-## Unified Integration Tests
+## Unified Integration Tests & Hoster Benchmark
 
-Run the blackbox `curl` protocol suite against the Rust daemon, PHP, or both:
+Run the blackbox `curl` protocol suite against the Rust daemon, PHP, or both, plus the PHP concurrency/rollback/inode suite and shared-hoster measurement tool:
 
 ```bash
 ./tests/run.sh --target rust
 ./tests/run.sh --target both --allow-missing-php
+./tests/test_php_locks.sh
+./tests/measure_hoster.sh --url https://hoster.example/sync.php --admin-sk <64-hex-sk> --out report.md
 ```
 
 Run Rust unit and integration tests (including hybrid mode, pool isolation, priority media eviction, Zero-PII email opt-in, redeem codes, and graceful downgrade):

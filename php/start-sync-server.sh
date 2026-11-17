@@ -12,13 +12,21 @@ set -eo pipefail
 SERVER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SERVER_DIR"
 
-# 1. PHP und Sodium-Prüfung
+# 1. PHP (>= 8.1), ext-sodium und sha3-256-Prüfung
 if ! command -v php >/dev/null 2>&1; then
     echo ""
-    echo "❌ FEHLER: PHP ist auf diesem System noch nicht installiert."
+    echo "❌ FEHLER: PHP (>= 8.1) ist auf diesem System noch nicht installiert."
     echo ""
     echo "Installiere es einfach mit folgendem Befehl:"
-    echo "   sudo apt install -y php-cli php-sodium"
+    echo "   sudo apt update && sudo apt install -y php-cli"
+    echo ""
+    exit 1
+fi
+
+PHP_VER_CHECK=$(php -r 'echo PHP_VERSION_ID >= 80100 ? "ok" : PHP_VERSION;' 2>/dev/null || echo "error")
+if [ "$PHP_VER_CHECK" != "ok" ]; then
+    echo ""
+    echo "❌ FEHLER: Mindestens PHP 8.1 wird benötigt (gefunden: $PHP_VER_CHECK)."
     echo ""
     exit 1
 fi
@@ -30,6 +38,14 @@ if [ "$SODIUM_CHECK" != "ok" ]; then
     echo ""
     echo "Installiere sie mit:"
     echo "   sudo apt install -y php-sodium"
+    echo ""
+    exit 1
+fi
+
+SHA3_CHECK=$(php -r 'echo in_array("sha3-256", hash_algos(), true) ? "ok" : "missing";' 2>/dev/null || echo "error")
+if [ "$SHA3_CHECK" != "ok" ]; then
+    echo ""
+    echo "❌ FEHLER: Der Hash-Algorithmus 'sha3-256' fehlt in PHP."
     echo ""
     exit 1
 fi
@@ -89,5 +105,5 @@ echo "========================================================================"
 echo " Server läuft auf $BASE_URL (Beenden mit Strg+C)"
 echo "------------------------------------------------------------------------"
 
-# 7. PHP Built-In Server starten
-exec php -S "127.0.0.1:$PORT" -t "$SERVER_DIR"
+# 7. PHP Built-In Server starten (inkl. Router für /sync, /anchors und statische Reads)
+exec php -S "127.0.0.1:$PORT" -t "$SERVER_DIR" "$SERVER_DIR/sync.php"

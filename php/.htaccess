@@ -1,8 +1,8 @@
 # Disable directory listing
 Options -Indexes
 
-# Protect configuration, internal state, rate-limiter, member lists, lock, and temporary files from direct web access
-<FilesMatch "^(config\.php|\.state\.php|ratelimit\.bin\.php|members\..*\.php|\.lock|.*\.tmp.*)$">
+# Protect configuration, internal state, rate-limiter, member lists, lock handlers, lock, and temporary files from direct web access
+<FilesMatch "^(config\.php|lock_handler\.php|lock_rotation\.php|\.state\.php|ratelimit\.bin\.php|members\..*\.php|\.lock|.*\.tmp.*)$">
     <IfModule mod_authz_core.c>
         Require all denied
     </IfModule>
@@ -11,3 +11,10 @@ Options -Indexes
         Deny from all
     </IfModule>
 </FilesMatch>
+
+# Clean URL aliases for /sync and /anchors/<anchor_id>.bin
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteRule ^sync$ sync.php [QSA,L]
+    RewriteRule ^anchors/([0-9a-f]{64}\.bin)$ sync.php?__anchor=$1 [QSA,L]
+</IfModule>

@@ -22,21 +22,26 @@ The **HuMoCo Sync-Dienst** is an ultra-lightweight, zero-dependency PHP script d
 ```
 tools/humoco-sync/
 ├── sync.php             # Core API endpoint
-├── config.php           # Server configuration (admin pubkey, storage limits, channels)
-├── .htaccess            # Hardening: directory indexing off, internal files protected
+├── lock_handler.php     # Blind Lock channel handler (Write-Once link()+fsync(), ?lock_ticket, ?lock, GC)
+├── lock_rotation.php    # Lazy-loaded 3-phase committee rotation (?lock_freeze, ?lock_import, ?lock_commit)
+├── config.php           # Server configuration (admin pubkey, storage limits, channels, lock budget)
+├── .htaccess            # Hardening: directory indexing off, internal files & lock handlers protected
 ├── .state.php           # Internal server state (salt, admin pubkey, nonces)
 ├── ratelimit.bin.php    # Fixed 64 KiB 1-inode rate limiter storage
-├── members.<ch>.php     # Authorized member pubkey lists per channel
+├── members.<ch>.php     # Authorized member pubkey lists per channel (incl. members.lock.php)
 ├── robots.txt           # Crawling prevention (User-agent: * / Disallow: /)
 ├── index.html           # Empty blank landing page
 ├── README.md            # Installation and documentation
-├── start-sync-server.sh # Local dev server runner (Document root = script dir)
-└── tests/run.sh         # Automated test suite using `php -S` and curl
+└── start-sync-server.sh # Local dev server runner (PHP >= 8.1)
 ```
 
-`<data_dir>` contains **only**:
+`<data_dir>` contains:
 - `index.json`: Public catalog of published slots (`[{"id": "<pubkey64>", "channel": "<ch>", "mtime": <int>, "size": <int>, "etag": "<sha256>"}]`)
 - `<pubkey64>.<channel>.bin`: Encrypted binary slot files.
+- `.lock_key.php`: Server-generated Ed25519 lock signing key (`<?php __halt_compiler(); ?>`), isolated from slot state.
+- `locks/<YYYY-QN>/<B_S>/<file_S>.lock`: Immutable 605-byte write-once lock entries served statically with immutable cache headers.
+- `anchors/<anchor_id>.bin`: Latest finalized `AnchorManifest` JSON for committee rotation discovery.
+- `.locks_meta/`: Internal bucket metadata, rotation state, nonces, and inode counters (denied via `.htaccess`).
 
 ---
 
@@ -67,6 +72,16 @@ return [
         'backup' => ['max_bytes' => 5242880, 'ttl_days' => 180],
         'post'   => ['max_bytes' => 524288,  'ttl_days' => 21],
     ],
+
+    // Lock channel settings (SPEC.md Section 6)
+    'lock' => [
+        'enabled'               => true,
+        'max_retention_quarter' => 8159,
+        'max_inodes'            => 50000,
+        'pow_base_bits'         => 8,
+        'allow_pow_tickets'     => false,
+        'ticket_pow_bits'       => 16,
+    ],
 ];
 ```
 
@@ -78,9 +93,16 @@ All mutating requests must use custom HTTP headers:
 
 | Method & Route | Required Headers | Description |
 |---|---|---|
-| `GET sync.php?info` | – | Self-description: returns `drop_pub`, `read_url`, `register_url`, `channels`. |
+| `GET sync.php?info` | – | Self-description: returns `drop_pub`, `read_url`, `register_url`, `channels`, and `lock` metadata. |
 | `HEAD sync.php` | `X-Drop-Pubkey` *(optional: `X-Channel`, `X-Drop-Prefix`, `X-Media-Id`)* | Capability check: returns `200 OK` with `X-Drop-Authorized: true\|false`, `X-Drop-Channels`, `X-Channel-Max-Bytes`, `X-Channel-Ttl-Days`, `X-Slot-Occupied`, `ETag`, and `X-Media-*` headers (`400` on invalid header syntax). |
 | `PUT sync.php` | `X-Drop-Pubkey`, `X-Channel`, `X-Drop-Timestamp`, `X-Drop-Nonce`, `X-Drop-Signature`, optional `If-Match` | Raw binary slot upload. Enforces content length, replay nonce, `If-Match` concurrency, and global quota. |
 | `DELETE sync.php` | `X-Drop-Pubkey`, `X-Channel`, `X-Drop-Timestamp`, `X-Drop-Nonce`, `X-Drop-Signature` | Member slot deletion. |
-| `PUT sync.php?members&channel=<name>` | `X-Drop-Pubkey`, `X-Drop-Timestamp`, `X-Drop-Nonce`, `X-Drop-Signature`, Body: `{"pubkeys": [...]}` | Admin updates member list. Prunes slots for removed keys. |
+| `PUT sync.php?members&channel=<name>` | `X-Drop-Pubkey`, `X-Drop-Timestamp`, `X-Drop-Nonce`, `X-Drop-Signature`, Body: `{"pubkeys": [...]}` | Admin updates member list (`card`, `wot`, `backup`, `post`, `media`, `lock`). |
 | `GET sync.php?status` | `X-Drop-Pubkey`, `X-Drop-Timestamp`, `X-Drop-Nonce`, `X-Drop-Signature` | Admin dashboard status (used bytes, quotas, slot counts). |
+| `GET/POST sync.php?lock_selftest` | *(POST requires Admin headers)* | Runs / returns signed PHP 8.1+ lock readiness report (`ext-sodium`, `sha3-256`, `link()`, `fsync()`, inode budget). |
+| `PUT sync.php?lock_delegate` | Admin headers + `HUMOCO-LOCK-DELEGATE-V1` JSON | Persists admin delegation binding `S.lock_pub` to `admin_pubkey`. |
+| `POST sync.php?lock_ticket` | Member `lock` headers or PoW | Issues signed offline `GenesisTicket` for `anchor_id`. |
+| `POST sync.php?lock` | *(Unauthenticated PoS / WAF probe)* | Blind write-once lock batch (`FirstWrite` / `ConflictSeen` receipt, or zero-write WAF probe). |
+| `GET/POST sync.php?lock_freeze` | – | 3-phase committee rotation Phase 1 (`pre_freeze`, `propose`, `veto`, `heartbeat`, snapshot export). |
+| `POST sync.php?lock_import` | – | Rotation Phase 2 on new committee servers (timelock + union import -> `ImportAck`). |
+| `POST sync.php?lock_commit` | – | Rotation Phase 3 (`sign_commit` + `finalize` -> `/anchors/<anchor_id>.bin`). |

@@ -1,11 +1,18 @@
 <?php
 /**
- * HuMoCo Sync-Dienst – Hardened Privacy-Preserving HTTP Sync v1.1.0 (Multi-Channel + Prefix Sub-Mailboxes)
+ * HuMoCo Sync-Dienst – Hardened Privacy-Preserving HTTP Sync v1.2.0 (Multi-Channel + Lock Channel)
  *
- * Requirements: PHP >= 7.4 with ext-sodium, zero database, zero Composer.
+ * Requirements: PHP >= 8.1 with ext-sodium and hash('sha3-256'), zero database, zero Composer.
  * Strictly enforces 64-hex lowercase Ed25519 signatures, 1-inode rate limiting,
- * atomic index rebuilds.
+ * atomic index rebuilds, and isolated Write-Once Lock Channel routing.
  */
+
+if (PHP_VERSION_ID < 80100) {
+    http_response_code(500);
+    header('Content-Type: text/plain; charset=utf-8');
+    echo "PHP >= 8.1 is required.\n";
+    exit;
+}
 
 // Load configuration
 $configFile = __DIR__ . '/config.php';
@@ -77,11 +84,11 @@ if (!file_exists($dataHtaccess)) {
         . "<IfModule mod_mime.c>\n"
         . "    RemoveHandler .php .phtml .php3 .php4 .php5 .php7 .phps .cgi .pl .py\n"
         . "    RemoveType .php .phtml .php3 .php4 .php5 .php7 .phps .cgi .pl .py\n"
-        . "    AddType application/octet-stream .bin\n"
+        . "    AddType application/octet-stream .bin .lock\n"
         . "    AddType application/json .json\n"
         . "</IfModule>\n\n"
         . "# Deny direct access to lock and temporary files\n"
-        . "<FilesMatch \"^(\\..*|.*\\.tmp.*)\">\n"
+        . "<FilesMatch \"^(\\..*|.*\\.tmp.*|.*\\.lockdir.*)\">\n"
         . "    <IfModule mod_authz_core.c>\n"
         . "        Require all denied\n"
         . "    </IfModule>\n"
@@ -93,7 +100,11 @@ if (!file_exists($dataHtaccess)) {
     @file_put_contents($dataHtaccess, $htaccessContent);
 }
 
-// Global flock on .lock in script directory across all requests
+// Dispatch Lock Channel & static cli-server routes strictly BEFORE global .lock acquisition (§6.9)
+require_once __DIR__ . '/lock_handler.php';
+lock_maybe_handle_request($config, $configFile, $dataDir, $dataDirSetting, $disableRateLimit);
+
+// Global flock on .lock in script directory across all standard channel requests
 $lockFile = dirname($configFile) . DIRECTORY_SEPARATOR . '.lock';
 $lockFp = fopen($lockFile, 'c+');
 if ($lockFp === false) {
@@ -184,14 +195,14 @@ function respond_if_revoked(array $state, $now, $lockFp, array $commonHeaders, $
     if (!isset($state['revocation']) || !is_array($state['revocation'])) {
         return;
     }
-    $eff = isset($state['revocation']['effective_at']) ? (int)$state['revocation']['effective_at'] : 0;
-    if ($eff > 0 && $now >= $eff) {
-        $body = $isHead ? null : json_encode($state['revocation'], JSON_UNESCAPED_SLASHES);
-        $headers = $isHead
-            ? $commonHeaders
-            : array_merge($commonHeaders, ['Content-Type' => 'application/json; charset=utf-8']);
-        sync_respond(410, $lockFp, $body, $headers);
-    }
+    $body = $isHead ? null : json_encode([
+        'error'      => 'This sync service has been revoked',
+        'revocation' => $state['revocation'],
+    ], JSON_UNESCAPED_SLASHES);
+    $headers = $isHead
+        ? $commonHeaders
+        : array_merge($commonHeaders, ['Content-Type' => 'application/json; charset=utf-8']);
+    sync_respond(410, $lockFp, $body, $headers);
 }
 
 function resolve_own_sync_urls(array $config, $dataDirSetting) {
@@ -581,17 +592,24 @@ if ($method === 'GET' && isset($_GET['info'])) {
     }
 
     list(, $readUrl) = resolve_own_sync_urls($config, $dataDirSetting);
+    $lockInfo = lock_get_info_payload($config, $configFile, $dataDir, $now);
+    $infoChannels = array_keys($channels);
+    if ($lockInfo !== null && !in_array('lock', $infoChannels, true)) {
+        $infoChannels[] = 'lock';
+    }
 
     $infoResponse = [
         'drop_pub'     => $state['admin_pubkey'],
         'read_url'     => $readUrl,
         'register_url' => isset($config['register_url']) ? $config['register_url'] : null,
-        'channels'     => array_keys($channels),
+        'channels'     => $infoChannels,
         'revocation'   => (isset($state['revocation']) && is_array($state['revocation'])) ? $state['revocation'] : null,
+        'lock'         => $lockInfo,
     ];
 
     sync_respond(200, $lockFp, json_encode($infoResponse, JSON_UNESCAPED_SLASHES), array_merge($commonHeaders, [
-        'Content-Type' => 'application/json; charset=utf-8',
+        'Content-Type'  => 'application/json; charset=utf-8',
+        'Cache-Control' => 'no-store',
     ]));
 }
 
@@ -729,27 +747,29 @@ if ($method === 'HEAD') {
 // =========================================================================
 if ($method === 'PUT' && isset($_GET['members'])) {
     $channel = isset($_GET['channel']) && $_GET['channel'] !== '' ? (string)$_GET['channel'] : (isset($_SERVER['HTTP_X_CHANNEL']) ? (string)$_SERVER['HTTP_X_CHANNEL'] : '');
-    if (!preg_match('/^[a-z0-9_]{1,32}$/', $channel) || !isset($channels[$channel])) {
+    if (!preg_match('/^[a-z0-9_]{1,32}$/', $channel) || (!isset($channels[$channel]) && $channel !== 'lock')) {
         sync_respond(404, $lockFp, 'Not Found', $commonHeaders);
     }
 
     $adminPub = isset($_SERVER['HTTP_X_DROP_PUBKEY']) ? strtolower(trim((string)$_SERVER['HTTP_X_DROP_PUBKEY'])) : '';
-    $timestamp = isset($_SERVER['HTTP_X_DROP_TIMESTAMP']) ? (int)$_SERVER['HTTP_X_DROP_TIMESTAMP'] : 0;
+    $timestampRaw = isset($_SERVER['HTTP_X_DROP_TIMESTAMP']) ? trim((string)$_SERVER['HTTP_X_DROP_TIMESTAMP']) : '';
     $nonce = isset($_SERVER['HTTP_X_DROP_NONCE']) ? strtolower(trim((string)$_SERVER['HTTP_X_DROP_NONCE'])) : '';
     $signature = isset($_SERVER['HTTP_X_DROP_SIGNATURE']) ? strtolower(trim((string)$_SERVER['HTTP_X_DROP_SIGNATURE'])) : '';
 
-    if (abs($now - $timestamp) > 60 || !preg_match('/^[0-9a-f]{32}$/', $nonce) || !preg_match('/^[0-9a-f]{128}$/', $signature)) {
+    if ($adminPub === '' || !is_numeric($timestampRaw) || !preg_match('/^[0-9a-f]{64}$/', $adminPub) || !preg_match('/^[0-9a-f]{32}$/', $nonce) || !preg_match('/^[0-9a-f]{128}$/', $signature)) {
         $bucket['failCount'] = min(100, $bucket['failCount'] + 1);
         write_ip_bucket($rlFp, $ipBucketIdx, $bucket);
         sync_respond(400, $lockFp, 'Bad Request: Invalid headers', $commonHeaders);
     }
+    $timestamp = (int)$timestampRaw;
 
-    $isCurrentAdmin = hash_equals($state['admin_pubkey'], $adminPub);
-
-    if (!$isCurrentAdmin) {
+    if (!hash_equals($state['admin_pubkey'], $adminPub)) {
         $bucket['failCount'] = min(100, $bucket['failCount'] + 1);
         write_ip_bucket($rlFp, $ipBucketIdx, $bucket);
         sync_respond(403, $lockFp, 'Forbidden: Unauthorized admin pubkey', $commonHeaders);
+    }
+    if (abs($now - $timestamp) > 60) {
+        sync_respond(401, $lockFp, 'Unauthorized: Timestamp outside allowed window', $commonHeaders);
     }
 
     $rawInput = file_get_contents('php://input');
@@ -758,7 +778,7 @@ if ($method === 'PUT' && isset($_GET['members'])) {
     if (!verify_ed25519_detached($signature, $canonicalMsg, $adminPub)) {
         $bucket['failCount'] = min(100, $bucket['failCount'] + 1);
         write_ip_bucket($rlFp, $ipBucketIdx, $bucket);
-        sync_respond(403, $lockFp, 'Forbidden: Invalid admin signature', $commonHeaders);
+        sync_respond(401, $lockFp, 'Unauthorized: Invalid admin signature', $commonHeaders);
     }
 
     if (isset($state['nonces'][$nonce])) {
@@ -794,52 +814,60 @@ if ($method === 'PUT' && isset($_GET['members'])) {
         sync_respond(500, $lockFp, 'Internal Server Error: Failed to write members file', $commonHeaders);
     }
 
-    // Prune slots for this channel if pubkey is no longer a member
-    $memberSet = array_flip($newMemberPubkeys);
-    $existingSlots = glob($dataDir . DIRECTORY_SEPARATOR . '*.' . $channel . '.bin');
-    if ($existingSlots !== false) {
-        foreach ($existingSlots as $sFile) {
-            $bName = basename($sFile);
-            $parsed = parse_slot_filename($bName);
-            if ($parsed !== null && $parsed['channel'] === $channel) {
-                if (!isset($memberSet[$parsed['id']])) {
-                    $sz = filesize($sFile);
-                    @unlink($sFile);
-                    if ($sz !== false) {
-                        $state['used_bytes'] = max(0, $state['used_bytes'] - $sz);
-                    }
-                }
-            }
-        }
-    }
-
-    if ($channel === 'card' || $channel === 'media') {
-        if (isset($state['media_blobs']) && is_array($state['media_blobs'])) {
-            foreach ($state['media_blobs'] as $mId => $mInfo) {
-                $owner = isset($mInfo['owner']) ? $mInfo['owner'] : '';
-                if (!isset($memberSet[$owner])) {
-                    $mFile = $dataDir . DIRECTORY_SEPARATOR . $mId . '.media.bin';
-                    if (file_exists($mFile)) {
-                        $sz = filesize($mFile);
-                        @unlink($mFile);
+    // Prune slots for this channel if pubkey is no longer a member (lock channel never prunes lock files)
+    if ($channel !== 'lock') {
+        $memberSet = array_flip($newMemberPubkeys);
+        $existingSlots = glob($dataDir . DIRECTORY_SEPARATOR . '*.' . $channel . '.bin');
+        if ($existingSlots !== false) {
+            foreach ($existingSlots as $sFile) {
+                $bName = basename($sFile);
+                $parsed = parse_slot_filename($bName);
+                if ($parsed !== null && $parsed['channel'] === $channel) {
+                    if (!isset($memberSet[$parsed['id']])) {
+                        $sz = filesize($sFile);
+                        @unlink($sFile);
                         if ($sz !== false) {
                             $state['used_bytes'] = max(0, $state['used_bytes'] - $sz);
                         }
-                    } else {
-                        $sz = isset($mInfo['size']) ? (int)$mInfo['size'] : 0;
-                        $state['used_bytes'] = max(0, $state['used_bytes'] - $sz);
                     }
-                    unset($state['media_blobs'][$mId]);
                 }
             }
         }
-    }
 
-    lazy_prune_slots($dataDir, $channels, $state, $now);
-    rebuild_index($dataDir, $channels);
+        if ($channel === 'card' || $channel === 'media') {
+            if (isset($state['media_blobs']) && is_array($state['media_blobs'])) {
+                foreach ($state['media_blobs'] as $mId => $mInfo) {
+                    $owner = isset($mInfo['owner']) ? $mInfo['owner'] : '';
+                    if (!isset($memberSet[$owner])) {
+                        $mFile = $dataDir . DIRECTORY_SEPARATOR . $mId . '.media.bin';
+                        if (file_exists($mFile)) {
+                            $sz = filesize($mFile);
+                            @unlink($mFile);
+                            if ($sz !== false) {
+                                $state['used_bytes'] = max(0, $state['used_bytes'] - $sz);
+                            }
+                        } else {
+                            $sz = isset($mInfo['size']) ? (int)$mInfo['size'] : 0;
+                            $state['used_bytes'] = max(0, $state['used_bytes'] - $sz);
+                        }
+                        unset($state['media_blobs'][$mId]);
+                    }
+                }
+            }
+        }
+
+        lazy_prune_slots($dataDir, $channels, $state, $now);
+        rebuild_index($dataDir, $channels);
+    }
     save_state($stateFile, $state);
 
-    sync_respond(204, $lockFp, null, $commonHeaders);
+    sync_respond(200, $lockFp, json_encode([
+        'status'  => 'ok',
+        'channel' => $channel,
+        'members' => count($newMemberPubkeys),
+    ], JSON_UNESCAPED_SLASHES), array_merge($commonHeaders, [
+        'Content-Type' => 'application/json; charset=utf-8',
+    ]));
 }
 
 // =========================================================================
@@ -847,17 +875,18 @@ if ($method === 'PUT' && isset($_GET['members'])) {
 // =========================================================================
 if ($method === 'PUT' && isset($_GET['revoke'])) {
     $adminPub = isset($_SERVER['HTTP_X_DROP_PUBKEY']) ? strtolower(trim((string)$_SERVER['HTTP_X_DROP_PUBKEY'])) : '';
-    $timestamp = isset($_SERVER['HTTP_X_DROP_TIMESTAMP']) ? (int)$_SERVER['HTTP_X_DROP_TIMESTAMP'] : 0;
+    $timestampRaw = isset($_SERVER['HTTP_X_DROP_TIMESTAMP']) ? trim((string)$_SERVER['HTTP_X_DROP_TIMESTAMP']) : '';
     $nonce = isset($_SERVER['HTTP_X_DROP_NONCE']) ? strtolower(trim((string)$_SERVER['HTTP_X_DROP_NONCE'])) : '';
     $signature = isset($_SERVER['HTTP_X_DROP_SIGNATURE']) ? strtolower(trim((string)$_SERVER['HTTP_X_DROP_SIGNATURE'])) : '';
 
-    if (abs($now - $timestamp) > 60 || !preg_match('/^[0-9a-f]{32}$/', $nonce) || !preg_match('/^[0-9a-f]{128}$/', $signature)) {
+    if ($adminPub === '' || !is_numeric($timestampRaw) || !preg_match('/^[0-9a-f]{64}$/', $adminPub) || !preg_match('/^[0-9a-f]{32}$/', $nonce) || !preg_match('/^[0-9a-f]{128}$/', $signature)) {
         if (!$disableRateLimit) {
             $bucket['failCount'] = min(100, $bucket['failCount'] + 1);
             write_ip_bucket($rlFp, $ipBucketIdx, $bucket);
         }
         sync_respond(400, $lockFp, 'Bad Request: Invalid headers', $commonHeaders);
     }
+    $timestamp = (int)$timestampRaw;
 
     if (!hash_equals($state['admin_pubkey'], $adminPub)) {
         if (!$disableRateLimit) {
@@ -865,6 +894,9 @@ if ($method === 'PUT' && isset($_GET['revoke'])) {
             write_ip_bucket($rlFp, $ipBucketIdx, $bucket);
         }
         sync_respond(403, $lockFp, 'Forbidden: Unauthorized admin pubkey', $commonHeaders);
+    }
+    if (abs($now - $timestamp) > 60) {
+        sync_respond(401, $lockFp, 'Unauthorized: Timestamp outside allowed window', $commonHeaders);
     }
 
     $rawInput = file_get_contents('php://input');
@@ -875,7 +907,7 @@ if ($method === 'PUT' && isset($_GET['revoke'])) {
             $bucket['failCount'] = min(100, $bucket['failCount'] + 1);
             write_ip_bucket($rlFp, $ipBucketIdx, $bucket);
         }
-        sync_respond(403, $lockFp, 'Forbidden: Invalid admin signature', $commonHeaders);
+        sync_respond(401, $lockFp, 'Unauthorized: Invalid admin signature', $commonHeaders);
     }
 
     if (isset($state['nonces'][$nonce])) {
@@ -884,6 +916,28 @@ if ($method === 'PUT' && isset($_GET['revoke'])) {
     $state['nonces'][$nonce] = $now;
 
     $bodyData = json_decode($rawInput, true);
+    if ($bodyData === null && trim($rawInput) !== 'null') {
+        sync_respond(400, $lockFp, 'Bad Request: Invalid revocation JSON', $commonHeaders);
+    }
+
+    $revocationFile = $dataDir . DIRECTORY_SEPARATOR . 'revocation.json';
+
+    // Clear revocation when payload is null or effective_at is null/0 or clear=true or revoked=false
+    $shouldClear = ($bodyData === null)
+        || (is_array($bodyData) && !empty($bodyData['clear']))
+        || (is_array($bodyData) && array_key_exists('revoked', $bodyData) && $bodyData['revoked'] === false)
+        || (is_array($bodyData) && (!isset($bodyData['effective_at']) || $bodyData['effective_at'] === null || (int)$bodyData['effective_at'] === 0));
+    if ($shouldClear) {
+        $state['revocation'] = null;
+        if (file_exists($revocationFile)) {
+            @unlink($revocationFile);
+        }
+        save_state($stateFile, $state);
+        sync_respond(200, $lockFp, json_encode(['status' => 'ok', 'revoked' => false], JSON_UNESCAPED_SLASHES), array_merge($commonHeaders, [
+            'Content-Type' => 'application/json; charset=utf-8',
+        ]));
+    }
+
     if (!is_array($bodyData) || !isset($bodyData['issued_at']) || !is_numeric($bodyData['issued_at'])) {
         sync_respond(400, $lockFp, 'Bad Request: Missing issued_at', $commonHeaders);
     }
@@ -896,21 +950,7 @@ if ($method === 'PUT' && isset($_GET['revoke'])) {
         sync_respond(409, $lockFp, 'Conflict: Stale issued_at', $commonHeaders);
     }
 
-    $revocationFile = $dataDir . DIRECTORY_SEPARATOR . 'revocation.json';
-
-    // Clear revocation when effective_at is null or 0
     $effectiveAtRaw = isset($bodyData['effective_at']) ? $bodyData['effective_at'] : null;
-    if ($effectiveAtRaw === null || (int)$effectiveAtRaw === 0) {
-        $state['revocation'] = null;
-        if (file_exists($revocationFile)) {
-            @unlink($revocationFile);
-        }
-        save_state($stateFile, $state);
-        sync_respond(200, $lockFp, json_encode(['revocation' => null], JSON_UNESCAPED_SLASHES), array_merge($commonHeaders, [
-            'Content-Type' => 'application/json; charset=utf-8',
-        ]));
-    }
-
     if (!is_numeric($effectiveAtRaw) || (int)$effectiveAtRaw <= 0) {
         sync_respond(400, $lockFp, 'Bad Request: Invalid effective_at', $commonHeaders);
     }
@@ -997,29 +1037,31 @@ if ($method === 'PUT' && isset($_GET['revoke'])) {
 // =========================================================================
 if ($method === 'GET' && isset($_GET['status'])) {
     $adminPub = isset($_SERVER['HTTP_X_DROP_PUBKEY']) ? strtolower(trim((string)$_SERVER['HTTP_X_DROP_PUBKEY'])) : '';
-    $timestamp = isset($_SERVER['HTTP_X_DROP_TIMESTAMP']) ? (int)$_SERVER['HTTP_X_DROP_TIMESTAMP'] : 0;
+    $timestampRaw = isset($_SERVER['HTTP_X_DROP_TIMESTAMP']) ? trim((string)$_SERVER['HTTP_X_DROP_TIMESTAMP']) : '';
     $nonce = isset($_SERVER['HTTP_X_DROP_NONCE']) ? strtolower(trim((string)$_SERVER['HTTP_X_DROP_NONCE'])) : '';
     $signature = isset($_SERVER['HTTP_X_DROP_SIGNATURE']) ? strtolower(trim((string)$_SERVER['HTTP_X_DROP_SIGNATURE'])) : '';
 
-    if (abs($now - $timestamp) > 60 || !preg_match('/^[0-9a-f]{32}$/', $nonce) || !preg_match('/^[0-9a-f]{128}$/', $signature)) {
+    if ($adminPub === '' || !is_numeric($timestampRaw) || !preg_match('/^[0-9a-f]{64}$/', $adminPub) || !preg_match('/^[0-9a-f]{32}$/', $nonce) || !preg_match('/^[0-9a-f]{128}$/', $signature)) {
         $bucket['failCount'] = min(100, $bucket['failCount'] + 1);
         write_ip_bucket($rlFp, $ipBucketIdx, $bucket);
         sync_respond(400, $lockFp, 'Bad Request: Invalid headers', $commonHeaders);
     }
+    $timestamp = (int)$timestampRaw;
 
-    $isCurrentAdmin = hash_equals($state['admin_pubkey'], $adminPub);
-
-    if (!$isCurrentAdmin) {
+    if (!hash_equals($state['admin_pubkey'], $adminPub)) {
         $bucket['failCount'] = min(100, $bucket['failCount'] + 1);
         write_ip_bucket($rlFp, $ipBucketIdx, $bucket);
         sync_respond(403, $lockFp, 'Forbidden: Unauthorized admin pubkey', $commonHeaders);
+    }
+    if (abs($now - $timestamp) > 60) {
+        sync_respond(401, $lockFp, 'Unauthorized: Timestamp outside allowed window', $commonHeaders);
     }
 
     $canonicalMsg = "HUMOCO-DROP-ADMIN-V1\nSTATUS\n\n{$timestamp}\n{$nonce}\n" . hash('sha256', '');
     if (!verify_ed25519_detached($signature, $canonicalMsg, $adminPub)) {
         $bucket['failCount'] = min(100, $bucket['failCount'] + 1);
         write_ip_bucket($rlFp, $ipBucketIdx, $bucket);
-        sync_respond(403, $lockFp, 'Forbidden: Invalid admin signature', $commonHeaders);
+        sync_respond(401, $lockFp, 'Unauthorized: Invalid admin signature', $commonHeaders);
     }
 
     if (isset($state['nonces'][$nonce])) {
@@ -1085,16 +1127,20 @@ if ($method === 'PUT') {
     }
 
     $pubkey = isset($_SERVER['HTTP_X_DROP_PUBKEY']) ? strtolower(trim((string)$_SERVER['HTTP_X_DROP_PUBKEY'])) : '';
-    $timestamp = isset($_SERVER['HTTP_X_DROP_TIMESTAMP']) ? (int)$_SERVER['HTTP_X_DROP_TIMESTAMP'] : 0;
+    $timestampRaw = isset($_SERVER['HTTP_X_DROP_TIMESTAMP']) ? trim((string)$_SERVER['HTTP_X_DROP_TIMESTAMP']) : '';
     $nonce = isset($_SERVER['HTTP_X_DROP_NONCE']) ? strtolower(trim((string)$_SERVER['HTTP_X_DROP_NONCE'])) : '';
     $signature = isset($_SERVER['HTTP_X_DROP_SIGNATURE']) ? strtolower(trim((string)$_SERVER['HTTP_X_DROP_SIGNATURE'])) : '';
 
-    if (abs($now - $timestamp) > 60 || !preg_match('/^[0-9a-f]{32}$/', $nonce) || !preg_match('/^[0-9a-f]{128}$/', $signature) || !preg_match('/^[0-9a-f]{64}$/', $pubkey)) {
+    if ($timestampRaw === '' || !is_numeric($timestampRaw) || !preg_match('/^[0-9a-f]{32}$/', $nonce) || !preg_match('/^[0-9a-f]{128}$/', $signature) || !preg_match('/^[0-9a-f]{64}$/', $pubkey)) {
         if (!$disableRateLimit) {
             $bucket['failCount'] = min(100, $bucket['failCount'] + 1);
             write_ip_bucket($rlFp, $ipBucketIdx, $bucket);
         }
         sync_respond(400, $lockFp, 'Bad Request: Invalid auth headers', $commonHeaders);
+    }
+    $timestamp = (int)$timestampRaw;
+    if (abs($now - $timestamp) > 60) {
+        sync_respond(401, $lockFp, 'Unauthorized: Timestamp outside allowed window', $commonHeaders);
     }
 
     $channelMembers = load_channel_members($configFile, $channel);
@@ -1150,7 +1196,7 @@ if ($method === 'PUT') {
             $bucket['failCount'] = min(100, $bucket['failCount'] + 1);
             write_ip_bucket($rlFp, $ipBucketIdx, $bucket);
         }
-        sync_respond(403, $lockFp, 'Forbidden: Invalid request signature', $commonHeaders);
+        sync_respond(401, $lockFp, 'Unauthorized: Invalid request signature', $commonHeaders);
     }
 
     // Authenticated request: does NOT increment IP failCount! Enforce per-member token bucket
@@ -1243,8 +1289,14 @@ if ($method === 'PUT') {
         save_state($stateFile, $state);
 
         $newEtag = hash('sha256', $rawBody);
-        sync_respond(204, $lockFp, null, array_merge($commonHeaders, [
-            'ETag' => '"' . $newEtag . '"',
+        sync_respond(200, $lockFp, json_encode([
+            'status'  => 'ok',
+            'channel' => 'media',
+            'bytes'   => $newSize,
+            'etag'    => $newEtag,
+        ], JSON_UNESCAPED_SLASHES), array_merge($commonHeaders, [
+            'Content-Type' => 'application/json; charset=utf-8',
+            'ETag'         => '"' . $newEtag . '"',
         ]));
     }
 
@@ -1256,10 +1308,20 @@ if ($method === 'PUT') {
         clearstatcache(true, $slotFile);
         $mtime = filemtime($slotFile);
         $ttlDays = (int)$channelCfg['ttl_days'];
-        if ($mtime !== false && ($now - $mtime <= $ttlDays * 86400)) {
+        if ($mtime !== false && ($ttlDays <= 0 || ($now - $mtime <= $ttlDays * 86400))) {
             $currentEtag = hash_file('sha256', $slotFile);
             $sz = filesize($slotFile);
             $oldSize = ($sz !== false) ? $sz : 0;
+        }
+    }
+
+    // If-None-Match precondition check
+    if (isset($_SERVER['HTTP_IF_NONE_MATCH'])) {
+        $ifNoneMatch = trim((string)$_SERVER['HTTP_IF_NONE_MATCH'], " \t\n\r\0\x0B\"");
+        if ($currentEtag !== null && ($ifNoneMatch === '*' || hash_equals($currentEtag, $ifNoneMatch))) {
+            sync_respond(412, $lockFp, 'Precondition Failed', array_merge($commonHeaders, [
+                'ETag' => '"' . $currentEtag . '"',
+            ]));
         }
     }
 
@@ -1303,8 +1365,14 @@ if ($method === 'PUT') {
     save_state($stateFile, $state);
 
     $newEtag = hash('sha256', $rawBody);
-    sync_respond(204, $lockFp, null, array_merge($commonHeaders, [
-        'ETag' => '"' . $newEtag . '"',
+    sync_respond(200, $lockFp, json_encode([
+        'status'  => 'ok',
+        'channel' => $channel,
+        'bytes'   => $newSize,
+        'etag'    => $newEtag,
+    ], JSON_UNESCAPED_SLASHES), array_merge($commonHeaders, [
+        'Content-Type' => 'application/json; charset=utf-8',
+        'ETag'         => '"' . $newEtag . '"',
     ]));
 }
 
@@ -1313,16 +1381,20 @@ if ($method === 'PUT') {
 // =========================================================================
 if ($method === 'DELETE' && isset($_GET['account'])) {
     $pubkey = isset($_SERVER['HTTP_X_DROP_PUBKEY']) ? strtolower(trim((string)$_SERVER['HTTP_X_DROP_PUBKEY'])) : '';
-    $timestamp = isset($_SERVER['HTTP_X_DROP_TIMESTAMP']) ? (int)$_SERVER['HTTP_X_DROP_TIMESTAMP'] : 0;
+    $timestampRaw = isset($_SERVER['HTTP_X_DROP_TIMESTAMP']) ? trim((string)$_SERVER['HTTP_X_DROP_TIMESTAMP']) : '';
     $nonce = isset($_SERVER['HTTP_X_DROP_NONCE']) ? strtolower(trim((string)$_SERVER['HTTP_X_DROP_NONCE'])) : '';
     $signature = isset($_SERVER['HTTP_X_DROP_SIGNATURE']) ? strtolower(trim((string)$_SERVER['HTTP_X_DROP_SIGNATURE'])) : '';
 
-    if (abs($now - $timestamp) > 60 || !preg_match('/^[0-9a-f]{32}$/', $nonce) || !preg_match('/^[0-9a-f]{128}$/', $signature) || !preg_match('/^[0-9a-f]{64}$/', $pubkey)) {
+    if ($timestampRaw === '' || !is_numeric($timestampRaw) || !preg_match('/^[0-9a-f]{32}$/', $nonce) || !preg_match('/^[0-9a-f]{128}$/', $signature) || !preg_match('/^[0-9a-f]{64}$/', $pubkey)) {
         if (!$disableRateLimit) {
             $bucket['failCount'] = min(100, $bucket['failCount'] + 1);
             write_ip_bucket($rlFp, $ipBucketIdx, $bucket);
         }
         sync_respond(400, $lockFp, 'Bad Request: Invalid auth headers', $commonHeaders);
+    }
+    $timestamp = (int)$timestampRaw;
+    if (abs($now - $timestamp) > 60) {
+        sync_respond(401, $lockFp, 'Unauthorized: Timestamp outside allowed window', $commonHeaders);
     }
 
     $canonicalMsg = "HUMOCO-DROP-REQ-V1\nDELETE_ACCOUNT\n\n{$timestamp}\n{$nonce}\n" . hash('sha256', '');
@@ -1331,7 +1403,7 @@ if ($method === 'DELETE' && isset($_GET['account'])) {
             $bucket['failCount'] = min(100, $bucket['failCount'] + 1);
             write_ip_bucket($rlFp, $ipBucketIdx, $bucket);
         }
-        sync_respond(403, $lockFp, 'Forbidden: Invalid request signature', $commonHeaders);
+        sync_respond(401, $lockFp, 'Unauthorized: Invalid request signature', $commonHeaders);
     }
 
     if (!$disableRateLimit) {
@@ -1395,7 +1467,12 @@ if ($method === 'DELETE' && isset($_GET['account'])) {
     }
     save_state($stateFile, $state);
 
-    sync_respond(204, $lockFp, null, $commonHeaders);
+    sync_respond(200, $lockFp, json_encode([
+        'status'          => 'ok',
+        'deleted_account' => $pubkey,
+    ], JSON_UNESCAPED_SLASHES), array_merge($commonHeaders, [
+        'Content-Type' => 'application/json; charset=utf-8',
+    ]));
 }
 
 // =========================================================================
@@ -1418,16 +1495,20 @@ if ($method === 'DELETE') {
     }
 
     $pubkey = isset($_SERVER['HTTP_X_DROP_PUBKEY']) ? strtolower(trim((string)$_SERVER['HTTP_X_DROP_PUBKEY'])) : '';
-    $timestamp = isset($_SERVER['HTTP_X_DROP_TIMESTAMP']) ? (int)$_SERVER['HTTP_X_DROP_TIMESTAMP'] : 0;
+    $timestampRaw = isset($_SERVER['HTTP_X_DROP_TIMESTAMP']) ? trim((string)$_SERVER['HTTP_X_DROP_TIMESTAMP']) : '';
     $nonce = isset($_SERVER['HTTP_X_DROP_NONCE']) ? strtolower(trim((string)$_SERVER['HTTP_X_DROP_NONCE'])) : '';
     $signature = isset($_SERVER['HTTP_X_DROP_SIGNATURE']) ? strtolower(trim((string)$_SERVER['HTTP_X_DROP_SIGNATURE'])) : '';
 
-    if (abs($now - $timestamp) > 60 || !preg_match('/^[0-9a-f]{32}$/', $nonce) || !preg_match('/^[0-9a-f]{128}$/', $signature) || !preg_match('/^[0-9a-f]{64}$/', $pubkey)) {
+    if ($timestampRaw === '' || !is_numeric($timestampRaw) || !preg_match('/^[0-9a-f]{32}$/', $nonce) || !preg_match('/^[0-9a-f]{128}$/', $signature) || !preg_match('/^[0-9a-f]{64}$/', $pubkey)) {
         if (!$disableRateLimit) {
             $bucket['failCount'] = min(100, $bucket['failCount'] + 1);
             write_ip_bucket($rlFp, $ipBucketIdx, $bucket);
         }
         sync_respond(400, $lockFp, 'Bad Request: Invalid auth headers', $commonHeaders);
+    }
+    $timestamp = (int)$timestampRaw;
+    if (abs($now - $timestamp) > 60) {
+        sync_respond(401, $lockFp, 'Unauthorized: Timestamp outside allowed window', $commonHeaders);
     }
 
     $channelMembers = load_channel_members($configFile, $channel);
@@ -1453,7 +1534,7 @@ if ($method === 'DELETE') {
                 $bucket['failCount'] = min(100, $bucket['failCount'] + 1);
                 write_ip_bucket($rlFp, $ipBucketIdx, $bucket);
             }
-            sync_respond(403, $lockFp, 'Forbidden: Invalid request signature', $commonHeaders);
+            sync_respond(401, $lockFp, 'Unauthorized: Invalid request signature', $commonHeaders);
         }
 
         if (!$isMember) {
@@ -1524,7 +1605,12 @@ if ($method === 'DELETE') {
                     save_state($stateFile, $state);
                 }
             }
-            sync_respond(204, $lockFp, null, $commonHeaders);
+            sync_respond(200, $lockFp, json_encode([
+                'status'  => 'ok',
+                'channel' => 'media',
+            ], JSON_UNESCAPED_SLASHES), array_merge($commonHeaders, [
+                'Content-Type' => 'application/json; charset=utf-8',
+            ]));
         } else {
             // Delete all media blobs where owner === pubkey
             if (isset($state['media_blobs']) && is_array($state['media_blobs'])) {
@@ -1546,7 +1632,12 @@ if ($method === 'DELETE') {
                 }
                 save_state($stateFile, $state);
             }
-            sync_respond(204, $lockFp, null, $commonHeaders);
+            sync_respond(200, $lockFp, json_encode([
+                'status'  => 'ok',
+                'channel' => 'media',
+            ], JSON_UNESCAPED_SLASHES), array_merge($commonHeaders, [
+                'Content-Type' => 'application/json; charset=utf-8',
+            ]));
         }
     }
 
@@ -1568,7 +1659,7 @@ if ($method === 'DELETE') {
             $bucket['failCount'] = min(100, $bucket['failCount'] + 1);
             write_ip_bucket($rlFp, $ipBucketIdx, $bucket);
         }
-        sync_respond(403, $lockFp, 'Forbidden: Invalid request signature', $commonHeaders);
+        sync_respond(401, $lockFp, 'Unauthorized: Invalid request signature', $commonHeaders);
     }
 
     if (!$disableRateLimit) {
@@ -1601,7 +1692,12 @@ if ($method === 'DELETE') {
         save_state($stateFile, $state);
     }
 
-    sync_respond(204, $lockFp, null, $commonHeaders);
+    sync_respond(200, $lockFp, json_encode([
+        'status'  => 'ok',
+        'channel' => $channel,
+    ], JSON_UNESCAPED_SLASHES), array_merge($commonHeaders, [
+        'Content-Type' => 'application/json; charset=utf-8',
+    ]));
 }
 
 header('Allow: GET, HEAD, PUT, DELETE, POST');
