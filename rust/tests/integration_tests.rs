@@ -8,9 +8,10 @@ use tempfile::TempDir;
 use humoco_sync_server::build_router;
 use humoco_sync_server::config::{ChannelQuotaConfig, Config, ProfileConfig};
 use humoco_sync_server::crypto::{
-    canonical_revocation_message, format_admin_put_members_message,
-    format_admin_put_revoke_message, format_admin_status_message, format_delete_account_message,
-    parse_member_message, random_hex, sha256_hex, unix_now, RevocationNotice,
+    canonical_revocation_message, format_admin_put_config_message,
+    format_admin_put_members_message, format_admin_put_revoke_message,
+    format_admin_status_message, format_delete_account_message, parse_member_message, random_hex,
+    sha256_hex, unix_now, RevocationNotice,
 };
 use humoco_sync_server::db::ConditionalPrecondition;
 use humoco_sync_server::state::AppState;
@@ -3847,4 +3848,155 @@ async fn test_sync007_sync_revocation_returns_410_gone_across_lock_endpoints() {
     // Replacement server continues issuing tickets cleanly
     let q = humoco_proto::encode_quarter(2031, 4).unwrap();
     let _rep_tkt = issue_pow_ticket_http(&s_rep, [0xAA; 32], q).await;
+}
+
+#[tokio::test]
+async fn test_put_admin_config_validation_live_enforcement_and_persistence() {
+    let (admin_sk, admin_pk) = gen_keypair();
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("admin_cfg.redb");
+
+    let sign_put_cfg = |body: &str| {
+        let now = unix_now() as i64;
+        let nonce = random_hex(16);
+        let msg = format_admin_put_config_message(now, &nonce, &sha256_hex(body.as_bytes()));
+        let sig = hex::encode(admin_sk.sign(msg.as_bytes()).to_bytes());
+        (now, nonce, sig)
+    };
+
+    // Start first server instance with shutdown handle
+    let (tx_shutdown, rx_shutdown) = tokio::sync::oneshot::channel::<()>();
+    let (addr_str, base_cfg, srv_handle) = {
+        let mut cfg = base_hybrid_config(&admin_pk);
+        cfg.server.db_path = db_path.clone();
+        cfg.mode.max_admin_members = 2;
+        cfg.storage.max_total_storage_mb = 4096;
+        cfg.storage.max_free_pool_mb = 1024;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        cfg.server.bind = addr.to_string();
+        cfg.server.public_base_url = format!("http://{}", addr);
+        cfg.normalize();
+        cfg.validate().unwrap();
+        let state = AppState::from_config(cfg.clone()).unwrap();
+        let app = build_router(state);
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async {
+                let _ = rx_shutdown.await;
+            })
+            .await;
+        });
+        (format!("http://{}", addr), cfg, handle)
+    };
+
+    let client = reqwest::Client::new();
+
+    // 1. Validation: max_user_storage_mb < 10 -> 400
+    let bad_user_body =
+        r#"{"max_total_storage_mb":512,"max_members":10,"max_user_storage_mb":5}"#;
+    let (ts, nonce, sig) = sign_put_cfg(bad_user_body);
+    let r_bad1 = client
+        .put(format!("{}/sync.php?admin_config", addr_str))
+        .header("X-Drop-Pubkey", &admin_pk)
+        .header("X-Drop-Timestamp", ts.to_string())
+        .header("X-Drop-Nonce", &nonce)
+        .header("X-Drop-Signature", &sig)
+        .body(bad_user_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_bad1.status().as_u16(), 400);
+
+    // 2. Validation: max_total_storage_mb < max_user_storage_mb -> 400
+    let bad_total_body =
+        r#"{"max_total_storage_mb":20,"max_members":10,"max_user_storage_mb":30}"#;
+    let (ts, nonce, sig) = sign_put_cfg(bad_total_body);
+    let r_bad2 = client
+        .put(format!("{}/sync.php?admin_config", addr_str))
+        .header("X-Drop-Pubkey", &admin_pk)
+        .header("X-Drop-Timestamp", ts.to_string())
+        .header("X-Drop-Nonce", &nonce)
+        .header("X-Drop-Signature", &sig)
+        .body(bad_total_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_bad2.status().as_u16(), 400);
+
+    // 3. Valid update: lower total to 500 MB (clamps free_pool 1024 -> 500), raise max_members 2 -> 3, user quota 15 MB
+    let ok_body = r#"{"max_total_storage_mb":500,"max_members":3,"max_user_storage_mb":15}"#;
+    let (ts, nonce, sig) = sign_put_cfg(ok_body);
+    let r_ok = client
+        .put(format!("{}/sync.php?admin_config", addr_str))
+        .header("X-Drop-Pubkey", &admin_pk)
+        .header("X-Drop-Timestamp", ts.to_string())
+        .header("X-Drop-Nonce", &nonce)
+        .header("X-Drop-Signature", &sig)
+        .body(ok_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_ok.status().as_u16(), 200);
+    let st_json: serde_json::Value = r_ok.json().await.unwrap();
+    assert_eq!(st_json["max_bytes"], 500 * 1024 * 1024);
+    assert_eq!(st_json["max_members"], 3);
+    assert_eq!(st_json["max_user_bytes"], 15 * 1024 * 1024);
+    assert_eq!(st_json["free_pool_max_bytes"], 500 * 1024 * 1024);
+
+    // 4. Live enforcement: PUT ?members with 3 pubkeys succeeds (was capped at 2), 4 pubkeys fails (507)
+    let (_, pk1) = gen_keypair();
+    let (_, pk2) = gen_keypair();
+    let (_, pk3) = gen_keypair();
+    let (_, pk4) = gen_keypair();
+    let m3_body = serde_json::json!({ "pubkeys": [&pk1, &pk2, &pk3] }).to_string();
+    let now = unix_now() as i64;
+    let m_nonce = random_hex(16);
+    let m_msg = format_admin_put_members_message("card", now, &m_nonce, &sha256_hex(m3_body.as_bytes()));
+    let m_sig = hex::encode(admin_sk.sign(m_msg.as_bytes()).to_bytes());
+    let r_m3 = client
+        .put(format!("{}/sync.php?members&channel=card", addr_str))
+        .header("X-Drop-Pubkey", &admin_pk)
+        .header("X-Drop-Timestamp", now.to_string())
+        .header("X-Drop-Nonce", &m_nonce)
+        .header("X-Drop-Signature", &m_sig)
+        .body(m3_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_m3.status().as_u16(), 200);
+
+    let m4_body = serde_json::json!({ "pubkeys": [&pk1, &pk2, &pk3, &pk4] }).to_string();
+    let m4_nonce = random_hex(16);
+    let m4_msg = format_admin_put_members_message("card", now, &m4_nonce, &sha256_hex(m4_body.as_bytes()));
+    let m4_sig = hex::encode(admin_sk.sign(m4_msg.as_bytes()).to_bytes());
+    let r_m4 = client
+        .put(format!("{}/sync.php?members&channel=card", addr_str))
+        .header("X-Drop-Pubkey", &admin_pk)
+        .header("X-Drop-Timestamp", now.to_string())
+        .header("X-Drop-Nonce", &m4_nonce)
+        .header("X-Drop-Signature", &m4_sig)
+        .body(m4_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_m4.status().as_u16(), 507);
+
+    // 5. Persistence across server restart (shutdown first server, reopen DB with original base_cfg)
+    drop(client);
+    let _ = tx_shutdown.send(());
+    let _ = srv_handle.await;
+
+    let restarted_state = AppState::from_config(base_cfg).unwrap();
+    let restarted_st = restarted_state
+        .db
+        .admin_status(&restarted_state.config, unix_now())
+        .unwrap();
+    assert_eq!(restarted_st.max_bytes, 500 * 1024 * 1024);
+    assert_eq!(restarted_st.max_members, 3);
+    assert_eq!(restarted_st.max_user_bytes, 15 * 1024 * 1024);
+    assert_eq!(restarted_st.free_pool_max_bytes, 500 * 1024 * 1024);
 }

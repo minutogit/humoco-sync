@@ -12,13 +12,13 @@ use serde::Deserialize;
 use crate::config::Config;
 use crate::crypto::{
     check_timestamp_window, format_admin_post_lock_selftest_message,
-    format_admin_put_lock_delegate_message, format_admin_put_members_message,
-    format_admin_put_revoke_message, format_admin_status_message, format_delete_account_message,
-    normalize_pubkey_hex, parse_member_message, sha256_hex, unix_now,
-    validate_admin_member_channel, validate_channel, validate_drop_prefix, validate_nonce_hex,
-    verify_ed25519_hex, verify_revocation_notice, RevocationNotice,
+    format_admin_put_config_message, format_admin_put_lock_delegate_message,
+    format_admin_put_members_message, format_admin_put_revoke_message, format_admin_status_message,
+    format_delete_account_message, normalize_pubkey_hex, parse_member_message, sha256_hex,
+    unix_now, validate_admin_member_channel, validate_channel, validate_drop_prefix,
+    validate_nonce_hex, verify_ed25519_hex, verify_revocation_notice, RevocationNotice,
 };
-use crate::db::{normalize_etag, ConditionalPrecondition};
+use crate::db::{normalize_etag, AdminConfigOverrides, ConditionalPrecondition};
 use crate::lock_rotation::{LockCommitRequest, LockFreezeRequest, LockImportRequest};
 use crate::locks::{LockBatchRequest, LockDelegation, LockTicketRequest, TicketCallerAuth};
 use crate::ratelimit::extract_client_ip;
@@ -40,6 +40,13 @@ pub fn sync_router(cfg: &Config) -> Router<AppState> {
 #[derive(Deserialize)]
 struct PutMembersPayload {
     pubkeys: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct PutAdminConfigPayload {
+    max_total_storage_mb: u64,
+    max_members: usize,
+    max_user_storage_mb: u64,
 }
 
 async fn handle_sync_endpoint(
@@ -94,6 +101,8 @@ async fn handle_sync_endpoint(
                     .map(|s| s.as_str())
                     .unwrap_or("");
                 handle_put_members(&state, &headers, channel, body).await
+            } else if query_params.contains_key("admin_config") && query_params.len() == 1 {
+                handle_put_admin_config(&state, &headers, body).await
             } else if query_params.contains_key("revoke") && query_params.len() == 1 {
                 handle_put_revoke(&state, &headers, body).await
             } else if query_params.contains_key("lock_delegate") && query_params.len() == 1 {
@@ -362,6 +371,69 @@ async fn handle_put_members(
             })),
         )
             .into_response(),
+        Err(e) => db_err_to_response(e),
+    }
+}
+
+async fn handle_put_admin_config(state: &AppState, headers: &HeaderMap, body: Body) -> Response {
+    if !state.config.mode.enable_admin_app {
+        return json_error(StatusCode::FORBIDDEN, "Admin app management disabled");
+    }
+    let (bytes, now) = match verify_admin_request_with_body(
+        state,
+        headers,
+        body,
+        16 * 1024,
+        format_admin_put_config_message,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    let payload: PutAdminConfigPayload = match serde_json::from_slice(&bytes) {
+        Ok(p) => p,
+        Err(_) => return json_error(StatusCode::BAD_REQUEST, "Invalid admin_config JSON"),
+    };
+
+    if payload.max_members == 0 || payload.max_members > 100_000 {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "max_members must be between 1 and 100000",
+        );
+    }
+    if payload.max_user_storage_mb < 10 {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "max_user_storage_mb must be at least 10 MB",
+        );
+    }
+    if payload.max_total_storage_mb < payload.max_user_storage_mb
+        || payload.max_total_storage_mb > 10_485_760
+    {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "max_total_storage_mb must be between max_user_storage_mb and 10485760 MB",
+        );
+    }
+
+    let ov = AdminConfigOverrides {
+        max_total_storage_mb: payload.max_total_storage_mb,
+        max_members: payload.max_members,
+        max_user_storage_mb: payload.max_user_storage_mb,
+    };
+    if let Err(e) = state.db.set_admin_config_overrides(&ov) {
+        return db_err_to_response(e);
+    }
+
+    match state.db.admin_status(&state.config, now) {
+        Ok(status) => {
+            let mut resp = (StatusCode::OK, Json(status)).into_response();
+            resp.headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            resp
+        }
         Err(e) => db_err_to_response(e),
     }
 }

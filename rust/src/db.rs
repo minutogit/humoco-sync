@@ -198,6 +198,13 @@ pub struct SyncIndexEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminConfigOverrides {
+    pub max_total_storage_mb: u64,
+    pub max_members: usize,
+    pub max_user_storage_mb: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminStatusResponse {
     pub used_bytes: u64,
     pub max_bytes: u64,
@@ -206,6 +213,8 @@ pub struct AdminStatusResponse {
     pub slot_count: usize,
     pub channel_counts: BTreeMap<String, usize>,
     pub admin_pubkey: String,
+    pub max_members: usize,
+    pub max_user_bytes: u64,
     pub admin_members_count: usize,
     pub registered_users_count: usize,
     pub free_pool_used_bytes: u64,
@@ -450,6 +459,50 @@ impl SyncDb {
         Ok(())
     }
 
+    pub fn get_admin_config_overrides(&self) -> Result<Option<AdminConfigOverrides>, DbError> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(SERVER_META)?;
+        if let Some(guard) = table.get("admin_config")? {
+            let ov: AdminConfigOverrides = serde_json::from_slice(guard.value())?;
+            Ok(Some(ov))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn set_admin_config_overrides(&self, ov: &AdminConfigOverrides) -> Result<(), DbError> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(SERVER_META)?;
+            let json = serde_json::to_vec(ov)?;
+            table.insert("admin_config", json.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    pub fn effective_config(&self, base: &Config) -> Result<Config, DbError> {
+        let mut cfg = base.clone();
+        if let Some(ov) = self.get_admin_config_overrides()? {
+            cfg.storage.max_total_storage_mb = ov.max_total_storage_mb;
+            cfg.storage.max_free_pool_mb = cfg
+                .storage
+                .max_free_pool_mb
+                .min(ov.max_total_storage_mb);
+            cfg.mode.max_admin_members = ov.max_members;
+            let user_bytes = ov.max_user_storage_mb.saturating_mul(1024 * 1024);
+            if let Some(prof) = cfg.profiles.get_mut(&cfg.mode.admin_app_profile) {
+                prof.max_total_bytes = user_bytes;
+                if let Some(mq) = prof.channels.get_mut("media") {
+                    if let Some(ref mut ubytes) = mq.max_user_bytes {
+                        *ubytes = (*ubytes).min(user_bytes);
+                    }
+                }
+            }
+        }
+        Ok(cfg)
+    }
+
     fn admin_channels_for_pubkey_read<R: ReadableTable<&'static str, &'static [u8]>>(
         admin_table: &R,
         cfg: &Config,
@@ -597,10 +650,11 @@ impl SyncDb {
         pubkey: &str,
         now_secs: u64,
     ) -> Result<Option<EffectiveAccess>, DbError> {
+        let eff_cfg = self.effective_config(cfg)?;
         let read_txn = self.db.begin_read()?;
         let admin_table = read_txn.open_table(ADMIN_MEMBERS)?;
         let reg_table = read_txn.open_table(REGISTERED_USERS)?;
-        Self::resolve_member_access_in_txn(&admin_table, &reg_table, cfg, pubkey, now_secs)
+        Self::resolve_member_access_in_txn(&admin_table, &reg_table, &eff_cfg, pubkey, now_secs)
     }
 
     pub fn get_registered_user(
@@ -624,6 +678,8 @@ impl SyncDb {
         media_id: Option<&str>,
         now_secs: u64,
     ) -> Result<HeadCapability, DbError> {
+        let effective_cfg = self.effective_config(cfg)?;
+        let cfg = &effective_cfg;
         let read_txn = self.db.begin_read()?;
         let admin_table = read_txn.open_table(ADMIN_MEMBERS)?;
         let reg_table = read_txn.open_table(REGISTERED_USERS)?;
@@ -770,6 +826,8 @@ impl SyncDb {
                 "Use media endpoint headers for media uploads",
             ));
         }
+        let effective_cfg = self.effective_config(cfg)?;
+        let cfg = &effective_cfg;
         let slot_id = crate::crypto::format_slot_id(pubkey, prefix);
         let skey = slot_key(channel, &slot_id);
 
@@ -884,6 +942,8 @@ impl SyncDb {
         precondition: &ConditionalPrecondition,
         now_secs: u64,
     ) -> Result<PutOutcome, DbError> {
+        let effective_cfg = self.effective_config(cfg)?;
+        let cfg = &effective_cfg;
         let write_txn = self.db.begin_write()?;
         let outcome = {
             let admin_table = write_txn.open_table(ADMIN_MEMBERS)?;
@@ -1258,11 +1318,16 @@ impl SyncDb {
         pubkeys: &[String],
         now_secs: u64,
     ) -> Result<usize, DbError> {
+        let effective_cfg = self.effective_config(cfg)?;
+        let cfg = &effective_cfg;
         if !cfg.mode.enable_admin_app {
             return Err(DbError::http(403, "Admin app member management disabled"));
         }
         if pubkeys.len() > cfg.mode.max_admin_members {
-            return Err(DbError::http(413, "Too many members for channel"));
+            return Err(DbError::http(
+                507,
+                "Insufficient Storage: Exceeds max_members limit",
+            ));
         }
         let target_set: BTreeSet<String> = pubkeys.iter().cloned().collect();
 
@@ -1514,6 +1579,8 @@ impl SyncDb {
         cfg: &Config,
         now_secs: u64,
     ) -> Result<AdminStatusResponse, DbError> {
+        let effective_cfg = self.effective_config(cfg)?;
+        let cfg = &effective_cfg;
         let read_txn = self.db.begin_read()?;
         let admin_table = read_txn.open_table(ADMIN_MEMBERS)?;
         let reg_table = read_txn.open_table(REGISTERED_USERS)?;
@@ -1589,6 +1656,11 @@ impl SyncDb {
 
         let max_bytes = cfg.max_total_bytes();
         let soft_limit_bytes = cfg.soft_limit_bytes();
+        let max_user_bytes = cfg
+            .profiles
+            .get(&cfg.mode.admin_app_profile)
+            .map(|p| p.max_total_bytes)
+            .unwrap_or(25 * 1024 * 1024);
 
         Ok(AdminStatusResponse {
             used_bytes,
@@ -1598,6 +1670,8 @@ impl SyncDb {
             slot_count,
             channel_counts,
             admin_pubkey: cfg.server.admin_pubkey.clone(),
+            max_members: cfg.mode.max_admin_members,
+            max_user_bytes,
             admin_members_count: admin_unique_pks.len(),
             registered_users_count,
             free_pool_used_bytes,

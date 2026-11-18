@@ -145,6 +145,17 @@ pub fn format_admin_status_message(timestamp: i64, nonce: &str) -> String {
     )
 }
 
+pub fn format_admin_put_config_message(
+    timestamp: i64,
+    nonce: &str,
+    body_sha256_hex: &str,
+) -> String {
+    format!(
+        "HUMOCO-DROP-ADMIN-V1\nPUT_ADMIN_CONFIG\n\n{}\n{}\n{}",
+        timestamp, nonce, body_sha256_hex
+    )
+}
+
 pub fn format_admin_put_revoke_message(
     timestamp: i64,
     nonce: &str,

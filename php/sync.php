@@ -43,7 +43,7 @@ $disableRateLimit = !empty($config['disable_rate_limit'])
     || (isset($_SERVER['HUMOCO_DISABLE_RATE_LIMIT']) && $_SERVER['HUMOCO_DISABLE_RATE_LIMIT'] === '1');
 
 $channels = isset($config['channels']) && is_array($config['channels']) ? $config['channels'] : [];
-$maxTotalStorageMb = isset($config['max_total_storage_mb']) ? (int)$config['max_total_storage_mb'] : 256;
+$maxTotalStorageMb = isset($config['max_total_storage_mb']) ? (int)$config['max_total_storage_mb'] : 2048;
 $maxTotalBytes = isset($config['max_total_bytes']) ? (int)$config['max_total_bytes'] : ($maxTotalStorageMb * 1024 * 1024);
 $softLimitBytes = (int)floor($maxTotalBytes * 0.8);
 
@@ -309,6 +309,23 @@ if (!isset($state['used_bytes'])) {
     $state['used_bytes'] = $totalUsed;
 }
 
+$maxMembers = isset($config['max_members']) ? (int)$config['max_members'] : 300;
+$maxUserStorageMb = isset($config['max_user_storage_mb']) ? (int)$config['max_user_storage_mb'] : 25;
+if (isset($state['admin_config']) && is_array($state['admin_config'])) {
+    if (isset($state['admin_config']['max_total_storage_mb'])) {
+        $maxTotalStorageMb = (int)$state['admin_config']['max_total_storage_mb'];
+        $maxTotalBytes = $maxTotalStorageMb * 1024 * 1024;
+        $softLimitBytes = (int)floor($maxTotalBytes * 0.8);
+    }
+    if (isset($state['admin_config']['max_members'])) {
+        $maxMembers = (int)$state['admin_config']['max_members'];
+    }
+    if (isset($state['admin_config']['max_user_storage_mb'])) {
+        $maxUserStorageMb = (int)$state['admin_config']['max_user_storage_mb'];
+    }
+}
+$maxUserBytesLimit = $maxUserStorageMb * 1024 * 1024;
+
 
 // Prune nonces older than 120 seconds
 foreach ($state['nonces'] as $n => $ts) {
@@ -545,6 +562,96 @@ function evict_oldest_media_for_space($dataDir, array &$state, $neededBytes, $ma
     }
 }
 
+// Helper: enforce per-user storage budget with Priority-3 media eviction
+function ensure_user_quota_with_media_eviction($dataDir, array &$state, $pubkey, $newSize, $maxUserBytesLimit, $skipSlotBase = null, $skipMediaId = null) {
+    if ($maxUserBytesLimit <= 0) {
+        return true;
+    }
+    while (true) {
+        $userUsed = 0;
+        $userFiles = glob($dataDir . DIRECTORY_SEPARATOR . $pubkey . '*.bin');
+        if ($userFiles !== false) {
+            foreach ($userFiles as $uf) {
+                $base = basename($uf);
+                if ($skipSlotBase !== null && $base === $skipSlotBase) {
+                    continue;
+                }
+                $parsed = parse_slot_filename($base);
+                if ($parsed !== null && $parsed['id'] === $pubkey && $parsed['channel'] !== 'media') {
+                    $sz = filesize($uf);
+                    if ($sz !== false) {
+                        $userUsed += $sz;
+                    }
+                }
+            }
+        }
+        $userMedia = [];
+        if (isset($state['media_blobs']) && is_array($state['media_blobs'])) {
+            foreach ($state['media_blobs'] as $mId => $mInfo) {
+                if (isset($mInfo['owner']) && $mInfo['owner'] === $pubkey) {
+                    if ($skipMediaId !== null && $mId === $skipMediaId) {
+                        continue;
+                    }
+                    $mSz = isset($mInfo['size']) ? (int)$mInfo['size'] : 0;
+                    $userUsed += $mSz;
+                    $userMedia[$mId] = $mInfo;
+                }
+            }
+        }
+        if ($userUsed + $newSize <= $maxUserBytesLimit) {
+            return true;
+        }
+        if (empty($userMedia)) {
+            return false;
+        }
+        uasort($userMedia, function ($a, $b) {
+            $ta = isset($a['mtime']) ? (int)$a['mtime'] : 0;
+            $tb = isset($b['mtime']) ? (int)$b['mtime'] : 0;
+            return $ta <=> $tb;
+        });
+        $victimId = array_key_first($userMedia);
+        $mFile = $dataDir . DIRECTORY_SEPARATOR . $victimId . '.media.bin';
+        $sz = isset($state['media_blobs'][$victimId]['size']) ? (int)$state['media_blobs'][$victimId]['size'] : 0;
+        if (file_exists($mFile)) {
+            $realSz = filesize($mFile);
+            if ($realSz !== false) {
+                $sz = $realSz;
+            }
+            @unlink($mFile);
+        }
+        $state['used_bytes'] = max(0, $state['used_bytes'] - $sz);
+        unset($state['media_blobs'][$victimId]);
+    }
+}
+
+// Helper: build admin status JSON payload
+function build_admin_status_payload($dataDir, array $channels, array $state, $maxTotalBytes, $softLimitBytes, $maxMembers, $maxUserBytesLimit) {
+    $slotCounts = [];
+    $totalSlotCount = 0;
+    foreach (array_keys($channels) as $ch) {
+        if ($ch === 'media') {
+            $c = isset($state['media_blobs']) && is_array($state['media_blobs']) ? count($state['media_blobs']) : 0;
+        } else {
+            $files = glob($dataDir . DIRECTORY_SEPARATOR . '*.' . $ch . '.bin');
+            $c = ($files !== false) ? count($files) : 0;
+        }
+        $slotCounts[$ch] = $c;
+        $totalSlotCount += $c;
+    }
+
+    return [
+        'used_bytes'       => $state['used_bytes'],
+        'max_bytes'        => $maxTotalBytes,
+        'soft_limit_bytes' => $softLimitBytes,
+        'soft_warning'     => ($state['used_bytes'] >= $softLimitBytes),
+        'slot_count'       => $totalSlotCount,
+        'channel_counts'   => $slotCounts,
+        'admin_pubkey'     => $state['admin_pubkey'],
+        'max_members'      => $maxMembers,
+        'max_user_bytes'   => $maxUserBytesLimit,
+    ];
+}
+
 $commonHeaders = [];
 
 // Load members for a channel
@@ -731,8 +838,9 @@ if ($method === 'HEAD') {
         }
 
         if (isset($channels['media'])) {
-            $respHeaders['X-Media-Max-Count'] = (string)(isset($channels['media']['max_user_count']) ? (int)$channels['media']['max_user_count'] : 5);
-            $respHeaders['X-Media-Max-Bytes'] = (string)(isset($channels['media']['max_user_bytes']) ? (int)$channels['media']['max_user_bytes'] : 409600);
+            $respHeaders['X-Media-Max-Count'] = (string)(isset($channels['media']['max_user_count']) ? (int)$channels['media']['max_user_count'] : 12);
+            $cfgMediaMaxUserBytes = isset($channels['media']['max_user_bytes']) ? (int)$channels['media']['max_user_bytes'] : 6291456;
+            $respHeaders['X-Media-Max-Bytes'] = (string)min($maxUserBytesLimit, $cfgMediaMaxUserBytes);
         }
     }
 
@@ -791,7 +899,6 @@ if ($method === 'PUT' && isset($_GET['members'])) {
         sync_respond(400, $lockFp, 'Bad Request: Expected pubkeys array', $commonHeaders);
     }
 
-    $maxMembers = isset($config['max_members']) ? (int)$config['max_members'] : 300;
     if (count($bodyData['pubkeys']) > $maxMembers) {
         sync_respond(507, $lockFp, 'Insufficient Storage: Exceeds max_members limit', $commonHeaders);
     }
@@ -1033,6 +1140,95 @@ if ($method === 'PUT' && isset($_GET['revoke'])) {
 }
 
 // =========================================================================
+// ROUTE 4b: PUT sync.php?admin_config (Admin Update Storage & Member Quotas)
+// =========================================================================
+if ($method === 'PUT' && isset($_GET['admin_config']) && count($_GET) === 1) {
+    $adminPub = isset($_SERVER['HTTP_X_DROP_PUBKEY']) ? strtolower(trim((string)$_SERVER['HTTP_X_DROP_PUBKEY'])) : '';
+    $timestampRaw = isset($_SERVER['HTTP_X_DROP_TIMESTAMP']) ? trim((string)$_SERVER['HTTP_X_DROP_TIMESTAMP']) : '';
+    $nonce = isset($_SERVER['HTTP_X_DROP_NONCE']) ? strtolower(trim((string)$_SERVER['HTTP_X_DROP_NONCE'])) : '';
+    $signature = isset($_SERVER['HTTP_X_DROP_SIGNATURE']) ? strtolower(trim((string)$_SERVER['HTTP_X_DROP_SIGNATURE'])) : '';
+
+    if ($adminPub === '' || !is_numeric($timestampRaw) || !preg_match('/^[0-9a-f]{64}$/', $adminPub) || !preg_match('/^[0-9a-f]{32}$/', $nonce) || !preg_match('/^[0-9a-f]{128}$/', $signature)) {
+        if (!$disableRateLimit) {
+            $bucket['failCount'] = min(100, $bucket['failCount'] + 1);
+            write_ip_bucket($rlFp, $ipBucketIdx, $bucket);
+        }
+        sync_respond(400, $lockFp, 'Bad Request: Invalid headers', $commonHeaders);
+    }
+    $timestamp = (int)$timestampRaw;
+
+    if (!hash_equals($state['admin_pubkey'], $adminPub)) {
+        if (!$disableRateLimit) {
+            $bucket['failCount'] = min(100, $bucket['failCount'] + 1);
+            write_ip_bucket($rlFp, $ipBucketIdx, $bucket);
+        }
+        sync_respond(403, $lockFp, 'Forbidden: Unauthorized admin pubkey', $commonHeaders);
+    }
+    if (abs($now - $timestamp) > 60) {
+        sync_respond(401, $lockFp, 'Unauthorized: Timestamp outside allowed window', $commonHeaders);
+    }
+
+    $rawInput = file_get_contents('php://input');
+    $canonicalMsg = "HUMOCO-DROP-ADMIN-V1\nPUT_ADMIN_CONFIG\n\n{$timestamp}\n{$nonce}\n" . hash('sha256', $rawInput);
+    if (!verify_ed25519_detached($signature, $canonicalMsg, $adminPub)) {
+        if (!$disableRateLimit) {
+            $bucket['failCount'] = min(100, $bucket['failCount'] + 1);
+            write_ip_bucket($rlFp, $ipBucketIdx, $bucket);
+        }
+        sync_respond(401, $lockFp, 'Unauthorized: Invalid admin signature', $commonHeaders);
+    }
+
+    if (isset($state['nonces'][$nonce])) {
+        sync_respond(409, $lockFp, 'Conflict: Replay detected', $commonHeaders);
+    }
+    $state['nonces'][$nonce] = $now;
+
+    $bodyData = json_decode($rawInput, true);
+    if (!is_array($bodyData)
+        || !isset($bodyData['max_total_storage_mb'], $bodyData['max_members'], $bodyData['max_user_storage_mb'])
+        || !is_int($bodyData['max_total_storage_mb'])
+        || !is_int($bodyData['max_members'])
+        || !is_int($bodyData['max_user_storage_mb'])) {
+        sync_respond(400, $lockFp, 'Bad Request: Invalid admin_config JSON', $commonHeaders);
+    }
+
+    $reqTotalMb = $bodyData['max_total_storage_mb'];
+    $reqMembers = $bodyData['max_members'];
+    $reqUserMb  = $bodyData['max_user_storage_mb'];
+
+    if ($reqMembers < 1 || $reqMembers > 100000) {
+        sync_respond(400, $lockFp, 'Bad Request: max_members must be between 1 and 100000', $commonHeaders);
+    }
+    if ($reqUserMb < 10) {
+        sync_respond(400, $lockFp, 'Bad Request: max_user_storage_mb must be at least 10 MB', $commonHeaders);
+    }
+    if ($reqTotalMb < $reqUserMb || $reqTotalMb > 10485760) {
+        sync_respond(400, $lockFp, 'Bad Request: max_total_storage_mb must be between max_user_storage_mb and 10485760 MB', $commonHeaders);
+    }
+
+    $state['admin_config'] = [
+        'max_total_storage_mb' => $reqTotalMb,
+        'max_members'          => $reqMembers,
+        'max_user_storage_mb'  => $reqUserMb,
+    ];
+    $maxTotalStorageMb = $reqTotalMb;
+    $maxTotalBytes     = $maxTotalStorageMb * 1024 * 1024;
+    $softLimitBytes    = (int)floor($maxTotalBytes * 0.8);
+    $maxMembers        = $reqMembers;
+    $maxUserStorageMb  = $reqUserMb;
+    $maxUserBytesLimit = $maxUserStorageMb * 1024 * 1024;
+
+    lazy_prune_slots($dataDir, $channels, $state, $now);
+    save_state($stateFile, $state);
+
+    $statusData = build_admin_status_payload($dataDir, $channels, $state, $maxTotalBytes, $softLimitBytes, $maxMembers, $maxUserBytesLimit);
+    sync_respond(200, $lockFp, json_encode($statusData, JSON_UNESCAPED_SLASHES), array_merge($commonHeaders, [
+        'Content-Type'  => 'application/json; charset=utf-8',
+        'Cache-Control' => 'no-store',
+    ]));
+}
+
+// =========================================================================
 // ROUTE 5: GET sync.php?status (Admin Storage Dashboard Info)
 // =========================================================================
 if ($method === 'GET' && isset($_GET['status'])) {
@@ -1072,31 +1268,11 @@ if ($method === 'GET' && isset($_GET['status'])) {
     lazy_prune_slots($dataDir, $channels, $state, $now);
     save_state($stateFile, $state);
 
-    $slotCounts = [];
-    $totalSlotCount = 0;
-    foreach (array_keys($channels) as $ch) {
-        if ($ch === 'media') {
-            $c = isset($state['media_blobs']) && is_array($state['media_blobs']) ? count($state['media_blobs']) : 0;
-        } else {
-            $files = glob($dataDir . DIRECTORY_SEPARATOR . '*.' . $ch . '.bin');
-            $c = ($files !== false) ? count($files) : 0;
-        }
-        $slotCounts[$ch] = $c;
-        $totalSlotCount += $c;
-    }
-
-    $statusData = [
-        'used_bytes'        => $state['used_bytes'],
-        'max_bytes'         => $maxTotalBytes,
-        'soft_limit_bytes'  => $softLimitBytes,
-        'soft_warning'      => ($state['used_bytes'] >= $softLimitBytes),
-        'slot_count'        => $totalSlotCount,
-        'channel_counts'    => $slotCounts,
-        'admin_pubkey'      => $state['admin_pubkey'],
-    ];
+    $statusData = build_admin_status_payload($dataDir, $channels, $state, $maxTotalBytes, $softLimitBytes, $maxMembers, $maxUserBytesLimit);
 
     sync_respond(200, $lockFp, json_encode($statusData, JSON_UNESCAPED_SLASHES), array_merge($commonHeaders, [
-        'Content-Type' => 'application/json; charset=utf-8',
+        'Content-Type'  => 'application/json; charset=utf-8',
+        'Cache-Control' => 'no-store',
     ]));
 }
 
@@ -1230,6 +1406,10 @@ if ($method === 'PUT') {
         }
 
         $newSize = strlen($rawBody);
+        if (!ensure_user_quota_with_media_eviction($dataDir, $state, $pubkey, $newSize, $maxUserBytesLimit, null, $mediaId)) {
+            sync_respond(507, $lockFp, 'Insufficient Storage: Account total quota exceeded', $commonHeaders);
+        }
+
         $oldBlobSize = 0;
         if (isset($state['media_blobs'][$mediaId])) {
             $oldBlobSize = (int)$state['media_blobs'][$mediaId]['size'];
@@ -1254,8 +1434,8 @@ if ($method === 'PUT') {
         }
 
         // Check per-member limits
-        $maxUserCount = isset($channelCfg['max_user_count']) ? (int)$channelCfg['max_user_count'] : 5;
-        $maxUserBytes = isset($channelCfg['max_user_bytes']) ? (int)$channelCfg['max_user_bytes'] : 409600;
+        $maxUserCount = isset($channelCfg['max_user_count']) ? (int)$channelCfg['max_user_count'] : 12;
+        $maxUserBytes = min($maxUserBytesLimit, isset($channelCfg['max_user_bytes']) ? (int)$channelCfg['max_user_bytes'] : 6291456);
         if (($userCount + 1) > $maxUserCount || ($userBytes + $newSize) > $maxUserBytes) {
             sync_respond(507, $lockFp, 'Insufficient Storage: Member media quota exceeded', $commonHeaders);
         }
@@ -1346,6 +1526,10 @@ if ($method === 'PUT') {
 
     // Hard quota check with active priority eviction of oldest media blobs
     $newSize = strlen($rawBody);
+    $slotBaseName = build_slot_filename($pubkey, $prefix, $channel);
+    if (!ensure_user_quota_with_media_eviction($dataDir, $state, $pubkey, $newSize, $maxUserBytesLimit, $slotBaseName, null)) {
+        sync_respond(507, $lockFp, 'Insufficient Storage: Account total quota exceeded', $commonHeaders);
+    }
     $delta = $newSize - $oldSize;
     if ($state['used_bytes'] + $delta > $maxTotalBytes) {
         evict_oldest_media_for_space($dataDir, $state, $delta, $maxTotalBytes);

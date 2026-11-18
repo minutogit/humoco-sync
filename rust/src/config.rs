@@ -115,6 +115,7 @@ pub struct ModeConfig {
     pub enable_admin_app: bool,
     pub admin_app_profile: String,
     pub max_admin_members: usize,
+    pub max_admin_user_storage_mb: Option<u64>,
     pub enable_public_registration: bool,
     pub default_public_profile: String,
     pub registration_gates: Vec<String>,
@@ -130,6 +131,7 @@ impl Default for ModeConfig {
             enable_admin_app: true,
             admin_app_profile: "friends".to_string(),
             max_admin_members: 300,
+            max_admin_user_storage_mb: None,
             enable_public_registration: false,
             default_public_profile: "free".to_string(),
             registration_gates: vec!["email".to_string(), "code".to_string()],
@@ -328,7 +330,7 @@ pub fn default_profiles() -> BTreeMap<String, ProfileConfig> {
         "friends".to_string(),
         ProfileConfig {
             display_name: "Friends & Host Circle".to_string(),
-            max_total_bytes: 20_971_520, // 20 MiB
+            max_total_bytes: 26_214_400, // 25 MiB
             is_free_pool: false,
             store_contact_email: false,
             channels: BTreeMap::from([
@@ -476,6 +478,16 @@ impl Config {
         }
         self.email.transport = self.email.transport.trim().to_ascii_lowercase();
         self.email.smtp_tls_mode = self.email.smtp_tls_mode.trim().to_ascii_lowercase();
+        if let Some(mb) = self.mode.max_admin_user_storage_mb {
+            if let Some(prof) = self.profiles.get_mut(&self.mode.admin_app_profile) {
+                prof.max_total_bytes = mb.saturating_mul(1024 * 1024);
+                if let Some(mq) = prof.channels.get_mut("media") {
+                    if let Some(ref mut ubytes) = mq.max_user_bytes {
+                        *ubytes = (*ubytes).min(prof.max_total_bytes);
+                    }
+                }
+            }
+        }
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -572,6 +584,12 @@ impl Config {
                     )));
                 }
             }
+        }
+
+        if self.mode.max_admin_user_storage_mb.is_some_and(|mb| mb < 10) {
+            return Err(ConfigError::Validation(
+                "mode.max_admin_user_storage_mb must be >= 10".to_string(),
+            ));
         }
 
         if self.storage.max_free_pool_mb > self.storage.max_total_storage_mb {

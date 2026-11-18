@@ -1,6 +1,6 @@
 [package]
 name = "humoco-sync-server"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 description = "High-performance Hybrid Rust Drop Server for HuMoCo (wire-compatible with humoco-sync PHP)"

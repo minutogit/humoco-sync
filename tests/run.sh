@@ -224,6 +224,54 @@ run_blackbox_protocol_suite() {
     -H "X-Drop-Signature: $sig" \
     "${endpoint}?status")"
   assert_contains "$st_json" "\"admin_pubkey\":\"$admin_pk\"" "GET ?status returns server telemetry"
+  assert_contains "$st_json" "\"max_members\":" "GET ?status includes max_members"
+  assert_contains "$st_json" "\"max_user_bytes\":" "GET ?status includes max_user_bytes"
+
+  local cfg_ts cfg_nonce cfg_sig
+  printf '{"max_total_storage_mb":512,"max_members":10,"max_user_storage_mb":5}' > "$TMP_ROOT/admin_cfg_bad.json"
+  cfg_ts="$(date +%s)"
+  cfg_nonce="$(rand_nonce)"
+  cfg_sig="$("$helper_bin" sign-test sign-admin --sk "$admin_sk" --action PUT_ADMIN_CONFIG --ts "$cfg_ts" --nonce "$cfg_nonce" --body-file "$TMP_ROOT/admin_cfg_bad.json")"
+  local bad_cfg_code
+  bad_cfg_code="$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+    -H "X-Drop-Pubkey: $admin_pk" \
+    -H "X-Drop-Timestamp: $cfg_ts" \
+    -H "X-Drop-Nonce: $cfg_nonce" \
+    -H "X-Drop-Signature: $cfg_sig" \
+    -H "Content-Type: application/json" \
+    --data-binary "@$TMP_ROOT/admin_cfg_bad.json" \
+    "${endpoint}?admin_config")"
+  assert_eq "$bad_cfg_code" "400" "PUT ?admin_config rejects max_user_storage_mb < 10 with 400"
+
+  printf '{"max_total_storage_mb":1024,"max_members":250,"max_user_storage_mb":20}' > "$TMP_ROOT/admin_cfg_ok.json"
+  cfg_ts="$(date +%s)"
+  cfg_nonce="$(rand_nonce)"
+  cfg_sig="$("$helper_bin" sign-test sign-admin --sk "$admin_sk" --action PUT_ADMIN_CONFIG --ts "$cfg_ts" --nonce "$cfg_nonce" --body-file "$TMP_ROOT/admin_cfg_ok.json")"
+  local ok_cfg_json
+  ok_cfg_json="$(curl -sf -X PUT \
+    -H "X-Drop-Pubkey: $admin_pk" \
+    -H "X-Drop-Timestamp: $cfg_ts" \
+    -H "X-Drop-Nonce: $cfg_nonce" \
+    -H "X-Drop-Signature: $cfg_sig" \
+    -H "Content-Type: application/json" \
+    --data-binary "@$TMP_ROOT/admin_cfg_ok.json" \
+    "${endpoint}?admin_config")"
+  assert_contains "$ok_cfg_json" "\"max_members\":250" "PUT ?admin_config updates max_members live"
+  assert_contains "$ok_cfg_json" "\"max_user_bytes\":20971520" "PUT ?admin_config updates max_user_bytes live"
+
+  # Restore 300 members / 2048 MB / 25 MB
+  printf '{"max_total_storage_mb":2048,"max_members":300,"max_user_storage_mb":25}' > "$TMP_ROOT/admin_cfg_restore.json"
+  cfg_ts="$(date +%s)"
+  cfg_nonce="$(rand_nonce)"
+  cfg_sig="$("$helper_bin" sign-test sign-admin --sk "$admin_sk" --action PUT_ADMIN_CONFIG --ts "$cfg_ts" --nonce "$cfg_nonce" --body-file "$TMP_ROOT/admin_cfg_restore.json")"
+  curl -sf -X PUT \
+    -H "X-Drop-Pubkey: $admin_pk" \
+    -H "X-Drop-Timestamp: $cfg_ts" \
+    -H "X-Drop-Nonce: $cfg_nonce" \
+    -H "X-Drop-Signature: $cfg_sig" \
+    -H "Content-Type: application/json" \
+    --data-binary "@$TMP_ROOT/admin_cfg_restore.json" \
+    "${endpoint}?admin_config" > /dev/null
 
   echo "=== Group 5 ($label): Security (Replay 409, Timestamp Drift 401, Bad Sig 401) ==="
   local replay_code

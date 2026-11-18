@@ -1,7 +1,7 @@
 # Project Status: `humoco-sync`
 
-**Version:** `v0.1.0`  
-**Last Updated:** 2026-11-17
+**Version:** `v0.1.1`  
+**Last Updated:** 2026-11-18
 
 ## Overview
 `humoco-sync` is the 6th repository in the HuMoCo ecosystem, housing both the lightweight PHP sync script (`php/`) and the high-performance Rust sync daemon (`rust/humoco-sync-server`), unified under [`SPEC.md`](SPEC.md) and verified by a shared blackbox integration test suite (`tests/run.sh`).

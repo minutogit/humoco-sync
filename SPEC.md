@@ -21,6 +21,7 @@ Both `/sync.php` and `/sync` accept identical query parameters and HTTP methods.
 | Delete slot or media | `DELETE /sync.php` | Member Ed25519 signature |
 | Delete entire account & blobs | `DELETE /sync.php?account` | Account Ed25519 signature |
 | Update friend member list | `PUT /sync.php?members&channel=<ch>` | Admin Ed25519 signature |
+| Update admin storage & member limits | `PUT /sync.php?admin_config` | Admin Ed25519 signature |
 | Fetch storage dashboard | `GET /sync.php?status` | Admin Ed25519 signature |
 | Publish or clear revocation | `PUT /sync.php?revoke` | Admin Ed25519 signature |
 | Delegate server `lock_pub` | `PUT /sync.php?lock_delegate` | Admin Ed25519 signature (`HUMOCO-DROP-ADMIN-V1`) |
@@ -88,7 +89,14 @@ Empty body SHA-256 hex digest: `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934c
    ```text
    HUMOCO-DROP-ADMIN-V1\nSTATUS\n\n<timestamp>\n<nonce>\n<sha256_hex('')>
    ```
-3. **`PUT ?revoke`:**
+   Returns JSON with `used_bytes`, `max_bytes`, `soft_limit_bytes`, `soft_warning`, `slot_count`, `channel_counts`, `admin_pubkey`, `max_members`, and `max_user_bytes`.
+3. **`PUT ?admin_config`:**
+   ```text
+   HUMOCO-DROP-ADMIN-V1\nPUT_ADMIN_CONFIG\n\n<timestamp>\n<nonce>\n<sha256_hex(raw_body)>
+   ```
+   Body JSON: `{"max_total_storage_mb": <u64>, "max_members": <usize>, "max_user_storage_mb": <u64>}`.
+   Enforces `1 <= max_members <= 100000`, `max_user_storage_mb >= 10`, `max_total_storage_mb >= max_user_storage_mb`, and `max_total_storage_mb <= 10485760` (`400 Bad Request` otherwise). Persists live admin overrides across restarts and returns the updated `GET ?status` JSON object.
+4. **`PUT ?revoke`:**
    ```text
    HUMOCO-DROP-ADMIN-V1\nPUT_REVOKE\n<timestamp>\n<nonce>\n<sha256_hex(raw_body)>
    ```
@@ -96,15 +104,15 @@ Empty body SHA-256 hex digest: `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934c
    ```text
    HUMOCO-DROP-REVOKE-V1\n<drop_pub>\n<issued_at>\n<effective_at>\n<rep_write>\n<rep_read>\n<rep_pub>\n<reason>
    ```
-4. **`PUT ?lock_delegate`:**
+5. **`PUT ?lock_delegate`:**
    ```text
    HUMOCO-DROP-ADMIN-V1\nPUT_LOCK_DELEGATE\n<timestamp>\n<nonce>\n<sha256_hex(raw_body)>
    ```
-5. **`POST ?lock_selftest`:**
+6. **`POST ?lock_selftest`:**
    ```text
    HUMOCO-DROP-ADMIN-V1\nPOST_LOCK_SELFTEST\n<timestamp>\n<nonce>\n<sha256_hex(raw_body)>
    ```
-6. **`POST ?lock_ticket` (when using Member / Registered / Admin Ed25519 auth):**
+7. **`POST ?lock_ticket` (when using Member / Registered / Admin Ed25519 auth):**
    ```text
    HUMOCO-DROP-REQ-V1\nPOST\nlock_ticket\n\n<timestamp>\n<nonce>\n<sha256_hex(raw_body)>
    ```

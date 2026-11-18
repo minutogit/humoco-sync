@@ -15,9 +15,9 @@ use humoco_sync_server::build_router;
 use humoco_sync_server::config::Config;
 use humoco_sync_server::crypto::{
     canonical_revocation_message, format_admin_post_lock_selftest_message,
-    format_admin_put_lock_delegate_message, format_admin_put_members_message,
-    format_admin_put_revoke_message, format_admin_status_message, format_delete_account_message,
-    format_lock_delegate_signature_message, hash_admin_token, leading_zero_bits,
+    format_admin_put_config_message, format_admin_put_lock_delegate_message,
+    format_admin_put_members_message, format_admin_put_revoke_message, format_admin_status_message,
+    format_delete_account_message, format_lock_delegate_signature_message, hash_admin_token, leading_zero_bits,
     parse_member_message, random_hex, sha256_hex, unix_now, RevocationNotice,
     RevocationReplacementTarget,
 };
@@ -117,7 +117,7 @@ enum SignTestCmd {
         #[arg(long)]
         body_file: Option<PathBuf>,
     },
-    /// Sign an admin request (PUT_MEMBERS, STATUS, PUT_REVOKE) and print 128-hex signature
+    /// Sign an admin request (PUT_MEMBERS, STATUS, PUT_ADMIN_CONFIG, PUT_REVOKE) and print 128-hex signature
     SignAdmin {
         #[arg(long)]
         sk: String,
@@ -560,6 +560,7 @@ fn run_sign_test(cmd: SignTestCmd) -> i32 {
             let msg = match action.as_str() {
                 "PUT_MEMBERS" => format_admin_put_members_message(&channel, ts, &nonce, &body_hash),
                 "STATUS" => format_admin_status_message(ts, &nonce),
+                "PUT_ADMIN_CONFIG" => format_admin_put_config_message(ts, &nonce, &body_hash),
                 "PUT_REVOKE" => format_admin_put_revoke_message(ts, &nonce, &body_hash),
                 "PUT_LOCK_DELEGATE" => {
                     format_admin_put_lock_delegate_message(ts, &nonce, &body_hash)

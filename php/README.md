@@ -63,7 +63,10 @@ return [
     'max_members'          => 300,
 
     // Total storage quota in megabytes across all channels
-    'max_total_storage_mb' => 256,
+    'max_total_storage_mb' => 2048,
+
+    // Per-member storage quota in megabytes across all channels
+    'max_user_storage_mb'  => 25,
 
     // Configured channels: max byte sizes and retention TTL
     'channels' => [
@@ -98,6 +101,7 @@ All mutating requests must use custom HTTP headers:
 | `PUT sync.php` | `X-Drop-Pubkey`, `X-Channel`, `X-Drop-Timestamp`, `X-Drop-Nonce`, `X-Drop-Signature`, optional `If-Match` | Raw binary slot upload. Enforces content length, replay nonce, `If-Match` concurrency, and global quota. |
 | `DELETE sync.php` | `X-Drop-Pubkey`, `X-Channel`, `X-Drop-Timestamp`, `X-Drop-Nonce`, `X-Drop-Signature` | Member slot deletion. |
 | `PUT sync.php?members&channel=<name>` | `X-Drop-Pubkey`, `X-Drop-Timestamp`, `X-Drop-Nonce`, `X-Drop-Signature`, Body: `{"pubkeys": [...]}` | Admin updates member list (`card`, `wot`, `backup`, `post`, `media`, `lock`). |
+| `PUT sync.php?admin_config` | `X-Drop-Pubkey`, `X-Drop-Timestamp`, `X-Drop-Nonce`, `X-Drop-Signature`, Body: `{"max_total_storage_mb": ..., "max_members": ..., "max_user_storage_mb": ...}` | Admin updates storage and member limits live and returns updated status JSON. |
 | `GET sync.php?status` | `X-Drop-Pubkey`, `X-Drop-Timestamp`, `X-Drop-Nonce`, `X-Drop-Signature` | Admin dashboard status (used bytes, quotas, slot counts). |
 | `GET/POST sync.php?lock_selftest` | *(POST requires Admin headers)* | Runs / returns signed PHP 8.1+ lock readiness report (`ext-sodium`, `sha3-256`, `link()`, `fsync()`, inode budget). |
 | `PUT sync.php?lock_delegate` | Admin headers + `HUMOCO-LOCK-DELEGATE-V1` JSON | Persists admin delegation binding `S.lock_pub` to `admin_pubkey`. |
