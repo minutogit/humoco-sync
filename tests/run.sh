@@ -180,6 +180,13 @@ run_blackbox_protocol_suite() {
     --data-binary "@$TMP_ROOT/card1.bin" \
     "$endpoint")"
   assert_eq "$put1_code" "200" "PUT slot with If-None-Match: * creates slot"
+  local put1_json
+  put1_json="$(cat "$TMP_ROOT/put1.json")"
+  assert_contains "$put1_json" '"slot_ack"' "PUT slot response includes signed slot_ack"
+  assert_contains "$put1_json" '"lock_pub":"' "slot_ack includes server lock_pub"
+  if ! grep -Eq '"sig":"[0-9a-f]{128}"' "$TMP_ROOT/put1.json"; then
+    fail "slot_ack signature must be 128 lowercase hex chars: $put1_json"
+  fi
   local etag1
   etag1="$(sha256_file_hex "$TMP_ROOT/card1.bin")"
 

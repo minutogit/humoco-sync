@@ -1549,11 +1549,24 @@ if ($method === 'PUT') {
     save_state($stateFile, $state);
 
     $newEtag = hash('sha256', $rawBody);
+    $lockKeys = lock_load_or_init_keys($dataDir);
+    $ackPrefixJson = ($prefix !== '') ? $prefix : null;
+    $ackMsg = "HUMOCO-SLOT-ACK-V1\n{$lockKeys['pkHex']}\n{$pubkey}\n{$prefix}\n{$channel}\n{$newEtag}\n{$now}";
+    $ackSig = bin2hex(sodium_crypto_sign_detached($ackMsg, $lockKeys['sk64']));
     sync_respond(200, $lockFp, json_encode([
-        'status'  => 'ok',
-        'channel' => $channel,
-        'bytes'   => $newSize,
-        'etag'    => $newEtag,
+        'status'   => 'ok',
+        'channel'  => $channel,
+        'bytes'    => $newSize,
+        'etag'     => $newEtag,
+        'slot_ack' => [
+            'lock_pub'  => $lockKeys['pkHex'],
+            'pubkey'    => $pubkey,
+            'prefix'    => $ackPrefixJson,
+            'channel'   => $channel,
+            'etag'      => $newEtag,
+            'timestamp' => $now,
+            'sig'       => $ackSig,
+        ],
     ], JSON_UNESCAPED_SLASHES), array_merge($commonHeaders, [
         'Content-Type' => 'application/json; charset=utf-8',
         'ETag'         => '"' . $newEtag . '"',

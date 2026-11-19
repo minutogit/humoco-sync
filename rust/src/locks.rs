@@ -294,6 +294,35 @@ impl SyncDb {
         Ok(hex::encode(self.lock_pubkey_bytes()?))
     }
 
+    pub fn sign_slot_ack(
+        &self,
+        pubkey: &str,
+        prefix: Option<&str>,
+        channel: &str,
+        etag: &str,
+        timestamp: u64,
+    ) -> Result<serde_json::Value, DbError> {
+        let read_txn = self.raw_db().begin_read()?;
+        let meta = read_txn.open_table(SERVER_META)?;
+        let lock_sk = load_lock_signing_key_read(&meta)?;
+        let lock_pub_hex = hex::encode(lock_sk.verifying_key().to_bytes());
+        let prefix_str = prefix.unwrap_or("");
+        let msg = format!(
+            "HUMOCO-SLOT-ACK-V1\n{}\n{}\n{}\n{}\n{}\n{}",
+            lock_pub_hex, pubkey, prefix_str, channel, etag, timestamp
+        );
+        let sig_hex = hex::encode(lock_sk.sign(msg.as_bytes()).to_bytes());
+        Ok(serde_json::json!({
+            "lock_pub": lock_pub_hex,
+            "pubkey": pubkey,
+            "prefix": prefix,
+            "channel": channel,
+            "etag": etag,
+            "timestamp": timestamp,
+            "sig": sig_hex,
+        }))
+    }
+
     pub fn get_lock_delegation(&self) -> Result<Option<LockDelegation>, DbError> {
         let read_txn = self.raw_db().begin_read()?;
         let meta = read_txn.open_table(SERVER_META)?;

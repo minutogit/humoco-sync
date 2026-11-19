@@ -129,6 +129,34 @@ Both `php/sync.php` and `rust/humoco-sync-server` respond identically to `HEAD /
   - `X-Media-Count`, `X-Media-Bytes`, plus `X-Media-Max-Count` and `X-Media-Max-Bytes` *(when authorized)*.
 - **Static Conditional Reads (`GET <read_url>/...`):** Servers emit `ETag: "<sha256_hex>"` and return `304 Not Modified` when `If-None-Match` matches. Default PHP quotas align `card` and `wot` at `524288` bytes (512 KiB).
 
+### 2.4 Signed Slot Upload Receipt (`HUMOCO-SLOT-ACK-V1`)
+
+Every successful standard (non-media) `PUT /sync.php` (`200 OK`) returns a signed `slot_ack` object in the JSON response body:
+
+```json
+{
+  "status": "ok",
+  "channel": "backup",
+  "bytes": 65536,
+  "etag": "<64-hex>",
+  "slot_ack": {
+    "lock_pub": "<64-hex>",
+    "pubkey": "<64-hex>",
+    "prefix": "<optional string or null>",
+    "channel": "backup",
+    "etag": "<64-hex>",
+    "timestamp": 1794916800,
+    "sig": "<128-hex>"
+  }
+}
+```
+
+`sig` is the Ed25519 signature by the server's `lock_sk` over:
+
+```text
+HUMOCO-SLOT-ACK-V1\n<lock_pub>\n<pubkey>\n<prefix_or_empty>\n<channel>\n<etag>\n<timestamp>
+```
+
 ---
 
 ## 3. Channel Priorities, Quotas & Eviction

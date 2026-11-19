@@ -9,9 +9,9 @@ use humoco_sync_server::build_router;
 use humoco_sync_server::config::{ChannelQuotaConfig, Config, ProfileConfig};
 use humoco_sync_server::crypto::{
     canonical_revocation_message, format_admin_put_config_message,
-    format_admin_put_members_message, format_admin_put_revoke_message,
-    format_admin_status_message, format_delete_account_message, parse_member_message, random_hex,
-    sha256_hex, unix_now, RevocationNotice,
+    format_admin_put_members_message, format_admin_put_revoke_message, format_admin_status_message,
+    format_delete_account_message, parse_member_message, random_hex, sha256_hex, unix_now,
+    RevocationNotice,
 };
 use humoco_sync_server::db::ConditionalPrecondition;
 use humoco_sync_server::state::AppState;
@@ -3896,8 +3896,7 @@ async fn test_put_admin_config_validation_live_enforcement_and_persistence() {
     let client = reqwest::Client::new();
 
     // 1. Validation: max_user_storage_mb < 10 -> 400
-    let bad_user_body =
-        r#"{"max_total_storage_mb":512,"max_members":10,"max_user_storage_mb":5}"#;
+    let bad_user_body = r#"{"max_total_storage_mb":512,"max_members":10,"max_user_storage_mb":5}"#;
     let (ts, nonce, sig) = sign_put_cfg(bad_user_body);
     let r_bad1 = client
         .put(format!("{}/sync.php?admin_config", addr_str))
@@ -3912,8 +3911,7 @@ async fn test_put_admin_config_validation_live_enforcement_and_persistence() {
     assert_eq!(r_bad1.status().as_u16(), 400);
 
     // 2. Validation: max_total_storage_mb < max_user_storage_mb -> 400
-    let bad_total_body =
-        r#"{"max_total_storage_mb":20,"max_members":10,"max_user_storage_mb":30}"#;
+    let bad_total_body = r#"{"max_total_storage_mb":20,"max_members":10,"max_user_storage_mb":30}"#;
     let (ts, nonce, sig) = sign_put_cfg(bad_total_body);
     let r_bad2 = client
         .put(format!("{}/sync.php?admin_config", addr_str))
@@ -3955,7 +3953,8 @@ async fn test_put_admin_config_validation_live_enforcement_and_persistence() {
     let m3_body = serde_json::json!({ "pubkeys": [&pk1, &pk2, &pk3] }).to_string();
     let now = unix_now() as i64;
     let m_nonce = random_hex(16);
-    let m_msg = format_admin_put_members_message("card", now, &m_nonce, &sha256_hex(m3_body.as_bytes()));
+    let m_msg =
+        format_admin_put_members_message("card", now, &m_nonce, &sha256_hex(m3_body.as_bytes()));
     let m_sig = hex::encode(admin_sk.sign(m_msg.as_bytes()).to_bytes());
     let r_m3 = client
         .put(format!("{}/sync.php?members&channel=card", addr_str))
@@ -3971,7 +3970,8 @@ async fn test_put_admin_config_validation_live_enforcement_and_persistence() {
 
     let m4_body = serde_json::json!({ "pubkeys": [&pk1, &pk2, &pk3, &pk4] }).to_string();
     let m4_nonce = random_hex(16);
-    let m4_msg = format_admin_put_members_message("card", now, &m4_nonce, &sha256_hex(m4_body.as_bytes()));
+    let m4_msg =
+        format_admin_put_members_message("card", now, &m4_nonce, &sha256_hex(m4_body.as_bytes()));
     let m4_sig = hex::encode(admin_sk.sign(m4_msg.as_bytes()).to_bytes());
     let r_m4 = client
         .put(format!("{}/sync.php?members&channel=card", addr_str))
@@ -3999,4 +3999,105 @@ async fn test_put_admin_config_validation_live_enforcement_and_persistence() {
     assert_eq!(restarted_st.max_members, 3);
     assert_eq!(restarted_st.max_user_bytes, 15 * 1024 * 1024);
     assert_eq!(restarted_st.free_pool_max_bytes, 500 * 1024 * 1024);
+}
+
+#[tokio::test]
+async fn test_slot_put_returns_verified_slot_ack_receipt() {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+    let (admin_sk, admin_pk) = gen_keypair();
+    let (member_sk, member_pk) = gen_keypair();
+    let cfg = base_hybrid_config(&admin_pk);
+    let srv = TestServer::start(cfg).await;
+
+    let members_body = serde_json::json!({ "pubkeys": [&member_pk] }).to_string();
+    let ts = unix_now() as i64;
+    let m_nonce = random_hex(16);
+    let m_msg = format_admin_put_members_message(
+        "backup",
+        ts,
+        &m_nonce,
+        &sha256_hex(members_body.as_bytes()),
+    );
+    let m_sig = hex::encode(admin_sk.sign(m_msg.as_bytes()).to_bytes());
+    let mem_resp = srv
+        .client
+        .put(format!("{}/sync.php?members&channel=backup", srv.base_url))
+        .header("X-Drop-Pubkey", &admin_pk)
+        .header("X-Drop-Timestamp", ts.to_string())
+        .header("X-Drop-Nonce", &m_nonce)
+        .header("X-Drop-Signature", &m_sig)
+        .body(members_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mem_resp.status().as_u16(), 200);
+
+    let info_json: serde_json::Value = srv
+        .client
+        .get(format!("{}/sync.php?info", srv.base_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let expected_lock_pub = info_json["lock"]["lock_pub"]
+        .as_str()
+        .expect("GET ?info exposes lock.lock_pub")
+        .to_string();
+
+    for prefix in [None, Some("pc")] {
+        let payload = if prefix.is_some() {
+            b"prefixed-backup-blob".to_vec()
+        } else {
+            b"unprefixed-backup-blob".to_vec()
+        };
+        let put_ts = unix_now() as i64;
+        let put_nonce = random_hex(16);
+        let pfx_str = prefix.unwrap_or("");
+        let req_msg = format!(
+            "HUMOCO-DROP-REQ-V1\nPUT\nbackup\n{}\n{}\n{}\n{}",
+            pfx_str,
+            put_ts,
+            put_nonce,
+            sha256_hex(&payload)
+        );
+        let req_sig = hex::encode(member_sk.sign(req_msg.as_bytes()).to_bytes());
+        let mut req = srv
+            .client
+            .put(format!("{}/sync.php", srv.base_url))
+            .header("X-Drop-Pubkey", &member_pk)
+            .header("X-Channel", "backup")
+            .header("X-Drop-Timestamp", put_ts.to_string())
+            .header("X-Drop-Nonce", &put_nonce)
+            .header("X-Drop-Signature", &req_sig);
+        if let Some(p) = prefix {
+            req = req.header("X-Drop-Prefix", p);
+        }
+        let resp = req.body(payload.clone()).send().await.unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let ack = body["slot_ack"].as_object().expect("slot_ack present");
+        let ack_lock_pub = ack["lock_pub"].as_str().unwrap();
+        assert_eq!(ack_lock_pub, expected_lock_pub);
+        assert_eq!(ack["pubkey"].as_str().unwrap(), member_pk);
+        assert_eq!(ack["prefix"].as_str(), prefix);
+        assert_eq!(ack["channel"].as_str().unwrap(), "backup");
+        let expected_etag = sha256_hex(&payload);
+        assert_eq!(ack["etag"].as_str().unwrap(), expected_etag);
+        let ack_ts = ack["timestamp"].as_u64().unwrap();
+        let ack_sig_bytes: [u8; 64] = hex::decode(ack["sig"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let vk_bytes: [u8; 32] = hex::decode(ack_lock_pub).unwrap().try_into().unwrap();
+        let vk = VerifyingKey::from_bytes(&vk_bytes).unwrap();
+        let ack_msg = format!(
+            "HUMOCO-SLOT-ACK-V1\n{}\n{}\n{}\nbackup\n{}\n{}",
+            ack_lock_pub, member_pk, pfx_str, expected_etag, ack_ts
+        );
+        vk.verify(ack_msg.as_bytes(), &Signature::from_bytes(&ack_sig_bytes))
+            .expect("slot_ack Ed25519 signature must verify");
+    }
 }

@@ -613,10 +613,10 @@ async fn handle_put_slot(state: &AppState, headers: &HeaderMap, body: Body) -> R
         .and_then(|v| v.to_str().ok());
     let precondition = ConditionalPrecondition::from_headers(if_match, if_none_match);
 
-    let outcome = if let Some(mid) = media_id_opt {
+    let outcome = if let Some(ref mid) = media_id_opt {
         state
             .db
-            .put_media(&state.config, &pubkey, &mid, &bytes, &precondition, now)
+            .put_media(&state.config, &pubkey, mid, &bytes, &precondition, now)
     } else {
         state.db.put_slot(
             &state.config,
@@ -632,17 +632,25 @@ async fn handle_put_slot(state: &AppState, headers: &HeaderMap, body: Body) -> R
     match outcome {
         Ok(out) => {
             let etag = out.etag.clone();
-            let mut resp = (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "status": "ok",
-                    "channel": out.channel,
-                    "bytes": out.bytes,
-                    "etag": out.etag,
-                    "evicted_media": out.evicted_media,
-                })),
-            )
-                .into_response();
+            let mut body_json = serde_json::json!({
+                "status": "ok",
+                "channel": out.channel,
+                "bytes": out.bytes,
+                "etag": out.etag,
+                "evicted_media": out.evicted_media,
+            });
+            if media_id_opt.is_none() {
+                match state
+                    .db
+                    .sign_slot_ack(&pubkey, prefix_opt.as_deref(), &channel, &etag, now)
+                {
+                    Ok(ack) => {
+                        body_json["slot_ack"] = ack;
+                    }
+                    Err(e) => return db_err_to_response(e),
+                }
+            }
+            let mut resp = (StatusCode::OK, Json(body_json)).into_response();
             insert_header_str(resp.headers_mut(), "ETag", &format!("\"{}\"", etag));
             resp
         }
