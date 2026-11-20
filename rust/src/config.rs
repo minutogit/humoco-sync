@@ -619,9 +619,9 @@ impl Config {
                 "lock.pow_base_bits must be <= 24".to_string(),
             ));
         }
-        if self.lock.ticket_pow_bits > 28 {
+        if self.lock.ticket_pow_bits > humoco_proto::MAX_LOCK_POW_BITS {
             return Err(ConfigError::Validation(
-                "lock.ticket_pow_bits must be <= 28".to_string(),
+                "lock.ticket_pow_bits must be <= 24".to_string(),
             ));
         }
         if self.lock.max_inodes == 0 {

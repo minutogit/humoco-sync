@@ -1284,6 +1284,10 @@ async fn test_lock_delegation_selftest_probe_and_ticket_auth() {
         "not_applicable"
     );
     assert_eq!(info["lock"]["selftest"]["checks"]["sha3_256"], "pass");
+    assert_eq!(info["lock"]["ticket_pow_bits"], 8);
+    let mut bad_cfg = base_hybrid_config(&admin_pk);
+    bad_cfg.lock.ticket_pow_bits = 25;
+    assert!(bad_cfg.validate().is_err());
     assert!(info["lock"]["delegation"].is_null());
 
     // 2. PUT ?lock_delegate + POST ?lock_selftest

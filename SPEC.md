@@ -237,6 +237,7 @@ The Lock Channel provides a blind, write-once, voucher-pinned collision registry
        "inode_warning": false,
        "pow_base_bits": 8,
        "allow_pow_tickets": false,
+       "ticket_pow_bits": 16,
        "selftest": { "...": "cached SelftestReport signed by lock_sk" }
      }
    }

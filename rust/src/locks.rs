@@ -564,6 +564,7 @@ impl SyncDb {
             "inode_warning": inode_warning,
             "pow_base_bits": cfg.lock.pow_base_bits,
             "allow_pow_tickets": cfg.lock.allow_pow_tickets,
+            "ticket_pow_bits": cfg.lock.ticket_pow_bits,
             "selftest": selftest,
         }))
     }

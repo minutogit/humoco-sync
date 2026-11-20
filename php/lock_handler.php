@@ -29,7 +29,7 @@ function lock_cfg(array $config): array {
         'max_inodes' => max(1, (int)($l['max_inodes'] ?? 50000)),
         'pow_base_bits' => (int)($l['pow_base_bits'] ?? 8),
         'allow_pow_tickets' => !empty($l['allow_pow_tickets']),
-        'ticket_pow_bits' => (int)($l['ticket_pow_bits'] ?? 16),
+        'ticket_pow_bits' => min(24, max(0, (int)($l['ticket_pow_bits'] ?? 16))),
         'pre_freeze_ttl_secs' => max(1, (int)($l['pre_freeze_ttl_secs'] ?? 1800)),
         'proposal_timelock_secs' => (int)($l['proposal_timelock_secs'] ?? 259200),
         'creator_inactivity_secs' => (int)($l['creator_inactivity_secs'] ?? 2592000),
@@ -249,7 +249,7 @@ function lock_get_info_payload(array $config, string $configFile, string $dataDi
         $selftest = lock_read_json($p['meta'] . '/selftest.json') ?? lock_build_selftest($dataDir, $cfg, $keys, $now);
         $del = lock_read_json($p['meta'] . '/delegation.json');
         $used = lock_used_inodes_get($p);
-        return ['lock_pub' => $keys['pkHex'], 'delegation' => $del, 'max_retention_quarter' => $cfg['max_retention_quarter'], 'max_inodes' => $cfg['max_inodes'], 'used_inodes' => $used, 'inode_warning' => ($used * 100 >= $cfg['max_inodes'] * 80), 'pow_base_bits' => $cfg['pow_base_bits'], 'allow_pow_tickets' => $cfg['allow_pow_tickets'], 'selftest' => $selftest];
+        return ['lock_pub' => $keys['pkHex'], 'delegation' => $del, 'max_retention_quarter' => $cfg['max_retention_quarter'], 'max_inodes' => $cfg['max_inodes'], 'used_inodes' => $used, 'inode_warning' => ($used * 100 >= $cfg['max_inodes'] * 80), 'pow_base_bits' => $cfg['pow_base_bits'], 'allow_pow_tickets' => $cfg['allow_pow_tickets'], 'ticket_pow_bits' => $cfg['ticket_pow_bits'], 'selftest' => $selftest];
     } catch (LockAbort) { return null; }
 }
 
