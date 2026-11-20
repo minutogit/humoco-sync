@@ -4,10 +4,35 @@
  * Loaded lazily by lock_handler.php only when ?lock_freeze, ?lock_import, or ?lock_commit is called.
  */
 
+function lock_is_pure_committee_growth(array $prev, array $prop): bool {
+    $prevSrvs = $prev['servers'] ?? [];
+    $newSrvs = $prop['new_servers'] ?? [];
+    if (!is_array($prevSrvs) || !is_array($newSrvs) || count($newSrvs) <= count($prevSrvs)) {
+        return false;
+    }
+    if ((int)($prop['new_threshold'] ?? 0) < (int)($prev['threshold'] ?? 0)) {
+        return false;
+    }
+    $gCnt = count($prev['authority']['guarantor_mig_pubs'] ?? []);
+    $newSet = [];
+    foreach ($newSrvs as $s) {
+        $enc = is_array($s) ? lock_encode_server($s, $gCnt) : null;
+        if ($enc === null) return false;
+        $newSet[$enc] = true;
+    }
+    foreach ($prevSrvs as $s) {
+        $enc = is_array($s) ? lock_encode_server($s, $gCnt) : null;
+        if ($enc === null || !isset($newSet[$enc])) return false;
+    }
+    return true;
+}
+
 function lock_effective_timelock_secs(array $cfg, array $activeManifest, array $prop): int {
     $isCreator = (($prop['initiator']['kind'] ?? '') === 'creator');
     $hasGuarantors = !empty($activeManifest['authority']['guarantor_mig_pubs'] ?? []);
-    if ($isCreator && !$hasGuarantors) return 0;
+    if ($isCreator && !$hasGuarantors && lock_is_pure_committee_growth($activeManifest, $prop)) {
+        return 0;
+    }
     return (int)$cfg['proposal_timelock_secs'];
 }
 
@@ -128,6 +153,9 @@ function lock_verify_proposal(array $prop, string $anchor32, array $prev): bool 
         $pCnt = count(array_filter($prev['servers'], static fn($s) => $s['nominated_by'] === 'creator'));
         $nCnt = count(array_filter($newSrvs, static fn($s) => $s['nominated_by'] === 'creator'));
         if ($nCnt > $pCnt) return false;
+    }
+    if ($gCnt === 0 && (int)($prev['threshold'] ?? 0) >= 2 && (int)($prop['new_threshold'] ?? 0) < 2) {
+        return false;
     }
     return true;
 }

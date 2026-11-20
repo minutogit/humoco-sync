@@ -29,6 +29,7 @@ pub(crate) fn effective_proposal_timelock_secs(
 ) -> u64 {
     if matches!(proposal.initiator, ProposalInitiator::Creator)
         && active_manifest.authority.guarantor_mig_pubs.is_empty()
+        && humoco_proto::is_pure_committee_growth(active_manifest, proposal)
     {
         0
     } else {

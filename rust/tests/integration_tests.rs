@@ -4247,3 +4247,129 @@ async fn test_sync007_creator_zero_timelock_when_no_guarantors() {
         .unwrap();
     assert_eq!(sc_code, 200);
 }
+
+#[tokio::test]
+async fn test_k4_creator_non_growth_keeps_timelock_and_rejects_collapse_to_single_server() {
+    let (a1_sk, _, s1) = start_lock_test_server(true, None).await;
+    let (a2_sk, _, s2) = start_lock_test_server(true, None).await;
+    let (a3_sk, _, s3) = start_lock_test_server(true, None).await;
+
+    let creator_mig_sk = SigningKey::from_bytes(&[107u8; 32]);
+    let creator_mig_pub = creator_mig_sk.verifying_key().to_bytes();
+    let quarter = humoco_proto::encode_quarter(2031, 4).unwrap();
+    let t0 = 1_795_000_000u64;
+
+    let e_s1 = server_entry_for_test(&s1, &a1_sk, humoco_proto::NominatedBy::Creator);
+    let e_s2 = server_entry_for_test(&s2, &a2_sk, humoco_proto::NominatedBy::Creator);
+    let e_s3 = server_entry_for_test(&s3, &a3_sk, humoco_proto::NominatedBy::Creator);
+    let man = build_multi_server_manifest(
+        vec![e_s1.clone(), e_s2.clone()],
+        Vec::new(),
+        2,
+        creator_mig_pub,
+        Vec::new(),
+        t0 * 1_000,
+        quarter,
+    );
+    let aid = man.rev1_anchor_id().unwrap();
+
+    for srv in [&s1, &s2] {
+        let tkt = issue_pow_ticket_db(srv, aid, quarter, t0);
+        let bkt = humoco_proto::derive_bucket(&aid, &srv.state.db.lock_pubkey_bytes().unwrap());
+        let g_sk = SigningKey::from_bytes(&[108u8; 32]);
+        let r1_sk = SigningKey::from_bytes(&[109u8; 32]);
+        let e0 = sign_lock_entry_helper(
+            aid,
+            [0x52; 32],
+            [0u8; 32],
+            0,
+            0,
+            [0x62; 32],
+            &g_sk,
+            humoco_proto::hash_pubkey_sha3(&r1_sk.verifying_key().to_bytes()),
+            None,
+            Some(&creator_mig_sk),
+            8,
+        );
+        let (code, _) = srv
+            .state
+            .db
+            .process_lock_batch(
+                &srv.state.config,
+                humoco_sync_server::locks::LockBatchRequest {
+                    anchor_id: aid,
+                    bucket: bkt,
+                    recipient_nonce: [0x12; 32],
+                    entries: vec![e0.to_wire_hex().unwrap()],
+                    manifest: Some(man.clone()),
+                    genesis_ticket: Some(tkt),
+                    known_head_receipt: None,
+                },
+                t0,
+            )
+            .unwrap();
+        assert_eq!(code, 200);
+    }
+
+    let t1 = t0 + 100;
+    // Collapse from N=2(Q=2) -> N=1(Q=1) is rejected outright by verify_nomination_binding
+    let collapse_prop = build_signed_proposal(
+        aid,
+        1,
+        1,
+        vec![e_s1.clone()],
+        Vec::new(),
+        quarter,
+        t1,
+        humoco_proto::ProposalInitiator::Creator,
+        Some(&creator_mig_sk),
+        Vec::new(),
+    );
+    let err = s1
+        .state
+        .db
+        .process_lock_freeze(
+            &s1.state.config,
+            humoco_sync_server::lock_rotation::LockFreezeRequest::Propose {
+                proposal: collapse_prop,
+                current_manifest: None,
+            },
+            t1,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        humoco_sync_server::db::DbError::Http { status: 400, .. }
+    ));
+
+    // Server replacement 2 -> 2 (not pure growth) MUST still enforce full 72h timelock
+    let replace_prop = build_signed_proposal(
+        aid,
+        1,
+        2,
+        vec![e_s1, e_s3],
+        Vec::new(),
+        quarter,
+        t1,
+        humoco_proto::ProposalInitiator::Creator,
+        Some(&creator_mig_sk),
+        Vec::new(),
+    );
+    let (p_code, p_val) = s1
+        .state
+        .db
+        .process_lock_freeze(
+            &s1.state.config,
+            humoco_sync_server::lock_rotation::LockFreezeRequest::Propose {
+                proposal: replace_prop,
+                current_manifest: None,
+            },
+            t1,
+        )
+        .unwrap();
+    assert_eq!(p_code, 200);
+    assert_eq!(
+        p_val["effective_at"].as_u64().unwrap(),
+        t1 + s1.state.config.lock.proposal_timelock_secs
+    );
+}
