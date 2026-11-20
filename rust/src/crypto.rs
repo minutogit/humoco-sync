@@ -189,14 +189,23 @@ pub fn format_admin_post_lock_selftest_message(
     )
 }
 
+pub fn is_valid_lock_delegation_url(url: &str) -> bool {
+    !url.is_empty()
+        && url.len() <= 2048
+        && (url.starts_with("https://") || url.starts_with("http://"))
+        && !url.chars().any(|c| c.is_control() || c.is_whitespace())
+}
+
 pub fn format_lock_delegate_signature_message(
     admin_pub: &str,
     lock_pub: &str,
+    write_url: &str,
+    read_url: &str,
     issued_at: u64,
 ) -> String {
     format!(
-        "HUMOCO-LOCK-DELEGATE-V1\n{}\n{}\n{}",
-        admin_pub, lock_pub, issued_at
+        "HUMOCO-LOCK-DELEGATE-V1\n{}\n{}\n{}\n{}\n{}",
+        admin_pub, lock_pub, write_url, read_url, issued_at
     )
 }
 

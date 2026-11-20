@@ -485,10 +485,8 @@ impl SyncDb {
         let mut cfg = base.clone();
         if let Some(ov) = self.get_admin_config_overrides()? {
             cfg.storage.max_total_storage_mb = ov.max_total_storage_mb;
-            cfg.storage.max_free_pool_mb = cfg
-                .storage
-                .max_free_pool_mb
-                .min(ov.max_total_storage_mb);
+            cfg.storage.max_free_pool_mb =
+                cfg.storage.max_free_pool_mb.min(ov.max_total_storage_mb);
             cfg.mode.max_admin_members = ov.max_members;
             let user_bytes = ov.max_user_storage_mb.saturating_mul(1024 * 1024);
             if let Some(prof) = cfg.profiles.get_mut(&cfg.mode.admin_app_profile) {
@@ -603,7 +601,10 @@ impl SyncDb {
             (false, Some(rec)) => {
                 let (eff_name, eff_prof, in_grace, grace_until) =
                     Self::resolve_registered_profile(rec, cfg, now_secs);
-                let allowed: BTreeSet<String> = eff_prof.channels.keys().cloned().collect();
+                let mut allowed: BTreeSet<String> = eff_prof.channels.keys().cloned().collect();
+                if cfg.lock.enabled && rec.valid_until.is_none_or(|v| now_secs <= v) {
+                    allowed.insert("lock".to_string());
+                }
                 Ok(Some(EffectiveAccess {
                     profile_name: eff_name.to_string(),
                     profile: eff_prof.clone(),
@@ -629,6 +630,9 @@ impl SyncDb {
                 let mut allowed: BTreeSet<String> = admin_channels;
                 for ch in chosen_prof.channels.keys() {
                     allowed.insert(ch.clone());
+                }
+                if cfg.lock.enabled && rec.valid_until.is_none_or(|v| now_secs <= v) {
+                    allowed.insert("lock".to_string());
                 }
                 Ok(Some(EffectiveAccess {
                     profile_name: chosen_name,

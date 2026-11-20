@@ -500,7 +500,7 @@ run_blackbox_protocol_suite() {
   # PUT ?lock_delegate (admin-signed + inner HUMOCO-LOCK-DELEGATE-V1)
   local issued_bb
   issued_bb="$(date +%s)"
-  "$helper_bin" sign-test sign-lock-delegate --sk "$admin_sk" --lock-pub "$lock_pub_bb" --issued "$issued_bb" > "$TMP_ROOT/lock_delegate.json"
+  "$helper_bin" sign-test sign-lock-delegate --sk "$admin_sk" --lock-pub "$lock_pub_bb" --write-url "$endpoint" --read-url "$data_url" --issued "$issued_bb" > "$TMP_ROOT/lock_delegate.json"
   ts="$(date +%s)"
   nonce="$(rand_nonce)"
   sig="$("$helper_bin" sign-test sign-admin --sk "$admin_sk" --action PUT_LOCK_DELEGATE --ts "$ts" --nonce "$nonce" --body-file "$TMP_ROOT/lock_delegate.json")"
@@ -532,6 +532,12 @@ run_blackbox_protocol_suite() {
     -H "X-Drop-Signature: $sig" \
     --data-binary "@$TMP_ROOT/lock_members.json" \
     "${endpoint}?members&channel=lock")" "200" "PUT ?members&channel=lock authorizes lock member"
+
+  local lock_head_headers
+  lock_head_headers="$(curl -sI -H "X-Drop-Pubkey: $friend_pk" -H "X-Channel: lock" "$endpoint" | tr -d '\r' | tr '[:upper:]' '[:lower:]')"
+  assert_contains "$lock_head_headers" "x-drop-authorized: true" "HEAD with X-Channel: lock returns authorized=true"
+  assert_contains "$lock_head_headers" "x-drop-channels: " "HEAD includes X-Drop-Channels"
+  assert_contains "$lock_head_headers" "lock" "HEAD X-Drop-Channels includes lock channel"
 
   local bb_quarter=8125 anchor_bb
   anchor_bb="$("$helper_bin" sign-test make-lock-sample --lock-pub "$lock_pub_bb" --admin-pub "$admin_pk" --quarter "$bb_quarter" --variant anchor_id)"

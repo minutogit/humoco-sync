@@ -15,7 +15,8 @@ use zeroize::Zeroizing;
 use crate::config::Config;
 use crate::crypto::{
     format_lock_delegate_signature_message, format_lock_probe_signature_message,
-    format_lock_selftest_signature_message, sha256_hex, verify_ed25519_hex,
+    format_lock_selftest_signature_message, is_valid_lock_delegation_url, sha256_hex,
+    verify_ed25519_hex,
 };
 use crate::db::{
     AccountStatus, DbError, RegisteredUserRecord, SyncDb, ADMIN_MEMBERS, LOCK_ANCHORS,
@@ -43,6 +44,8 @@ pub struct LockDelegation {
     pub admin_pub: [u8; 32],
     #[serde(with = "humoco_proto::types::serde_hex_32")]
     pub lock_pub: LockPubKey,
+    pub write_url: String,
+    pub read_url: String,
     pub issued_at: u64,
     #[serde(with = "humoco_proto::types::serde_hex_64")]
     pub sig: [u8; 64],
@@ -360,13 +363,21 @@ impl SyncDb {
                 "Delegation lock_pub does not match this server's lock_pub",
             ));
         }
-        if del.issued_at == 0 {
-            return Err(DbError::http(400, "Delegation issued_at must be positive"));
+        if del.issued_at == 0
+            || !is_valid_lock_delegation_url(&del.write_url)
+            || !is_valid_lock_delegation_url(&del.read_url)
+        {
+            return Err(DbError::http(400, "Invalid lock delegation payload"));
         }
 
         let lock_pub_hex = hex::encode(del.lock_pub);
-        let msg =
-            format_lock_delegate_signature_message(&admin_pub_hex, &lock_pub_hex, del.issued_at);
+        let msg = format_lock_delegate_signature_message(
+            &admin_pub_hex,
+            &lock_pub_hex,
+            &del.write_url,
+            &del.read_url,
+            del.issued_at,
+        );
         let sig_hex = hex::encode(del.sig);
         if !verify_ed25519_hex(&admin_pub_hex, &sig_hex, msg.as_bytes()) {
             return Err(DbError::http(401, "Invalid lock delegation signature"));

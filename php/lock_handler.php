@@ -253,6 +253,12 @@ function lock_get_info_payload(array $config, string $configFile, string $dataDi
     } catch (LockAbort) { return null; }
 }
 
+function lock_is_valid_url(mixed $url): bool {
+    if (!is_string($url) || $url === '' || strlen($url) > 2048) return false;
+    if (!str_starts_with($url, 'https://') && !str_starts_with($url, 'http://')) return false;
+    return preg_match('/[\x00-\x20\x7f]/', $url) !== 1;
+}
+
 function lock_encode_server(array $s, int $gCount): ?string {
     $wu = $s['write_url'] ?? null; $ru = $s['read_url'] ?? null;
     $ap = lock_hex_bytes($s['admin_pub'] ?? null, 32); $lp = lock_hex_bytes($s['lock_pub'] ?? null, 32);
@@ -261,7 +267,7 @@ function lock_encode_server(array $s, int $gCount): ?string {
     if ($nb === 'creator') $nbBytes = "\x00";
     elseif (is_array($nb) && isset($nb['guarantor']) && is_int($nb['guarantor']) && $nb['guarantor'] >= 0 && $nb['guarantor'] < $gCount) $nbBytes = "\x01" . chr($nb['guarantor']);
     else return null;
-    return pack('v', strlen($wu)) . $wu . pack('v', strlen($ru)) . $ru . $ap . $lp . $nbBytes;
+    return $ap . $lp . $nbBytes;
 }
 
 function lock_validate_committee(array $servers, int $q): ?array {
@@ -661,9 +667,11 @@ function lock_maybe_handle_request(array $config, string $configFile, string $da
             $raw = (string)file_get_contents('php://input');
             lock_auth_admin($adminPub, $p, 'PUT_LOCK_DELEGATE', $raw, $now);
             $del = json_decode($raw, true);
-            if (!is_array($del) || strtolower((string)($del['admin_pub'] ?? '')) !== $adminPub || strtolower((string)($del['lock_pub'] ?? '')) !== $keys['pkHex'] || !is_int($del['issued_at'] ?? null) || $del['issued_at'] <= 0) lock_fail(400, 'Invalid lock delegation payload');
+            $wu = $del['write_url'] ?? null;
+            $ru = $del['read_url'] ?? null;
+            if (!is_array($del) || strtolower((string)($del['admin_pub'] ?? '')) !== $adminPub || strtolower((string)($del['lock_pub'] ?? '')) !== $keys['pkHex'] || !lock_is_valid_url($wu) || !lock_is_valid_url($ru) || !is_int($del['issued_at'] ?? null) || $del['issued_at'] <= 0) lock_fail(400, 'Invalid lock delegation payload');
             $sig = lock_hex_bytes($del['sig'] ?? null, 64);
-            if ($sig === null || !lock_verify_sig(hex2bin($adminPub), $sig, "HUMOCO-LOCK-DELEGATE-V1\n{$adminPub}\n{$keys['pkHex']}\n{$del['issued_at']}")) lock_fail(401, 'Invalid lock delegation signature');
+            if ($sig === null || !lock_verify_sig(hex2bin($adminPub), $sig, "HUMOCO-LOCK-DELEGATE-V1\n{$adminPub}\n{$keys['pkHex']}\n{$wu}\n{$ru}\n{$del['issued_at']}")) lock_fail(401, 'Invalid lock delegation signature');
             lock_atomic_write($p['meta'] . '/delegation.json', json_encode($del, JSON_UNESCAPED_SLASHES));
             lock_ok(200, $del);
         }

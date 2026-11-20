@@ -267,7 +267,8 @@ HEAD_CODE="$(curl -s -o /dev/null -w '%{http_code}' -I -H "X-Drop-Pubkey: ${CALL
 DELEGATE_RESULT="skipped"
 if [[ -n "$ADMIN_SK" ]]; then
   issued="$(date +%s)"
-  "$SERVER_BIN" sign-test sign-lock-delegate --sk "$ADMIN_SK" --lock-pub "$LOCK_PUB" --issued "$issued" > "$TMP_ROOT/del.json"
+  local del_read_url="${SYNC_URL%/*}/data"
+  "$SERVER_BIN" sign-test sign-lock-delegate --sk "$ADMIN_SK" --lock-pub "$LOCK_PUB" --write-url "$SYNC_URL" --read-url "$del_read_url" --issued "$issued" > "$TMP_ROOT/del.json"
   ts="$(date +%s)"; nonce="$(rand_nonce)"
   sig="$("$SERVER_BIN" sign-test sign-admin --sk "$ADMIN_SK" --action PUT_LOCK_DELEGATE --ts "$ts" --nonce "$nonce" --body-file "$TMP_ROOT/del.json")"
   DEL_CODE="$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "X-Drop-Pubkey: $ADMIN_PK" -H "X-Drop-Timestamp: $ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig" --data-binary "@$TMP_ROOT/del.json" "${SYNC_URL}?lock_delegate")"

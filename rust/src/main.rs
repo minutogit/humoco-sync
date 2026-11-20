@@ -17,8 +17,8 @@ use humoco_sync_server::crypto::{
     canonical_revocation_message, format_admin_post_lock_selftest_message,
     format_admin_put_config_message, format_admin_put_lock_delegate_message,
     format_admin_put_members_message, format_admin_put_revoke_message, format_admin_status_message,
-    format_delete_account_message, format_lock_delegate_signature_message, hash_admin_token, leading_zero_bits,
-    parse_member_message, random_hex, sha256_hex, unix_now, RevocationNotice,
+    format_delete_account_message, format_lock_delegate_signature_message, hash_admin_token,
+    leading_zero_bits, parse_member_message, random_hex, sha256_hex, unix_now, RevocationNotice,
     RevocationReplacementTarget,
 };
 use humoco_sync_server::locks::LockDelegation;
@@ -162,6 +162,10 @@ enum SignTestCmd {
         sk: String,
         #[arg(long)]
         lock_pub: String,
+        #[arg(long)]
+        write_url: String,
+        #[arg(long)]
+        read_url: String,
         #[arg(long)]
         issued: u64,
     },
@@ -641,6 +645,8 @@ fn run_sign_test(cmd: SignTestCmd) -> i32 {
         SignTestCmd::SignLockDelegate {
             sk,
             lock_pub,
+            write_url,
+            read_url,
             issued,
         } => {
             let sk = match parse_sk(&sk) {
@@ -656,12 +662,19 @@ fn run_sign_test(cmd: SignTestCmd) -> i32 {
             };
             let admin_pub_bytes = sk.verifying_key().to_bytes();
             let admin_pub_hex = hex::encode(admin_pub_bytes);
-            let msg =
-                format_lock_delegate_signature_message(&admin_pub_hex, lock_pub.trim(), issued);
+            let msg = format_lock_delegate_signature_message(
+                &admin_pub_hex,
+                lock_pub.trim(),
+                write_url.trim(),
+                read_url.trim(),
+                issued,
+            );
             let sig_bytes = sk.sign(msg.as_bytes()).to_bytes();
             let del = LockDelegation {
                 admin_pub: admin_pub_bytes,
                 lock_pub: lock_pub_bytes,
+                write_url: write_url.trim().to_string(),
+                read_url: read_url.trim().to_string(),
                 issued_at: issued,
                 sig: sig_bytes,
             };

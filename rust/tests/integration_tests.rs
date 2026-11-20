@@ -1288,14 +1288,20 @@ async fn test_lock_delegation_selftest_probe_and_ticket_auth() {
 
     // 2. PUT ?lock_delegate + POST ?lock_selftest
     let issued_at = unix_now();
+    let del_write_url = format!("{}/sync.php", srv.base_url);
+    let del_read_url = format!("{}/humoco_sync_data", srv.base_url);
     let del_msg = humoco_sync_server::crypto::format_lock_delegate_signature_message(
         &admin_pk,
         &lock_pub_hex,
+        &del_write_url,
+        &del_read_url,
         issued_at,
     );
     let del_body = serde_json::to_vec(&serde_json::json!({
         "admin_pub": admin_pk,
         "lock_pub": lock_pub_hex,
+        "write_url": del_write_url,
+        "read_url": del_read_url,
         "issued_at": issued_at,
         "sig": hex::encode(admin_sk.sign(del_msg.as_bytes()).to_bytes()),
     }))
@@ -2407,6 +2413,9 @@ async fn test_sync007_pre_freeze_ttl_1800_and_voted_proposal_uniqueness() {
 
     let creator_mig_sk = SigningKey::from_bytes(&[81u8; 32]);
     let creator_mig_pub = creator_mig_sk.verifying_key().to_bytes();
+    let g_mig_pub = SigningKey::from_bytes(&[84u8; 32])
+        .verifying_key()
+        .to_bytes();
     let quarter = humoco_proto::encode_quarter(2031, 4).unwrap();
     let t0 = 1_795_000_000u64;
 
@@ -2417,7 +2426,7 @@ async fn test_sync007_pre_freeze_ttl_1800_and_voted_proposal_uniqueness() {
         vec![e_s5.clone()],
         1,
         creator_mig_pub,
-        Vec::new(),
+        vec![g_mig_pub],
         t0 * 1_000,
         quarter,
     );
@@ -4100,4 +4109,137 @@ async fn test_slot_put_returns_verified_slot_ack_receipt() {
         vk.verify(ack_msg.as_bytes(), &Signature::from_bytes(&ack_sig_bytes))
             .expect("slot_ack Ed25519 signature must verify");
     }
+}
+
+#[tokio::test]
+async fn test_sync007_creator_zero_timelock_when_no_guarantors() {
+    let (a1_sk, _, s1) = start_lock_test_server(true, None).await;
+    let (a2_sk, _, s2) = start_lock_test_server(true, None).await;
+    assert_eq!(s1.state.config.lock.proposal_timelock_secs, 259_200);
+
+    let creator_mig_sk = SigningKey::from_bytes(&[97u8; 32]);
+    let creator_mig_pub = creator_mig_sk.verifying_key().to_bytes();
+    let quarter = humoco_proto::encode_quarter(2031, 4).unwrap();
+    let t0 = 1_795_000_000u64;
+
+    let e_s1 = server_entry_for_test(&s1, &a1_sk, humoco_proto::NominatedBy::Creator);
+    let e_s2 = server_entry_for_test(&s2, &a2_sk, humoco_proto::NominatedBy::Creator);
+    let man = build_multi_server_manifest(
+        vec![e_s1.clone()],
+        Vec::new(),
+        1,
+        creator_mig_pub,
+        Vec::new(),
+        t0 * 1_000,
+        quarter,
+    );
+    let aid = man.rev1_anchor_id().unwrap();
+
+    let tkt = issue_pow_ticket_db(&s1, aid, quarter, t0);
+    let bkt = humoco_proto::derive_bucket(&aid, &s1.state.db.lock_pubkey_bytes().unwrap());
+    let g_sk = SigningKey::from_bytes(&[98u8; 32]);
+    let r1_sk = SigningKey::from_bytes(&[99u8; 32]);
+    let e0 = sign_lock_entry_helper(
+        aid,
+        [0x51; 32],
+        [0u8; 32],
+        0,
+        0,
+        [0x61; 32],
+        &g_sk,
+        humoco_proto::hash_pubkey_sha3(&r1_sk.verifying_key().to_bytes()),
+        None,
+        Some(&creator_mig_sk),
+        8,
+    );
+    let (c0, _) = s1
+        .state
+        .db
+        .process_lock_batch(
+            &s1.state.config,
+            humoco_sync_server::locks::LockBatchRequest {
+                anchor_id: aid,
+                bucket: bkt,
+                recipient_nonce: [0x11; 32],
+                entries: vec![e0.to_wire_hex().unwrap()],
+                manifest: Some(man.clone()),
+                genesis_ticket: Some(tkt),
+                known_head_receipt: None,
+            },
+            t0,
+        )
+        .unwrap();
+    assert_eq!(c0, 200);
+
+    let t1 = t0 + 100;
+    let prop = build_signed_proposal(
+        aid,
+        1,
+        2,
+        vec![e_s1.clone(), e_s2.clone()],
+        Vec::new(),
+        quarter,
+        t1,
+        humoco_proto::ProposalInitiator::Creator,
+        Some(&creator_mig_sk),
+        Vec::new(),
+    );
+    let (p_code, p_val) = s1
+        .state
+        .db
+        .process_lock_freeze(
+            &s1.state.config,
+            humoco_sync_server::lock_rotation::LockFreezeRequest::Propose {
+                proposal: prop.clone(),
+                current_manifest: None,
+            },
+            t1,
+        )
+        .unwrap();
+    assert_eq!(p_code, 200);
+    assert_eq!(p_val["effective_at"], t1);
+    let snap: humoco_proto::SnapshotExport =
+        serde_json::from_value(p_val["snapshot_export"].clone()).unwrap();
+
+    // Immediate import & sign_commit at t1 succeed without 72h freeze!
+    let mut acks = Vec::new();
+    let mut imported_state_hash = [0u8; 32];
+    for srv in [&s1, &s2] {
+        let (imp_code, imp_val) = srv
+            .state
+            .db
+            .process_lock_import(
+                &srv.state.config,
+                humoco_sync_server::lock_rotation::LockImportRequest {
+                    anchor_id: aid,
+                    active_manifest: man.clone(),
+                    proposal: prop.clone(),
+                    snapshots: vec![snap.clone()],
+                    quorum_certificates: Vec::new(),
+                },
+                t1,
+            )
+            .unwrap();
+        assert_eq!(imp_code, 200);
+        let ack: humoco_proto::ImportAck =
+            serde_json::from_value(imp_val["import_ack"].clone()).unwrap();
+        imported_state_hash = ack.imported_state_hash;
+        acks.push(ack);
+    }
+
+    let (sc_code, _) = s1
+        .state
+        .db
+        .process_lock_commit(
+            &s1.state.config,
+            humoco_sync_server::lock_rotation::LockCommitRequest::SignCommit {
+                anchor_id: aid,
+                proposal: prop,
+                imported_state_hash,
+                import_acks: acks,
+            },
+            t1,
+        )
+        .unwrap();
+    assert_eq!(sc_code, 200);
 }

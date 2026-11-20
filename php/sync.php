@@ -739,9 +739,10 @@ if ($method === 'HEAD') {
         sync_respond(400, $lockFp, null, $commonHeaders);
     }
 
+    $lockCfg = lock_cfg($config);
     $channelRaw = isset($_SERVER['HTTP_X_CHANNEL']) ? trim((string)$_SERVER['HTTP_X_CHANNEL']) : '';
     $channel = ($channelRaw !== '') ? $channelRaw : null;
-    if ($channel !== null && (!preg_match('/^[a-z0-9_]{1,32}$/', $channel) || !isset($channels[$channel]))) {
+    if ($channel !== null && (!preg_match('/^[a-z0-9_]{1,32}$/', $channel) || (!isset($channels[$channel]) && !($channel === 'lock' && $lockCfg['enabled'])))) {
         sync_respond(400, $lockFp, null, $commonHeaders);
     }
 
@@ -765,6 +766,12 @@ if ($method === 'HEAD') {
         $chMembers = load_channel_members($configFile, (string)$chName);
         if (in_array($pubkey, $chMembers, true)) {
             $allowedChannels[] = (string)$chName;
+        }
+    }
+    if ($lockCfg['enabled']) {
+        $lockMembers = load_channel_members($configFile, 'lock');
+        if (($state['admin_pubkey'] !== '' && hash_equals($state['admin_pubkey'], $pubkey)) || in_array($pubkey, $lockMembers, true)) {
+            $allowedChannels[] = 'lock';
         }
     }
 

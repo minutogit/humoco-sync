@@ -4,6 +4,13 @@
  * Loaded lazily by lock_handler.php only when ?lock_freeze, ?lock_import, or ?lock_commit is called.
  */
 
+function lock_effective_timelock_secs(array $cfg, array $activeManifest, array $prop): int {
+    $isCreator = (($prop['initiator']['kind'] ?? '') === 'creator');
+    $hasGuarantors = !empty($activeManifest['authority']['guarantor_mig_pubs'] ?? []);
+    if ($isCreator && !$hasGuarantors) return 0;
+    return (int)$cfg['proposal_timelock_secs'];
+}
+
 function lock_encode_server_list(array $list, int $gCount): ?string {
     $out = '';
     foreach ($list as $s) {
@@ -367,7 +374,7 @@ function lock_handle_freeze(string $method, array $cfg, array $keys, string $dat
             if (!lock_verify_proposal($prop, $a32, $r['active_manifest'])) lock_fail(400, 'Proposal validation failed');
             if ($prop['initiator']['kind'] === 'guarantor' && $now < ((int)$r['last_creator_activity_secs'] + $cfg['creator_inactivity_secs'])) lock_fail(403, 'Creator 30-day inactivity window has not elapsed yet');
             if ($prop['initiator']['kind'] === 'creator') $r['last_creator_activity_secs'] = max((int)$r['last_creator_activity_secs'], $now);
-            $effAt = $now + $cfg['proposal_timelock_secs'];
+            $effAt = $now + lock_effective_timelock_secs($cfg, $r['active_manifest'], $prop);
             $r['voted_proposals_by_rev'][$revKey] = ['proposal' => $prop, 'proposal_hash' => $pHashHex, 'accepted_at' => $now, 'effective_at' => $effAt];
             $b['freeze_state'] = ['permanent_proposal' => ['from_rev' => (int)$prop['from_rev'], 'proposal_hash' => $pHashHex, 'frozen_at' => $now, 'effective_at' => $effAt]];
             lock_atomic_write($p['meta'] . "/buckets/{$bHex}.json", json_encode($b, JSON_UNESCAPED_SLASHES));
@@ -422,7 +429,8 @@ function lock_handle_import(array $cfg, array $keys, string $dataDir, int $now):
     $newC = lock_validate_committee($prop['new_servers'], (int)$prop['new_threshold']);
     if ($newC === null || !in_array($keys['pkHex'], $newC['members'], true)) lock_fail(400, 'Target server lock_pub is not in proposal.new_servers');
     if ((int)$prop['retain_until_quarter'] > $cfg['max_retention_quarter']) lock_fail(422, 'Proposal retain_until_quarter exceeds server max_retention_quarter');
-    if ($now < ((int)$prop['proposed_at'] + $cfg['proposal_timelock_secs'])) lock_fail(409, 'Proposal 72h timelock has not elapsed yet');
+    $timelockSecs = lock_effective_timelock_secs($cfg, $m, $prop);
+    if ($now < ((int)$prop['proposed_at'] + $timelockSecs)) lock_fail(409, 'Proposal 72h timelock has not elapsed yet');
 
     $oldC = $histComms[count($histComms) - 1]; $snaps = $req['snapshots'];
     if (count($snaps) < $oldC['threshold']) lock_fail(400, 'Fewer than Q_old freeze snapshots supplied');
@@ -440,7 +448,7 @@ function lock_handle_import(array $cfg, array $keys, string $dataDir, int $now):
         if ($sbk === null || $sbk !== hash('sha256', 'HUMOCO_SYNC_BUCKET_V1' . $a32 . $slp, true) || $sbh === null || $ssh === null || $ssig === null) lock_fail(400, 'Invalid FreezeSnapshot fields');
         $sPre = 'HUMOCO_FREEZE_SNAP_V1' . $a32 . $sbk . pack('P', $sn['from_rev']) . pack('v', $sn['retain_until_quarter']) . pack('P', $sn['write_seq']) . $sbh . $ssh . "\x01\x01" . $pHash32 . pack('P', $sn['frozen_at']) . pack('P', 0) . $slp;
         if (!lock_verify_sig($slp, $ssig, hash('sha256', $sPre, true))) lock_fail(400, 'Invalid FreezeSnapshot signature');
-        if ($now >= ((int)$sn['frozen_at'] + $cfg['proposal_timelock_secs'])) $matured++;
+        if ($now >= ((int)$sn['frozen_at'] + $timelockSecs)) $matured++;
 
         $parsedE = []; $parsedC = [];
         foreach (($exp['entries'] ?? []) as $h) { $e = lock_parse_entry($h) ?? lock_fail(400, 'Corrupted snapshot entry'); $parsedE[] = $e; $candBySlot[$e['slot']][$e['entryHash']] = $e; }
@@ -574,7 +582,8 @@ function lock_handle_commit(array $cfg, array $keys, string $dataDir, int $now):
         $vp = $r['voted_proposals_by_rev'][(string)$prop['from_rev']] ?? null;
         $pHash32 = lock_proposal_digest($prop); $pHashHex = $pHash32 !== null ? bin2hex($pHash32) : '';
         if ($vp === null || $vp['proposal_hash'] !== $pHashHex) lock_fail(409, 'Proposal does not match voted_proposal[rev]');
-        if ($now < (int)$vp['effective_at']) lock_fail(409, 'Proposal 72h timelock has not elapsed yet');
+        $timelockSecs = lock_effective_timelock_secs($cfg, $am, $prop);
+        if ($timelockSecs > 0 && $now < (int)$vp['effective_at']) lock_fail(409, 'Proposal 72h timelock has not elapsed yet');
         $newC = lock_validate_committee($prop['new_servers'], (int)$prop['new_threshold']);
         if ($newC === null || !lock_verify_import_acks($acks, $newC, $a32, $pHash32, (int)$prop['to_rev'], $ish32, (int)$prop['retain_until_quarter'])) lock_fail(401, 'Invalid ImportAck');
         $cDig = hash('sha256', 'HUMOCO_MIGRATION_CERT_V1' . $a32 . $pHash32 . pack('P', $prop['to_rev']) . $ish32, true);

@@ -586,7 +586,11 @@ impl Config {
             }
         }
 
-        if self.mode.max_admin_user_storage_mb.is_some_and(|mb| mb < 10) {
+        if self
+            .mode
+            .max_admin_user_storage_mb
+            .is_some_and(|mb| mb < 10)
+        {
             return Err(ConfigError::Validation(
                 "mode.max_admin_user_storage_mb must be >= 10".to_string(),
             ));

@@ -208,15 +208,17 @@ The Lock Channel provides a blind, write-once, voucher-pinned collision registry
      {
        "admin_pub": "<64-hex>",
        "lock_pub": "<64-hex>",
+       "write_url": "https://sync.example.org/sync.php",
+       "read_url": "https://sync.example.org/d-0000",
        "issued_at": 1794916800,
        "sig": "<128-hex>"
      }
      ```
    - `sig` is the Ed25519 signature by `admin_sk` over the UTF-8 message:
      ```text
-     HUMOCO-LOCK-DELEGATE-V1\n<admin_pub>\n<lock_pub>\n<issued_at>
+     HUMOCO-LOCK-DELEGATE-V1\n<admin_pub>\n<lock_pub>\n<write_url>\n<read_url>\n<issued_at>
      ```
-   - Server verifies `admin_pub == configured admin_pubkey`, `lock_pub == local lock_pub`, non-zero `issued_at`, and `sig`. Returns `200 OK` with the persisted delegation object.
+   - Server verifies `admin_pub == configured admin_pubkey`, `lock_pub == local lock_pub`, valid HTTP/HTTPS `write_url`/`read_url` (without requiring `HTTP_HOST` equality for reverse-proxy safety), non-zero `issued_at`, and `sig`. Returns `200 OK` with the persisted delegation object.
 3. **Extended `GET /sync.php?info` Payload:**
    Returns existing fields plus `lock`:
    ```json
@@ -228,7 +230,7 @@ The Lock Channel provides a blind, write-once, voucher-pinned collision registry
      "revocation": null,
      "lock": {
        "lock_pub": "<64-hex>",
-       "delegation": { "admin_pub": "<64-hex>", "lock_pub": "<64-hex>", "issued_at": 1794916800, "sig": "<128-hex>" },
+       "delegation": { "admin_pub": "<64-hex>", "lock_pub": "<64-hex>", "write_url": "https://...", "read_url": "https://...", "issued_at": 1794916800, "sig": "<128-hex>" },
        "max_retention_quarter": 8159,
        "max_inodes": 50000,
        "used_inodes": 0,
@@ -310,7 +312,7 @@ The Lock Channel provides a blind, write-once, voucher-pinned collision registry
      `mig_seed = HMAC-SHA256(key = master_seed, msg = b"HUMOCO_ANCHOR_MIG_SEED_V1:" || anchor_nonce)`
    - `NominatedBy` canonical bytes: `0x00` for `Creator`; `0x01 || idx: u8` for `Guarantor(idx)`.
    - `ServerEntry` canonical bytes (`encode_server_entry`):
-     `(write_url.len() as u16).to_le_bytes() || write_url_utf8 || (read_url.len() as u16).to_le_bytes() || read_url_utf8 || admin_pub (32B) || lock_pub (32B) || nominated_by_bytes`.
+     `admin_pub (32B) || lock_pub (32B) || nominated_by_bytes` (`write_url`/`read_url` are intentionally excluded from the manifest hash so server relocations preserve `anchor_id`).
    - `AnchorManifest` canonical `anchor_id` (`SHA-256`, always computed over Genesis Rev-1 layout):
      ```text
      SHA-256(
@@ -569,9 +571,9 @@ The Lock Channel provides a blind, write-once, voucher-pinned collision registry
 2. **`POST /sync.php?lock_freeze` (`{"action": ...}`):**
    - `pre_freeze`: Freezes active bucket with TTL `lock.pre_freeze_ttl_secs` (`1800 s`) and returns non-permanent `SnapshotExport`.
    - `heartbeat`: Verifies `CreatorHeartbeat` (`HUMOCO_CREATOR_HB_V1`) against `creator_mig_pub` and updates `last_creator_activity_secs`.
-   - `propose`: Enforces `voted_proposal[from_rev]` uniqueness (re-returns idempotently if identical digest, `409 Conflict` on differing proposal), authority/standby authorization, `CREATOR_INACTIVITY_TAKEOVER_SECS` (`30 d`) for `ProposalInitiator::Guarantor`, nomination binding (`humoco_proto::verify_nomination_binding`), binds `frozen_at = now` for the `72 h` (`259200 s`) timelock, permanently freezes the bucket, and returns signed `SnapshotExport` (`HUMOCO_FREEZE_SNAP_V1` + `HUMOCO_FREEZE_STATE_V1`).
+   - `propose`: Enforces `voted_proposal[from_rev]` uniqueness (re-returns idempotently if identical digest, `409 Conflict` on differing proposal), authority/standby authorization, `CREATOR_INACTIVITY_TAKEOVER_SECS` (`30 d`) for `ProposalInitiator::Guarantor`, nomination binding (`humoco_proto::verify_nomination_binding`), binds `frozen_at = now` for the effective timelock (`0 s` when `initiator == Creator` and `guarantor_mig_pubs` is empty, otherwise `72 h` / `259200 s`), permanently freezes the bucket, and returns signed `SnapshotExport` (`HUMOCO_FREEZE_SNAP_V1` + `HUMOCO_FREEZE_STATE_V1`).
    - `veto`: Before `timelock` expiry, verifies `MigrationVeto` (`HUMOCO_MIGRATION_VETO_V1`) from an authority distinct from the proposer, blacklists `proposal_hash`, clears `voted_proposal[from_rev]`, and unfreezes the bucket back to `Active`.
-3. **`POST /sync.php?lock_import`:** Target server in `proposal.new_servers` verifies `active_manifest.verify_anchor_id(&anchor_id)`, `retain_until_quarter` invariance, `72 h` timelock elapsed against both `proposal.proposed_at` and `>= Q_old` snapshot `frozen_at` timestamps, nomination binding, and executes `humoco_proto::resolve_import_union`:
+3. **`POST /sync.php?lock_import`:** Target server in `proposal.new_servers` verifies `active_manifest.verify_anchor_id(&anchor_id)`, `retain_until_quarter` invariance, effective timelock elapsed against both `proposal.proposed_at` and `>= Q_old` snapshot `frozen_at` timestamps, nomination binding, and executes `humoco_proto::resolve_import_union`:
    - Preserves every single-entry slot and resolves conflicting slots with a verified `QuorumCertificate` across historical committees `1..=from_rev`.
    - Conflicting entries lacking a QC stay `CONFLICT([A, B, ...])` (`LOCK_CONFLICTS` table; future `POST ?lock` returns `ConflictSeen` carrying the competing wire entry, while valid children of surviving branches remain unblocked).
    - Signs and returns `ImportAck` (`HUMOCO_IMPORT_ACK_V1`) committing `imported_state_hash` (`HUMOCO_IMPORT_STATE_V1`).

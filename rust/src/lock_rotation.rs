@@ -22,6 +22,20 @@ use crate::locks::{
     BucketFreezeState, LockBucketRecord, LOCK_USED_INODES_META,
 };
 
+pub(crate) fn effective_proposal_timelock_secs(
+    cfg: &Config,
+    active_manifest: &AnchorManifest,
+    proposal: &MigrationProposal,
+) -> u64 {
+    if matches!(proposal.initiator, ProposalInitiator::Creator)
+        && active_manifest.authority.guarantor_mig_pubs.is_empty()
+    {
+        0
+    } else {
+        cfg.lock.proposal_timelock_secs
+    }
+}
+
 pub(crate) struct LockEntryStorageExt;
 
 impl LockEntryStorageExt {
@@ -695,7 +709,9 @@ impl SyncDb {
                     rot.last_creator_activity_secs = rot.last_creator_activity_secs.max(now_secs);
                 }
 
-                let effective_at = now_secs.saturating_add(cfg.lock.proposal_timelock_secs);
+                let timelock_secs =
+                    effective_proposal_timelock_secs(cfg, &rot.active_manifest, &proposal);
+                let effective_at = now_secs.saturating_add(timelock_secs);
                 rot.voted_proposals_by_rev.insert(
                     proposal.from_rev,
                     VotedProposalRecord {
@@ -856,12 +872,9 @@ impl SyncDb {
                 "Proposal retain_until_quarter exceeds server max_retention_quarter",
             ));
         }
-        if now_secs
-            < req
-                .proposal
-                .proposed_at
-                .saturating_add(cfg.lock.proposal_timelock_secs)
-        {
+        let timelock_secs =
+            effective_proposal_timelock_secs(cfg, &req.active_manifest, &req.proposal);
+        if now_secs < req.proposal.proposed_at.saturating_add(timelock_secs) {
             return Err(DbError::http(
                 409,
                 "Proposal 72h timelock has not elapsed yet",
@@ -885,12 +898,7 @@ impl SyncDb {
         let matured_snaps = req
             .snapshots
             .iter()
-            .filter(|e| {
-                now_secs
-                    >= e.snapshot
-                        .frozen_at
-                        .saturating_add(cfg.lock.proposal_timelock_secs)
-            })
+            .filter(|e| now_secs >= e.snapshot.frozen_at.saturating_add(timelock_secs))
             .count();
         if matured_snaps < usize::from(req.active_manifest.threshold) {
             return Err(DbError::http(
@@ -1149,7 +1157,9 @@ impl SyncDb {
                         "Proposal does not match voted_proposal[rev]",
                     ));
                 }
-                if now_secs < vp.effective_at {
+                let timelock_secs =
+                    effective_proposal_timelock_secs(cfg, &rot.active_manifest, &proposal);
+                if timelock_secs > 0 && now_secs < vp.effective_at {
                     return Err(DbError::http(
                         409,
                         "Proposal 72h timelock has not elapsed yet",

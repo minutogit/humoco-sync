@@ -228,7 +228,9 @@ async fn handle_head(state: &AppState, headers: &HeaderMap) -> Response {
     }
 
     let channel = match headers.get("x-channel").and_then(|v| v.to_str().ok()) {
-        Some(raw) => match validate_channel(raw) {
+        Some(raw) => match validate_admin_member_channel(raw)
+            .filter(|ch| ch != "lock" || state.config.lock.enabled)
+        {
             Some(ch) => Some(ch),
             None => return json_error(StatusCode::BAD_REQUEST, "Invalid X-Channel"),
         },
