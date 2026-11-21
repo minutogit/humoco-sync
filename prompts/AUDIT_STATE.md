@@ -1,0 +1,39 @@
+# 🧠 HuMoCo Sync Quality Review & Coverage Ledger
+
+> **Doctrine:** *"Trust people, verify math — open-minded review, root-cause fixes, zero blind deletions."*  
+> **Status:** Active coverage ledger for [`prompts/AUDIT_LOOP.md`](AUDIT_LOOP.md).  
+> **False-Positive Filter & Spec References:** Active design-intent filter: [`docs/security/DESIGN_INTENT_TRIAGE.md`](../docs/security/DESIGN_INTENT_TRIAGE.md) · Wire specification & formal proofs: [`SPEC.md`](../SPEC.md), [`formal/README.md`](../formal/README.md).
+
+---
+
+## 🎯 Selection Rules for AI Agents
+1. **Priority 1 (Initial Baseline Pass):** Select any slice with `Last_Run == never` or status `⚪ Pending` (`P1 > P2 > P3`, then lower Slice ID `S01` to `S09`). Ensures 100% initial coverage before cycling.
+2. **Priority 2 (Follow-Up Verification):** Once all slices have completed their initial pass (`Last_Run != never`), select any slice marked `🟡 ReCheck` to independently confirm recent fixes (`P1 > P2 > P3`, oldest `Last_Run`, lower Slice ID).
+3. **Priority 3 (Routine Quality Pass):** Among remaining slices NOT marked `🔴 Fix_Open`, select the slice with the **lowest `Clean_Streak`** (tie-breakers: **highest `Total_Finds`** to prioritize historically fragile hotspots, oldest `Last_Run`, higher weight `P1 > P2 > P3`, lower Slice ID).
+4. **Explicit Override:** Only deviate from Rules 1–3 when the caller explicitly names target Slice ID(s).
+
+---
+
+## 📊 Coverage Matrix (100% Repo Scope: `rust/src/`, `php/`, `formal/`, `docker/`, `Dockerfile`, `config.example.toml` + Cross-Slice `S09`)
+
+| Slice | Weight | Target Files | Scope & Focus | Clean_Streak | Total_Finds | Last_Run | Status | Notes |
+|---|---|---|---|---|---|---|---|---|
+| **S01** | P1 | `rust/src/{locks,crypto}.rs` | `lock_sk`/`lock_pub` anti-amnesia, 5-field `HUMOCO-LOCK-DELEGATE-V1`, `?lock_selftest` FIPS-202 KAT, `?lock_ticket` (member/PoW, 24-bit cap), `?lock` WAF probe & single-txn Write-Once batches (`CausalOutputProof`, 1-child-per-output, partial-batch `ConflictSeen`, `known_head_receipt` Self-Freeze), Ed25519 request/admin/revoke/slot-ack signatures & Zero-PII email HMAC/AEAD | 0 | 0 | never | `⚪ Pending` | — |
+| **S02** | P1 | `rust/src/lock_rotation.rs` | 3-phase committee rotation: `?lock_freeze` (`pre_freeze` 1800s TTL, `heartbeat`, `propose` single-proposal lock, `veto`), `effective_proposal_timelock_secs` (`0s` pure creator growth via `is_pure_committee_growth` vs `72h`), `30d` creator-inactivity guarantor takeover, `?lock_import` union resolution & `LOCK_CONFLICTS`, `?lock_commit` (`sign_commit`/`finalize` -> `/anchors/<id>.bin`), `409 epoch_frozen` & `410 Gone` | 0 | 0 | never | `⚪ Pending` | — |
+| **S03** | P1 | `rust/src/{db,state}.rs` | `redb` ACID persistence (`SERVER_META`, `LOCK_CONFLICTS`, `LOCK_ROTATIONS`, `LOCK_ANCHORS`, slots, media, users, nonces), Hybrid `admin_app` vs `registered` isolation, Free-Pool (`max_free_pool_mb`) separation, Prio-1/2 protection & Prio-3 LRU media eviction, `DELETE ?account` lock immunity, quarterly lock GC (`Quartalsende + 30d`) & `downgrade_grace_days` | 0 | 0 | never | `⚪ Pending` | — |
+| **S04** | P1 | `rust/src/{sync_routes,ratelimit}.rs` | `/sync.php` & `/sync` wire parity with `SPEC.md`, streaming `PUT` body limits, `HEAD` capability/`ETag`/`X-Drop-Authorized` headers, `If-Match` & `304 Not Modified`, `HUMOCO-SLOT-ACK-V1` receipts, `PUT ?members` (`admin_app`-only pruning), `PUT ?admin_config`, `PUT ?revoke`, static reads (`/index.json`, `/anchors/<id>.bin`, `/locks/...`), RAM IP/pubkey rate limiting & proxy-safe member exemption | 0 | 0 | never | `⚪ Pending` | — |
+| **S05** | P1 | `rust/src/{web_routes,admin_api,mailer}.rs` | `/register` self-service onboarding, Double-Opt-In Zero-PII email confirmation & verified `/register/delete-confirm`, PoW/open `/24` & `/48` subnet caps, invite/pro code redemption, `/admin` Argon2id auth + `HttpOnly; SameSite=Strict` cookie + CSRF + HTML/XSS escaping, `/api/v1/admin/*` Bearer auth, SMTP/TLS mailer CRLF/header-injection & SSRF safety | 0 | 0 | never | `⚪ Pending` | — |
+| **S06** | P1 | `php/{sync.php,config.php,.htaccess,start-sync-server.sh,robots.txt,index.html}` | PHP >= 8.1 guard, `ext-sodium` Ed25519 verification & nonce replay (`409`), fixed 1-inode 64 KiB `ratelimit.bin.php` under `flock`, atomic `tmp + fsync + rename`, Prio-3 media LRU eviction, `PUT ?members` / `?admin_config` / `?revoke`, `DELETE ?account` lock immunity, path-traversal / dotfile / `.htaccess` (`Require all denied`) hardening & clean URL rewrites | 0 | 0 | never | `⚪ Pending` | — |
+| **S07** | P1 | `php/{lock_handler.php,lock_rotation.php}` | `.lock_key.php` (`__halt_compiler()`) isolation, atomic `link()` + `fsync()` Write-Once & `ignore_user_abort(true)`, `Self-Freeze` rollback detection, 5-field `HUMOCO-LOCK-DELEGATE-V1`, `ticket_pow_bits` 24-bit cap, `80%/100%` inode budget (`507`), `lock_is_pure_committee_growth` (`0s` vs `72h`) & `threshold >= 2` floor parity with Rust/`humoco-proto`, lazy rotation transitions & `--gc` retention cleanup | 0 | 0 | never | `⚪ Pending` | — |
+| **S08** | P2 | `rust/src/{lib,main,config}.rs`, `config.example.toml`, `Dockerfile`, `docker/{docker-compose.yml,humoco-sync.service}`, `formal/{SyncLocks.tla,SyncLocks.cfg,Rotation.tla,Rotation.cfg}` | `#![forbid(unsafe_code)]`, CLI subcommands (`serve`, `generate-config`, `sign-test`), TOML config bounds & secret isolation (never storing `lock_sk` in config), non-root `Dockerfile`, `docker-compose.yml`/`systemd` hardening & TLA+ model alignment (`SyncLocks.tla`/`Rotation.tla`) against implemented invariants | 0 | 0 | never | `⚪ Pending` | — |
+| **S09** | P1 | *Cross-Slice Seams* (`PHP ↔ Rust ↔ SPEC.md ↔ humoco-proto`) + `rust/tests/integration_tests.rs` + `tests/{run.sh,test_php_locks.sh,measure_hoster.sh,prepare_hoster_test.sh}` | End-to-end flow & parity rotation (1 flow per run, logged in `Notes`): `F1` Standard Channels+Quota/Eviction+`SLOT-ACK` PHP↔Rust Parity · `F2` Lock Channel Write-Once/Partial-Conflict/Self-Freeze/GC PHP↔Rust Parity · `F3` 3-Phase Rotation+`0s` Pure-Growth/72h Timelock/Veto+`410 Gone` PHP↔Rust Parity · `F4` Hybrid Mode/Free-Pool/Web `/register` & `/admin`+Test-Assertion Audit | 0 | 0 | never | `⚪ Pending` | Next: `F1` |
+
+---
+
+## 🔄 State Lifecycle & Transition Rules
+- **`Clean_Streak`:** Incremented by `+1` on every review pass finding **0 verified defects**. Reset to `0` whenever `>= 1` verified defect is found.
+- **`Status` Values:**
+  - `⚪ Pending`: Not yet reviewed (`Last_Run == never`). Awaits initial baseline pass.
+  - `🟢 Clean`: Reviewed, 0 open defects in this slice.
+  - `🔴 Fix_Open`: Verified defect(s) identified; awaiting approval/remediation (or all items deferred in `AUTONOMOUS`).
+  - `🟡 ReCheck`: At least one fix implemented and verified; awaits independent follow-up review (any deferred `AUTONOMOUS` questions/removals remain linked in `Notes`).
