@@ -6260,3 +6260,552 @@ async fn test_s03_lock_disabled_capability_ttl_expiry_and_profile_safety() {
         humoco_sync_server::db::DbError::Http { status: 500, .. }
     ));
 }
+
+#[tokio::test]
+async fn test_s04_auth_rate_limit_ordering_and_put_streaming_validation() {
+    let (_admin_sk, admin_pk) = gen_keypair();
+    let (friend_sk, friend_pk) = gen_keypair();
+    let (outsider_sk, _outsider_pk) = gen_keypair();
+
+    let mut cfg = base_hybrid_config(&admin_pk);
+    cfg.security.ip_requests_per_minute = 5000;
+    cfg.security.pubkey_requests_per_minute = 3;
+    let srv = TestServer::start(cfg).await;
+    let now_u = unix_now();
+    let now = now_u as i64;
+
+    srv.state
+        .db
+        .put_admin_members(
+            &srv.state.config,
+            "card",
+            std::slice::from_ref(&friend_pk),
+            now_u,
+        )
+        .unwrap();
+    srv.state
+        .db
+        .put_admin_members(
+            &srv.state.config,
+            "wot",
+            std::slice::from_ref(&friend_pk),
+            now_u,
+        )
+        .unwrap();
+    srv.state
+        .db
+        .put_admin_members(
+            &srv.state.config,
+            "lock",
+            std::slice::from_ref(&friend_pk),
+            now_u,
+        )
+        .unwrap();
+
+    // 1. Unauthenticated HEAD and forged PUT/DELETE/DELETE?account/POST?lock_ticket
+    // must NEVER drain friend_pk's authenticated pubkey rate-limit bucket.
+    let bad_sig = "00".repeat(64);
+    let ticket_body = serde_json::to_vec(&serde_json::json!({
+        "anchor_id": "11".repeat(32),
+        "retain_until_quarter": humoco_proto::encode_quarter(2031, 2).unwrap(),
+        "pow_timestamp": serde_json::Value::Null,
+        "pow_nonce": serde_json::Value::Null,
+    }))
+    .unwrap();
+    for _ in 0..5 {
+        assert_eq!(
+            srv.client
+                .head(format!("{}/sync.php", srv.base_url))
+                .header("X-Drop-Pubkey", &friend_pk)
+                .header("X-Channel", "card")
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16(),
+            200
+        );
+        assert_eq!(
+            srv.client
+                .put(format!("{}/sync", srv.base_url))
+                .header("X-Drop-Pubkey", &friend_pk)
+                .header("X-Channel", "card")
+                .header("X-Drop-Timestamp", now.to_string())
+                .header("X-Drop-Nonce", random_hex(16))
+                .header("X-Drop-Signature", &bad_sig)
+                .body(b"forged-put".to_vec())
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16(),
+            401
+        );
+        assert_eq!(
+            srv.client
+                .delete(format!("{}/sync", srv.base_url))
+                .header("X-Drop-Pubkey", &friend_pk)
+                .header("X-Channel", "card")
+                .header("X-Drop-Timestamp", now.to_string())
+                .header("X-Drop-Nonce", random_hex(16))
+                .header("X-Drop-Signature", &bad_sig)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16(),
+            401
+        );
+        assert_eq!(
+            srv.client
+                .delete(format!("{}/sync?account", srv.base_url))
+                .header("X-Drop-Pubkey", &friend_pk)
+                .header("X-Drop-Timestamp", now.to_string())
+                .header("X-Drop-Nonce", random_hex(16))
+                .header("X-Drop-Signature", &bad_sig)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16(),
+            401
+        );
+        assert_eq!(
+            srv.client
+                .post(format!("{}/sync?lock_ticket", srv.base_url))
+                .header("X-Drop-Pubkey", &friend_pk)
+                .header("X-Drop-Timestamp", now.to_string())
+                .header("X-Drop-Nonce", random_hex(16))
+                .header("X-Drop-Signature", &bad_sig)
+                .header("Content-Type", "application/json")
+                .body(ticket_body.clone())
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16(),
+            401
+        );
+    }
+
+    // 2. Empty PUT must return 400 BEFORE consuming the nonce, so reusing that nonce
+    // for a valid non-empty PUT succeeds (also proving bucket wasn't drained!).
+    let reused_nonce_empty = random_hex(16);
+    let empty_sig = hex::encode(
+        friend_sk
+            .sign(
+                parse_member_message(
+                    "PUT",
+                    "card",
+                    "",
+                    now,
+                    &reused_nonce_empty,
+                    &sha256_hex(b""),
+                )
+                .as_bytes(),
+            )
+            .to_bytes(),
+    );
+    let empty_resp = srv
+        .client
+        .put(format!("{}/sync", srv.base_url))
+        .header("X-Drop-Pubkey", &friend_pk)
+        .header("X-Channel", "card")
+        .header("X-Drop-Timestamp", now.to_string())
+        .header("X-Drop-Nonce", &reused_nonce_empty)
+        .header("X-Drop-Signature", &empty_sig)
+        .body(Vec::<u8>::new())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        empty_resp.status().as_u16(),
+        400,
+        "Empty PUT payload must be rejected with 400"
+    );
+
+    let ok_payload = b"valid-after-forged-flood-and-empty".to_vec();
+    let ok_sig = hex::encode(
+        friend_sk
+            .sign(
+                parse_member_message(
+                    "PUT",
+                    "card",
+                    "",
+                    now,
+                    &reused_nonce_empty,
+                    &sha256_hex(&ok_payload),
+                )
+                .as_bytes(),
+            )
+            .to_bytes(),
+    );
+    let ok_resp = srv
+        .client
+        .put(format!("{}/sync", srv.base_url))
+        .header("X-Drop-Pubkey", &friend_pk)
+        .header("X-Channel", "card")
+        .header("X-Drop-Timestamp", now.to_string())
+        .header("X-Drop-Nonce", &reused_nonce_empty)
+        .header("X-Drop-Signature", &ok_sig)
+        .body(ok_payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        ok_resp.status().as_u16(),
+        200,
+        "Legitimate signed PUT must succeed after forged flood & empty PUT (no bucket drain or nonce burn)"
+    );
+
+    // 3. Oversized wot PUT (friends.wot.max_bytes = 262_144 < pro.backup 16 MiB) must fail 413
+    // BEFORE signature verification / nonce burn / pubkey bucket consumption.
+    let too_big_wot = vec![0xAAu8; 262_145];
+    let reused_nonce_big = random_hex(16);
+    let big_sig = hex::encode(
+        friend_sk
+            .sign(
+                parse_member_message(
+                    "PUT",
+                    "wot",
+                    "",
+                    now,
+                    &reused_nonce_big,
+                    &sha256_hex(&too_big_wot),
+                )
+                .as_bytes(),
+            )
+            .to_bytes(),
+    );
+    let big_resp = srv
+        .client
+        .put(format!("{}/sync", srv.base_url))
+        .header("X-Drop-Pubkey", &friend_pk)
+        .header("X-Channel", "wot")
+        .header("X-Drop-Timestamp", now.to_string())
+        .header("X-Drop-Nonce", &reused_nonce_big)
+        .header("X-Drop-Signature", &big_sig)
+        .body(too_big_wot)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        big_resp.status().as_u16(),
+        413,
+        "Exceeding channel max_bytes must return 413 before consuming nonce"
+    );
+
+    let small_wot = b"small-wot-payload".to_vec();
+    let small_sig = hex::encode(
+        friend_sk
+            .sign(
+                parse_member_message(
+                    "PUT",
+                    "wot",
+                    "",
+                    now,
+                    &reused_nonce_big,
+                    &sha256_hex(&small_wot),
+                )
+                .as_bytes(),
+            )
+            .to_bytes(),
+    );
+    assert_eq!(
+        srv.client
+            .put(format!("{}/sync", srv.base_url))
+            .header("X-Drop-Pubkey", &friend_pk)
+            .header("X-Channel", "wot")
+            .header("X-Drop-Timestamp", now.to_string())
+            .header("X-Drop-Nonce", &reused_nonce_big)
+            .header("X-Drop-Signature", &small_sig)
+            .body(small_wot)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        200
+    );
+
+    // 4. Unauthorized caller sending oversized payload gets 403 before buffering body
+    let outsider_payload = vec![0xBBu8; 300_000];
+    let mut outsider_req = srv.client.put(format!("{}/sync", srv.base_url));
+    for (k, v) in sign_member_headers(&outsider_sk, "PUT", "card", "", "", now, &outsider_payload) {
+        outsider_req = outsider_req.header(k, v);
+    }
+    assert_eq!(
+        outsider_req
+            .body(outsider_payload)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        403
+    );
+
+    // 5. Non-UTF-8 X-Drop-Prefix must return 400 rather than silently being ignored
+    let bad_hdr_resp = srv
+        .client
+        .head(format!("{}/sync.php", srv.base_url))
+        .header("X-Drop-Pubkey", &friend_pk)
+        .header("X-Channel", "card")
+        .header(
+            "X-Drop-Prefix",
+            reqwest::header::HeaderValue::from_bytes(b"\xff\xfe").unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_hdr_resp.status().as_u16(), 400);
+
+    // 6. Real pubkey rate limit still enforces after 3 legitimate signed requests (used 2 above)
+    let mut req3 = srv.client.put(format!("{}/sync", srv.base_url));
+    for (k, v) in sign_member_headers(&friend_sk, "PUT", "card", "", "", now, b"third") {
+        req3 = req3.header(k, v);
+    }
+    assert_eq!(
+        req3.body(b"third".to_vec())
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        200
+    );
+
+    let mut req4 = srv.client.put(format!("{}/sync", srv.base_url));
+    for (k, v) in sign_member_headers(&friend_sk, "PUT", "card", "", "", now, b"fourth") {
+        req4 = req4.header(k, v);
+    }
+    assert_eq!(
+        req4.body(b"fourth".to_vec())
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        429
+    );
+}
+
+#[tokio::test]
+async fn test_s04_static_lock_304_etag_members_capacity_and_fast_fail() {
+    let (admin_sk, admin_pk) = gen_keypair();
+    let (user_sk, user_pk) = gen_keypair();
+
+    let mut cfg = base_hybrid_config(&admin_pk);
+    cfg.mode.max_admin_members = 10_000;
+    let srv = TestServer::start(cfg).await;
+    let now = unix_now() as i64;
+
+    // 1. Commit a lock entry and verify GET/HEAD static .lock conditional 304 Not Modified
+    srv.client
+        .post(format!("{}/register/open", srv.base_url))
+        .form(&[("pubkey", user_pk.as_str())])
+        .send()
+        .await
+        .unwrap();
+
+    let lock_pub = srv.state.db.lock_pubkey_bytes().unwrap();
+    let admin_pub_bytes = admin_sk.verifying_key().to_bytes();
+    let creator_mig_sk = SigningKey::from_bytes(&[55u8; 32]);
+    let creator_mig_pub = creator_mig_sk.verifying_key().to_bytes();
+    let quarter = humoco_proto::encode_quarter(2031, 2).unwrap();
+    let manifest =
+        build_single_server_manifest(admin_pub_bytes, lock_pub, creator_mig_pub, quarter);
+    let anchor_id = manifest.rev1_anchor_id().unwrap();
+    let bucket = humoco_proto::derive_bucket(&anchor_id, &lock_pub);
+
+    let (t_code, t_json) = fetch_ticket_signed(&srv, &user_sk, anchor_id, quarter).await;
+    assert_eq!(t_code, 200);
+    let ticket: humoco_proto::GenesisTicket =
+        serde_json::from_value(t_json["ticket"].clone()).unwrap();
+
+    let g_sk = SigningKey::from_bytes(&[56u8; 32]);
+    let r_hash = [0x66; 32];
+    let e0 = sign_lock_entry_helper(
+        anchor_id,
+        [0x21; 32],
+        [0u8; 32],
+        0,
+        0,
+        [0x31; 32],
+        &g_sk,
+        r_hash,
+        None,
+        Some(&creator_mig_sk),
+        8,
+    );
+    let batch_req = serde_json::json!({
+        "anchor_id": hex::encode(anchor_id),
+        "bucket": hex::encode(bucket),
+        "recipient_nonce": hex::encode([0xBB; 32]),
+        "entries": [e0.to_wire_hex().unwrap()],
+        "manifest": manifest,
+        "genesis_ticket": ticket,
+        "known_head_receipt": serde_json::Value::Null,
+    });
+    assert_eq!(
+        srv.client
+            .post(format!("{}/sync.php?lock", srv.base_url))
+            .json(&batch_req)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        200
+    );
+
+    let q_str = humoco_proto::format_quarter(quarter).unwrap();
+    let file_s = hex::encode(humoco_proto::derive_slot_file_id(&e0.slot, &lock_pub));
+    let lock_url = format!(
+        "{}/humoco_sync_data/locks/{}/{}/{}.lock",
+        srv.base_url,
+        q_str,
+        hex::encode(bucket),
+        file_s
+    );
+    let lock_get = srv.client.get(&lock_url).send().await.unwrap();
+    assert_eq!(lock_get.status().as_u16(), 200);
+    let lock_etag = lock_get
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let lock_bytes = lock_get.bytes().await.unwrap();
+    assert_eq!(lock_bytes.len(), 605);
+    assert_eq!(lock_etag, format!("\"{}\"", sha256_hex(&lock_bytes)));
+
+    let lock_304 = srv
+        .client
+        .get(&lock_url)
+        .header("If-None-Match", &lock_etag)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        lock_304.status().as_u16(),
+        304,
+        "Static .lock read MUST return 304 Not Modified on matching If-None-Match"
+    );
+
+    let lock_304_multi = srv
+        .client
+        .head(&lock_url)
+        .header("If-None-Match", format!("\"deadbeef\", W/{}", lock_etag))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(lock_304_multi.status().as_u16(), 304);
+
+    let static_post = srv.client.post(&lock_url).send().await.unwrap();
+    assert_eq!(static_post.status().as_u16(), 405);
+    assert_eq!(
+        static_post
+            .headers()
+            .get("allow")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "GET, HEAD"
+    );
+
+    // 2. PUT ?members must accept payloads > 512 KiB (e.g., 8,500 members ~570 KiB)
+    let big_members: Vec<String> = (0..8_500u32).map(|i| format!("{:064x}", i + 1)).collect();
+    let big_members_body =
+        serde_json::to_vec(&serde_json::json!({ "pubkeys": big_members })).unwrap();
+    assert!(big_members_body.len() > 512 * 1024);
+    let m_nonce = random_hex(16);
+    let m_sig = hex::encode(
+        admin_sk
+            .sign(
+                format_admin_put_members_message(
+                    "card",
+                    now,
+                    &m_nonce,
+                    &sha256_hex(&big_members_body),
+                )
+                .as_bytes(),
+            )
+            .to_bytes(),
+    );
+    let pm_big = srv
+        .client
+        .put(format!("{}/sync.php?members&channel=card", srv.base_url))
+        .header("X-Drop-Pubkey", &admin_pk)
+        .header("X-Drop-Timestamp", now.to_string())
+        .header("X-Drop-Nonce", &m_nonce)
+        .header("X-Drop-Signature", &m_sig)
+        .body(big_members_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        pm_big.status().as_u16(),
+        200,
+        "PUT ?members must support large admin member lists (> 512 KiB up to 100k members)"
+    );
+
+    // 3. Disabled admin_app / disabled lock fast-fail before consuming nonce or buffering body
+    let mut off_cfg = Config::default();
+    off_cfg.server.admin_pubkey = admin_pk.clone();
+    off_cfg.mode.enable_admin_app = false;
+    off_cfg.lock.enabled = false;
+    off_cfg.security.ip_requests_per_minute = 5000;
+    let off_srv = TestServer::start(off_cfg).await;
+
+    let reused_admin_nonce = random_hex(16);
+    let pm_off_body = serde_json::to_vec(&serde_json::json!({ "pubkeys": [] })).unwrap();
+    let pm_off_sig = hex::encode(
+        admin_sk
+            .sign(
+                format_admin_put_members_message(
+                    "card",
+                    now,
+                    &reused_admin_nonce,
+                    &sha256_hex(&pm_off_body),
+                )
+                .as_bytes(),
+            )
+            .to_bytes(),
+    );
+    let pm_off_resp = off_srv
+        .client
+        .put(format!(
+            "{}/sync.php?members&channel=card",
+            off_srv.base_url
+        ))
+        .header("X-Drop-Pubkey", &admin_pk)
+        .header("X-Drop-Timestamp", now.to_string())
+        .header("X-Drop-Nonce", &reused_admin_nonce)
+        .header("X-Drop-Signature", &pm_off_sig)
+        .body(pm_off_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pm_off_resp.status().as_u16(), 403);
+    // Nonce must NOT have been consumed when enable_admin_app = false
+    assert!(off_srv
+        .state
+        .db
+        .check_and_consume_nonce(&reused_admin_nonce, now as u64)
+        .unwrap());
+
+    assert_eq!(
+        off_srv
+            .client
+            .post(format!("{}/sync.php?lock_import", off_srv.base_url))
+            .body(b"{\"invalid\":true}".to_vec())
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        404
+    );
+}
