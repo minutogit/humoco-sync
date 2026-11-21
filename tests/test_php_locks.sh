@@ -102,6 +102,7 @@ start_php_server() {
   local workers="$4"
   local port="$5"
   local log_file="$6"
+  local prop_tl="${7:-259200}"
 
   mkdir -p "$docroot"
   cp "${ROOT_DIR}/php/sync.php" "${ROOT_DIR}/php/lock_handler.php" "${ROOT_DIR}/php/lock_rotation.php" "${ROOT_DIR}/php/index.html" "${ROOT_DIR}/php/robots.txt" "$docroot/"
@@ -124,6 +125,7 @@ return [
         'pow_base_bits' => 8,
         'allow_pow_tickets' => false,
         'ticket_pow_bits' => 16,
+        'proposal_timelock_secs' => ${prop_tl},
     ],
 ];
 EOF
@@ -313,6 +315,387 @@ GC_AFTER="$(php "${DOC2}/lock_handler.php" --gc --config="${DOC2}/config.php" --
 assert_contains "$GC_AFTER" "purged_buckets=1 purged_inodes=5" "GC at Quartalsende + 30d purges expired bucket & 5 inodes"
 assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "${DATA2}/${Q_REL0}")" "404" "Expired lock returns 404 after retention GC"
 assert_contains "$(curl -sf "${URL2}/sync.php?info")" '"used_inodes":0' "GET ?info reports used_inodes=0 after GC"
+
+stop_php_server
+
+echo "--- Test 5 (SYNC-S07-01/02): Atomic partial-batch abort, exact nonce expiry & 409 freeze code ---"
+read -r ADMIN3_SK ADMIN3_PK <<< "$("$SERVER_BIN" sign-test keygen)"
+PORT3="$(pick_free_port)"
+DOC3="$TMP_DIR/doc3"
+start_php_server "$DOC3" "$ADMIN3_PK" 50000 4 "$PORT3" "$TMP_DIR/php3.log"
+URL3="http://127.0.0.1:${PORT3}"
+DATA3="${URL3}/humoco_sync_data"
+LP3="$(curl -sf "${URL3}/sync.php?lock_selftest" | sed -n 's/.*"lock_pub":"\([0-9a-f]\{64\}\)".*/\1/p')"
+
+ANCHOR_C1="$("$SERVER_BIN" sign-test make-lock-sample --lock-pub "$LP3" --admin-pub "$ADMIN3_PK" --quarter "$QTR" --anchor-tag "s07-c1" --variant anchor_id)"
+assert_eq "$(issue_ticket "$URL3" "$ADMIN3_SK" "$ADMIN3_PK" "$ANCHOR_C1" "$QTR" "$TMP_DIR/c1_ticket.json")" "200" "Issued ticket for S07-C1"
+"$SERVER_BIN" sign-test make-lock-sample --lock-pub "$LP3" --admin-pub "$ADMIN3_PK" --quarter "$QTR" --ticket-json "$TMP_DIR/c1_ticket.json" --anchor-tag "s07-c1" --variant init > "$TMP_DIR/c1_init.json"
+
+# Craft [entry0, entry1, entry2] where entry2 claims the exact same (entry0.slot, branch 0) -> 409 output_branch_already_claimed
+php -r '
+  $req = json_decode(file_get_contents($argv[1]), true);
+  $a32 = hex2bin($req["anchor_id"]);
+  $e0 = hex2bin($req["entries"][0]);
+  $slot0 = substr($e0, 5, 32);
+  $recv1SkSeed = str_repeat(chr(93), 32);
+  $recv1Kp = sodium_crypto_sign_seed_keypair($recv1SkSeed);
+  $recv1Sk = sodium_crypto_sign_secretkey($recv1Kp);
+  $recv1Pub = sodium_crypto_sign_publickey($recv1Kp);
+  $slot2 = hash("sha256", "HUMOCO_SYNC_SLOT_V1" . $a32 . str_repeat(chr(0x33), 32), true);
+  $child2 = str_repeat(chr(0x33), 32);
+  $recv2Hash = str_repeat(chr(0x78), 32);
+  $dig = hash("sha256", "HUMOCO_CAUSAL_OUTPUT_V1" . $a32 . $slot2 . $slot0 . "\x00" . pack("V", 1) . $child2 . $recv1Pub . $recv2Hash . "\x00" . str_repeat("\0", 32), true);
+  $csig = sodium_crypto_sign_detached($dig, $recv1Sk);
+  $nonce = 0;
+  for (;; $nonce++) {
+    $h = hash("sha256", "HUMOCO_LOCK_POW_V1" . $slot2 . $child2 . pack("V", 1) . pack("P", $nonce), true);
+    if (ord($h[0]) === 0) break;
+  }
+  $wire2 = "HMLK\x01" . $slot2 . $slot0 . "\x00" . pack("V", 1) . $child2 . $recv1Pub . $recv2Hash . "\x00" . str_repeat("\0", 32) . $csig . "\x00" . str_repeat("\0", 64) . str_repeat("\x67", 265) . pack("P", $nonce);
+  $req["entries"][] = bin2hex($wire2);
+  file_put_contents($argv[2], json_encode($req, JSON_UNESCAPED_SLASHES));
+' "$TMP_DIR/c1_init.json" "$TMP_DIR/c1_abort_claim.json"
+
+ABT_CODE="$(curl -s -o "$TMP_DIR/c1_abort_resp.json" -w '%{http_code}' -X POST -H 'Content-Type: application/json' --data-binary "@$TMP_DIR/c1_abort_claim.json" "${URL3}/sync.php?lock")"
+assert_eq "$ABT_CODE" "409" "SYNC-S07-01: duplicate branch claim in batch returns 409"
+assert_contains "$(cat "$TMP_DIR/c1_abort_resp.json")" '"output_branch_already_claimed"' "SYNC-S07-01: 409 error is output_branch_already_claimed"
+C1_REL0="$("$SERVER_BIN" sign-test make-lock-sample --lock-pub "$LP3" --admin-pub "$ADMIN3_PK" --quarter "$QTR" --anchor-tag "s07-c1" --variant read_path)"
+assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "${DATA3}/${C1_REL0}")" "404" "SYNC-S07-01: aborted prefix entry0 MUST NOT remain readable on disk (404)"
+assert_contains "$(curl -sf "${URL3}/sync.php?info")" '"used_inodes":0' "SYNC-S07-01: used_inodes stays 0 after aborted batch"
+
+# Exact-second nonce expiry check (SYNC-S07-02)
+NONCE_BOUNDARY="$(php -r '
+  require $argv[1];
+  $p = lock_paths($argv[2]);
+  $ok1 = lock_consume_nonce($p, "req:exact120", 120, 1795000000);
+  $okEq = lock_consume_nonce($p, "req:exact120", 120, 1795000120);
+  $okAfter = lock_consume_nonce($p, "req:exact120", 120, 1795000121);
+  echo ($ok1 ? "1" : "0") . ":" . ($okEq ? "1" : "0") . ":" . ($okAfter ? "1" : "0");
+' "${DOC3}/lock_handler.php" "${DOC3}/humoco_sync_data")"
+assert_eq "$NONCE_BOUNDARY" "1:0:1" "SYNC-S07-02: lock_consume_nonce rejects replay at exact exp == now"
+
+# Self-frozen bucket ticket returns canonical bucket_self_frozen (SYNC-S07-02)
+ANCHOR_SF="$("$SERVER_BIN" sign-test make-lock-sample --lock-pub "$LP3" --admin-pub "$ADMIN3_PK" --quarter "$QTR" --anchor-tag "s07-sf" --variant anchor_id)"
+assert_eq "$(issue_ticket "$URL3" "$ADMIN3_SK" "$ADMIN3_PK" "$ANCHOR_SF" "$QTR" "$TMP_DIR/sf_ticket.json")" "200" "Issued ticket for S07-SF"
+"$SERVER_BIN" sign-test make-lock-sample --lock-pub "$LP3" --admin-pub "$ADMIN3_PK" --quarter "$QTR" --ticket-json "$TMP_DIR/sf_ticket.json" --anchor-tag "s07-sf" --variant seq:0 > "$TMP_DIR/sf_b0.json"
+curl -sf -X POST -H 'Content-Type: application/json' --data-binary "@$TMP_DIR/sf_b0.json" "${URL3}/sync.php?lock" > "$TMP_DIR/sf_rec0.json"
+"$SERVER_BIN" sign-test make-lock-sample --lock-pub "$LP3" --admin-pub "$ADMIN3_PK" --quarter "$QTR" --ticket-json "$TMP_DIR/sf_ticket.json" --anchor-tag "s07-sf" --variant seq:1 > "$TMP_DIR/sf_b1.json"
+curl -sf -X POST -H 'Content-Type: application/json' --data-binary "@$TMP_DIR/sf_b1.json" "${URL3}/sync.php?lock" > "$TMP_DIR/sf_rec1.json"
+# Force bucket tombstone rollback check by deleting bucket metadata & presenting rec1
+rm -rf "${DOC3}/humoco_sync_data/.locks_meta/buckets/"*.json
+"$SERVER_BIN" sign-test make-lock-sample --lock-pub "$LP3" --admin-pub "$ADMIN3_PK" --quarter "$QTR" --ticket-json "$TMP_DIR/sf_ticket.json" --receipt-json "$TMP_DIR/sf_rec1.json" --anchor-tag "s07-sf" --variant seq:2 > "$TMP_DIR/sf_rb.json"
+assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' --data-binary "@$TMP_DIR/sf_rb.json" "${URL3}/sync.php?lock")" "409" "Triggered self_frozen on s07-sf"
+assert_eq "$(issue_ticket "$URL3" "$ADMIN3_SK" "$ADMIN3_PK" "$ANCHOR_SF" "$QTR" "$TMP_DIR/sf_ticket_after.json")" "409" "POST ?lock_ticket on self_frozen returns 409"
+assert_contains "$(cat "$TMP_DIR/sf_ticket_after.json")" '"error":"bucket_self_frozen"' "SYNC-S07-02: POST ?lock_ticket reports canonical bucket_self_frozen"
+
+stop_php_server
+
+echo "--- Test 6 (SYNC-S07-03/04): Sticky SelfFrozen & Monotonic Rotation Guards ---"
+read -r R1_ADMIN_SK R1_ADMIN_PK <<< "$("$SERVER_BIN" sign-test keygen)"
+read -r R2_ADMIN_SK R2_ADMIN_PK <<< "$("$SERVER_BIN" sign-test keygen)"
+read -r R3_ADMIN_SK R3_ADMIN_PK <<< "$("$SERVER_BIN" sign-test keygen)"
+R1_PORT="$(pick_free_port)"
+R1_DOC="$TMP_DIR/rot_s1"
+start_php_server "$R1_DOC" "$R1_ADMIN_PK" 50000 2 "$R1_PORT" "$TMP_DIR/r1.log"
+R1_PID="$PHP_PID"
+PHP_PID=""
+R1_URL="http://127.0.0.1:${R1_PORT}"
+R1_LP="$(curl -sf "${R1_URL}/sync.php?lock_selftest" | sed -n 's/.*"lock_pub":"\([0-9a-f]\{64\}\)".*/\1/p')"
+
+R2_PORT=$((R1_PORT + 1))
+while (echo >/dev/tcp/127.0.0.1/"$R2_PORT") 2>/dev/null; do R2_PORT=$((R2_PORT + 1)); done
+R2_DOC="$TMP_DIR/rot_s2"
+start_php_server "$R2_DOC" "$R2_ADMIN_PK" 50000 2 "$R2_PORT" "$TMP_DIR/r2.log" 0
+R2_PID="$PHP_PID"
+PHP_PID=""
+R2_URL="http://127.0.0.1:${R2_PORT}"
+R2_LP="$(curl -sf "${R2_URL}/sync.php?lock_selftest" | sed -n 's/.*"lock_pub":"\([0-9a-f]\{64\}\)".*/\1/p')"
+
+R3_PORT=$((R2_PORT + 1))
+while (echo >/dev/tcp/127.0.0.1/"$R3_PORT") 2>/dev/null; do R3_PORT=$((R3_PORT + 1)); done
+R3_DOC="$TMP_DIR/rot_s3"
+start_php_server "$R3_DOC" "$R3_ADMIN_PK" 50000 2 "$R3_PORT" "$TMP_DIR/r3.log" 0
+R3_PID="$PHP_PID"
+PHP_PID=""
+R3_URL="http://127.0.0.1:${R3_PORT}"
+R3_LP="$(curl -sf "${R3_URL}/sync.php?lock_selftest" | sed -n 's/.*"lock_pub":"\([0-9a-f]\{64\}\)".*/\1/p')"
+
+# Clean up extra PHP servers on exit too
+cleanup_with_rot() {
+  for xp in "${R1_PID:-}" "${R2_PID:-}" "${R3_PID:-}"; do
+    if [[ -n "$xp" ]] && kill -0 "$xp" 2>/dev/null; then
+      kill "$xp" 2>/dev/null || true
+      wait "$xp" 2>/dev/null || true
+    fi
+  done
+  cleanup
+}
+trap cleanup_with_rot EXIT
+
+# 6a) SelfFrozen must persist across propose -> veto (with guarantor 72h timelock)
+"$SERVER_BIN" sign-test rotation make-manifest \
+  --s1-lock-pub "$R1_LP" --s1-admin-pub "$R1_ADMIN_PK" --s1-url "$R1_URL" \
+  --s2-lock-pub "$R2_LP" --s2-admin-pub "$R2_ADMIN_PK" --s2-url "$R2_URL" \
+  --quarter "$QTR" --anchor-tag "sf-veto" > "$TMP_DIR/sfv_m.json"
+SFV_ANCHOR="$(sed -n 's/.*"anchor_id":"\([0-9a-f]\{64\}\)".*/\1/p' "$TMP_DIR/sfv_m.json")"
+issue_ticket "$R1_URL" "$R1_ADMIN_SK" "$R1_ADMIN_PK" "$SFV_ANCHOR" "$QTR" "$TMP_DIR/sfv_t.json" >/dev/null
+"$SERVER_BIN" sign-test make-lock-sample --lock-pub "$R1_LP" --admin-pub "$R1_ADMIN_PK" --quarter "$QTR" --manifest-json "$TMP_DIR/sfv_m.json" --ticket-json "$TMP_DIR/sfv_t.json" --anchor-tag "sf-veto" --variant seq:0 > "$TMP_DIR/sfv_b0.json"
+curl -sf -X POST -H 'Content-Type: application/json' --data-binary "@$TMP_DIR/sfv_b0.json" "${R1_URL}/sync.php?lock" > "$TMP_DIR/sfv_r0.json"
+"$SERVER_BIN" sign-test make-lock-sample --lock-pub "$R1_LP" --admin-pub "$R1_ADMIN_PK" --quarter "$QTR" --manifest-json "$TMP_DIR/sfv_m.json" --ticket-json "$TMP_DIR/sfv_t.json" --anchor-tag "sf-veto" --variant seq:1 > "$TMP_DIR/sfv_b1.json"
+curl -sf -X POST -H 'Content-Type: application/json' --data-binary "@$TMP_DIR/sfv_b1.json" "${R1_URL}/sync.php?lock" > "$TMP_DIR/sfv_r1.json"
+# Roll back R1 bucket to write_seq=1 by removing sfv_b1 metadata & presenting sfv_r1
+php -r '
+  $d = $argv[1]; $a = $argv[2]; $lp = hex2bin($argv[3]);
+  $bHex = hash("sha256", "HUMOCO_SYNC_BUCKET_V1" . hex2bin($a) . $lp);
+  $bf = "$d/humoco_sync_data/.locks_meta/buckets/$bHex.json";
+  $b = json_decode(file_get_contents($bf), true);
+  $b["write_seq"] = 0;
+  file_put_contents($bf, json_encode($b));
+' "$R1_DOC" "$SFV_ANCHOR" "$R1_LP"
+"$SERVER_BIN" sign-test make-lock-sample --lock-pub "$R1_LP" --admin-pub "$R1_ADMIN_PK" --quarter "$QTR" --manifest-json "$TMP_DIR/sfv_m.json" --ticket-json "$TMP_DIR/sfv_t.json" --receipt-json "$TMP_DIR/sfv_r1.json" --anchor-tag "sf-veto" --variant seq:2 > "$TMP_DIR/sfv_rb.json"
+assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' --data-binary "@$TMP_DIR/sfv_rb.json" "${R1_URL}/sync.php?lock")" "409" "6a: R1 enters self_frozen"
+
+"$SERVER_BIN" sign-test rotation make-propose --manifest-json "$TMP_DIR/sfv_m.json" --ts "$(date +%s)" > "$TMP_DIR/sfv_prop.json"
+assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' --data-binary "@$TMP_DIR/sfv_prop.json" "${R1_URL}/sync.php?lock_freeze")" "200" "6a: propose accepted on self_frozen bucket"
+"$SERVER_BIN" sign-test rotation make-veto --manifest-json "$TMP_DIR/sfv_m.json" --propose-json "$TMP_DIR/sfv_prop.json" --ts "$(date +%s)" > "$TMP_DIR/sfv_veto.json"
+assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' --data-binary "@$TMP_DIR/sfv_veto.json" "${R1_URL}/sync.php?lock_freeze")" "200" "6a: veto accepted"
+SFV_AFTER_CODE="$(curl -s -o "$TMP_DIR/sfv_after.json" -w '%{http_code}' -X POST -H 'Content-Type: application/json' --data-binary "@$TMP_DIR/sfv_b0.json" "${R1_URL}/sync.php?lock")"
+assert_eq "$SFV_AFTER_CODE" "409" "SYNC-S07-03: SelfFrozen persists after propose -> veto (409)"
+assert_contains "$(cat "$TMP_DIR/sfv_after.json")" '"bucket_self_frozen"' "SYNC-S07-03: freeze error remains bucket_self_frozen after veto"
+
+# 6b) Pure growth (0s timelock, no guarantors) + Sticky SelfFrozen on remaining member R1 across finalize, plus monotonic guards (SYNC-S07-04)
+php -r '
+  $r1Url = $argv[1]; $r1Ap = $argv[2]; $r1Lp = $argv[3];
+  $r2Url = $argv[4]; $r2Ap = $argv[5]; $r2Lp = $argv[6];
+  $r3Url = $argv[7]; $r3Ap = $argv[8]; $r3Lp = $argv[9];
+  $q = (int)$argv[10]; $outDir = $argv[11];
+  $cSeed = hash("sha256", "S07_C2_CREATOR", true);
+  $cKp = sodium_crypto_sign_seed_keypair($cSeed);
+  $cSk = sodium_crypto_sign_secretkey($cKp);
+  $cPk = bin2hex(sodium_crypto_sign_publickey($cKp));
+  $encSrv = fn($s) => hex2bin($s["admin_pub"]) . hex2bin($s["lock_pub"]) . "\x00";
+  $s1 = ["write_url" => "$r1Url/sync.php", "read_url" => "$r1Url/humoco_sync_data", "admin_pub" => $r1Ap, "lock_pub" => $r1Lp, "nominated_by" => "creator"];
+  $s2 = ["write_url" => "$r2Url/sync.php", "read_url" => "$r2Url/humoco_sync_data", "admin_pub" => $r2Ap, "lock_pub" => $r2Lp, "nominated_by" => "creator"];
+  $s3 = ["write_url" => "$r3Url/sync.php", "read_url" => "$r3Url/humoco_sync_data", "admin_pub" => $r3Ap, "lock_pub" => $r3Lp, "nominated_by" => "creator"];
+  $mkRev1 = function($srvs, $tsMs) use ($cPk, $q, $encSrv) {
+    $m = ["revision" => 1, "threshold" => count($srvs) === 1 ? 1 : 2, "servers" => $srvs, "successors" => [], "authority" => ["creator_mig_pub" => $cPk, "guarantor_mig_pubs" => []], "migration_chain" => [], "issued_at_ms" => $tsMs, "retain_until_quarter" => $q];
+    $sBin = ""; foreach ($srvs as $s) $sBin .= $encSrv($s);
+    $aid = hash("sha256", "HUMOCO_ANCHOR_MANIFEST_V1\0" . pack("P", 1) . chr($m["threshold"]) . chr(count($srvs)) . $sBin . pack("v", 0) . hex2bin($cPk) . chr(0) . pack("P", $tsMs) . pack("v", $q), true);
+    return [bin2hex($aid), $m];
+  };
+  $mkProp = function($aHex, $from, $to, $thr, $srvs, $ts) use ($cSk, $encSrv) {
+    $sBin = ""; foreach ($srvs as $s) $sBin .= $encSrv($s);
+    $dig = hash("sha256", "HUMOCO_MIGRATION_PROP_V1" . hex2bin($aHex) . pack("P", $from) . pack("P", $to) . chr($thr) . chr(count($srvs)) . $sBin . pack("v", 0) . pack("v", $GLOBALS["q"]) . pack("P", $ts) . "\x00", true);
+    return ["anchor_id" => $aHex, "from_rev" => $from, "to_rev" => $to, "new_threshold" => $thr, "new_servers" => $srvs, "new_successors" => [], "retain_until_quarter" => $GLOBALS["q"], "proposed_at" => $ts, "initiator" => ["kind" => "creator"], "proposer_sig" => bin2hex(sodium_crypto_sign_detached($dig, $cSk)), "guarantor_cosigs" => []];
+  };
+  $GLOBALS["q"] = $q;
+  $now = time();
+  [$aSfHex, $mSf1] = $mkRev1([$s1], 1794916800000);
+  $propSf = $mkProp($aSfHex, 1, 2, 2, [$s1, $s2], $now);
+  [$aRotHex, $mRot1] = $mkRev1([$s1], 1794916900000);
+  $propRot12 = $mkProp($aRotHex, 1, 2, 2, [$s1, $s2], $now);
+  // Make Rev2->Rev3 pure growth ([s1,s2] -> [s1,s2,s3]) so R1 has 0s timelock too, AND also check Rev3->Rev4 replacement on timelock=0 servers R2/R3!
+  $propRot23 = $mkProp($aRotHex, 2, 3, 2, [$s1, $s2, $s3], $now);
+  $propRot34 = $mkProp($aRotHex, 3, 4, 2, [$s2, $s3], $now);
+  [$aUnrelHex, $mUnrel] = $mkRev1([$s3], 1794917000000);
+  $propUnrel = $mkProp($aUnrelHex, 1, 2, 2, [$s3, $s2], $now);
+  // Write a signed root entry helper data
+  $genKp = sodium_crypto_sign_seed_keypair(str_repeat(chr(71), 32));
+  $genSk = sodium_crypto_sign_secretkey($genKp); $genPk = sodium_crypto_sign_publickey($genKp);
+  $mkRootEntry = function($aHex) use ($cSk, $genSk, $genPk) {
+    $a32 = hex2bin($aHex);
+    $slot = hash("sha256", "HUMOCO_SYNC_SLOT_V1" . $a32 . str_repeat(chr(0x51), 32), true);
+    $cl = str_repeat(chr(0x52), 32); $rh = hash("sha3-256", str_repeat(chr(0x53), 32), true);
+    $cd = hash("sha256", "HUMOCO_CAUSAL_OUTPUT_V1" . $a32 . $slot . str_repeat("\0", 32) . "\x00" . pack("V", 0) . $cl . $genPk . $rh . "\x00" . str_repeat("\0", 32), true);
+    $csig = sodium_crypto_sign_detached($cd, $genSk);
+    $rmd = hash("sha256", "HUMOCO_ROOT_MIG_AUTH_V1" . $a32 . $slot . $genPk, true);
+    $rsig = sodium_crypto_sign_detached($rmd, $cSk);
+    for ($n = 0;; $n++) { $h = hash("sha256", "HUMOCO_LOCK_POW_V1" . $slot . $cl . pack("V", 0) . pack("P", $n), true); if (ord($h[0]) === 0) break; }
+    return bin2hex("HMLK\x01" . $slot . str_repeat("\0", 32) . "\x00" . pack("V", 0) . $cl . $genPk . $rh . "\x00" . str_repeat("\0", 32) . $csig . "\x01" . $rsig . str_repeat("\x44", 265) . pack("P", $n));
+  };
+  file_put_contents("$outDir/s07_rot_plan.json", json_encode([
+    "sf_anchor" => $aSfHex, "sf_m1" => $mSf1, "sf_prop" => $propSf, "sf_entry" => $mkRootEntry($aSfHex),
+    "rot_anchor" => $aRotHex, "rot_m1" => $mRot1, "rot_prop12" => $propRot12, "rot_prop23" => $propRot23, "rot_prop34" => $propRot34, "rot_entry" => $mkRootEntry($aRotHex),
+    "unrel_anchor" => $aUnrelHex, "unrel_m1" => $mUnrel, "unrel_prop" => $propUnrel,
+  ]));
+' "$R1_URL" "$R1_ADMIN_PK" "$R1_LP" "$R2_URL" "$R2_ADMIN_PK" "$R2_LP" "$R3_URL" "$R3_ADMIN_PK" "$R3_LP" "$QTR" "$TMP_DIR"
+
+# Run full 6b rotation + rollback + replay sequence via PHP orchestration + curl HTTP assertions
+S07_6B_OUT="$(php -r '
+  $plan = json_decode(file_get_contents($argv[1]), true);
+  $r1 = $argv[2]; $r2 = $argv[3]; $r3 = $argv[4];
+  $r1Doc = $argv[5]; $r1Sk = $argv[6]; $r1Pk = $argv[7]; $r1Lp = $argv[8];
+  $r2Sk = $argv[9]; $r2Pk = $argv[10]; $r3Sk = $argv[11]; $r3Pk = $argv[12];
+  $post = function($url, $body, $hdrs = []) {
+    $ch = curl_init($url);
+    $h = array_merge(["Content-Type: application/json"], $hdrs);
+    curl_setopt_array($ch, [CURLOPT_POST => true, CURLOPT_POSTFIELDS => $body, CURLOPT_HTTPHEADER => $h, CURLOPT_RETURNTRANSFER => true]);
+    $resp = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    return [$code, json_decode((string)$resp, true) ?? $resp];
+  };
+  $issueT = function($url, $skHex, $pkHex, $aHex, $q) use ($post) {
+    $body = json_encode(["anchor_id" => $aHex, "retain_until_quarter" => $q, "pow_timestamp" => null, "pow_nonce" => null]);
+    $ts = time(); $nonce = bin2hex(random_bytes(16));
+    $msg = "HUMOCO-DROP-REQ-V1\nPOST\nlock_ticket\n\n{$ts}\n{$nonce}\n" . hash("sha256", $body);
+    $sig = bin2hex(sodium_crypto_sign_detached($msg, hex2bin($skHex) . hex2bin($pkHex)));
+    [$c, $j] = $post("$url/sync.php?lock_ticket", $body, ["X-Drop-Pubkey: $pkHex", "X-Drop-Timestamp: $ts", "X-Drop-Nonce: $nonce", "X-Drop-Signature: $sig"]);
+    if ($c !== 200) throw new RuntimeException("ticket failed $c");
+    return $j["ticket"];
+  };
+  $doBatch = function($url, $aHex, $lpHex, $entryHex, $m, $t, $kr = null) use ($post) {
+    $bHex = hash("sha256", "HUMOCO_SYNC_BUCKET_V1" . hex2bin($aHex) . hex2bin($lpHex));
+    return $post("$url/sync.php?lock", json_encode(["anchor_id" => $aHex, "bucket" => $bHex, "recipient_nonce" => bin2hex(random_bytes(32)), "entries" => [$entryHex], "manifest" => $m, "genesis_ticket" => $t, "known_head_receipt" => $kr]));
+  };
+  // 1) SelfFrozen across pure-growth finalize where R1 remains in new_servers
+  $tSf = $issueT($r1, $r1Sk, $r1Pk, $plan["sf_anchor"], $plan["sf_m1"]["retain_until_quarter"]);
+  [$c, $bRes] = $doBatch($r1, $plan["sf_anchor"], $r1Lp, $plan["sf_entry"], $plan["sf_m1"], $tSf);
+  if ($c !== 200) throw new RuntimeException("sf init batch failed");
+  $rec = $bRes["receipts"][0];
+  $bHexSf = hash("sha256", "HUMOCO_SYNC_BUCKET_V1" . hex2bin($plan["sf_anchor"]) . hex2bin($r1Lp));
+  unlink("$r1Doc/humoco_sync_data/.locks_meta/buckets/$bHexSf.json");
+  [$cRb, ] = $doBatch($r1, $plan["sf_anchor"], $r1Lp, $plan["sf_entry"], $plan["sf_m1"], $tSf, $rec);
+  if ($cRb !== 409) throw new RuntimeException("sf trigger failed: $cRb");
+  [$cPr, $prRes] = $post("$r1/sync.php?lock_freeze", json_encode(["action" => "propose", "proposal" => $plan["sf_prop"], "current_manifest" => $plan["sf_m1"]]));
+  if ($cPr !== 200) throw new RuntimeException("sf propose failed: $cPr");
+  $impReq = json_encode(["anchor_id" => $plan["sf_anchor"], "active_manifest" => $plan["sf_m1"], "proposal" => $plan["sf_prop"], "snapshots" => [$prRes["snapshot_export"]], "quorum_certificates" => []]);
+  [$cI1, $i1] = $post("$r1/sync.php?lock_import", $impReq);
+  [$cI2, $i2] = $post("$r2/sync.php?lock_import", $impReq);
+  if ($cI1 !== 200 || $cI2 !== 200) throw new RuntimeException("sf import failed $cI1/$cI2");
+  $scReq = json_encode(["action" => "sign_commit", "anchor_id" => $plan["sf_anchor"], "proposal" => $plan["sf_prop"], "imported_state_hash" => $i1["import_ack"]["imported_state_hash"], "import_acks" => [$i1["import_ack"], $i2["import_ack"]]]);
+  [$cSc, $sc] = $post("$r1/sync.php?lock_commit", $scReq);
+  if ($cSc !== 200) throw new RuntimeException("sf sign_commit failed $cSc");
+  $sfM2 = ["revision" => 2, "threshold" => 2, "servers" => $plan["sf_prop"]["new_servers"], "successors" => [], "authority" => $plan["sf_m1"]["authority"], "migration_chain" => [["anchor_id" => $plan["sf_anchor"], "genesis_manifest" => $plan["sf_m1"], "proposal" => $plan["sf_prop"], "imported_state_hash" => $i1["import_ack"]["imported_state_hash"], "import_acks" => [$i1["import_ack"], $i2["import_ack"]], "commit_sigs" => [$sc["committee_signature"]]]], "issued_at_ms" => $plan["sf_prop"]["proposed_at"] * 1000, "retain_until_quarter" => $plan["sf_m1"]["retain_until_quarter"]];
+  [$cFin, $finRes] = $post("$r1/sync.php?lock_commit", json_encode(["action" => "finalize", "anchor_id" => $plan["sf_anchor"], "new_manifest" => $sfM2]));
+  [$cAfterFin, $afterFin] = $doBatch($r1, $plan["sf_anchor"], $r1Lp, $plan["sf_entry"], $sfM2, $tSf);
+
+  // 2) Full Rev1->Rev2->Rev3 rotation on rot_anchor to test SYNC-S07-04 guards
+  $tR = $issueT($r1, $r1Sk, $r1Pk, $plan["rot_anchor"], $plan["rot_m1"]["retain_until_quarter"]);
+  [$c, ] = $doBatch($r1, $plan["rot_anchor"], $r1Lp, $plan["rot_entry"], $plan["rot_m1"], $tR);
+  if ($c !== 200) throw new RuntimeException("rot init failed");
+  [, $pr12] = $post("$r1/sync.php?lock_freeze", json_encode(["action" => "propose", "proposal" => $plan["rot_prop12"], "current_manifest" => $plan["rot_m1"]]));
+  $imp12Req = json_encode(["anchor_id" => $plan["rot_anchor"], "active_manifest" => $plan["rot_m1"], "proposal" => $plan["rot_prop12"], "snapshots" => [$pr12["snapshot_export"]], "quorum_certificates" => []]);
+  [$c12a, $r1Imp12] = $post("$r1/sync.php?lock_import", $imp12Req);
+  [$c12b, $r2Imp12] = $post("$r2/sync.php?lock_import", $imp12Req);
+  if ($c12a !== 200 || $c12b !== 200) throw new RuntimeException("rot12 import failed");
+  [, $sc12] = $post("$r1/sync.php?lock_commit", json_encode(["action" => "sign_commit", "anchor_id" => $plan["rot_anchor"], "proposal" => $plan["rot_prop12"], "imported_state_hash" => $r1Imp12["import_ack"]["imported_state_hash"], "import_acks" => [$r1Imp12["import_ack"], $r2Imp12["import_ack"]]]));
+  $rotM2 = ["revision" => 2, "threshold" => 2, "servers" => $plan["rot_prop12"]["new_servers"], "successors" => [], "authority" => $plan["rot_m1"]["authority"], "migration_chain" => [["anchor_id" => $plan["rot_anchor"], "genesis_manifest" => $plan["rot_m1"], "proposal" => $plan["rot_prop12"], "imported_state_hash" => $r1Imp12["import_ack"]["imported_state_hash"], "import_acks" => [$r1Imp12["import_ack"], $r2Imp12["import_ack"]], "commit_sigs" => [$sc12["committee_signature"]]]], "issued_at_ms" => $plan["rot_prop12"]["proposed_at"] * 1000, "retain_until_quarter" => $plan["rot_m1"]["retain_until_quarter"]];
+  $fin12Body = json_encode(["action" => "finalize", "anchor_id" => $plan["rot_anchor"], "new_manifest" => $rotM2]);
+  $post("$r1/sync.php?lock_commit", $fin12Body);
+  $post("$r2/sync.php?lock_commit", $fin12Body);
+
+  // Tests on Rev 2 active servers R1+R2:
+  [$cIdemFin, ] = $post("$r2/sync.php?lock_commit", $fin12Body); // idempotent finalize retry
+  [$cStaleProp, ] = $post("$r1/sync.php?lock_freeze", json_encode(["action" => "propose", "proposal" => $plan["rot_prop12"]])); // stale rev1 propose on active rev2 R1
+  [$cStaleImp, ] = $post("$r2/sync.php?lock_import", $imp12Req); // stale rev1->2 import replay on active rev2 R2
+  // Test valid unrelated Rev 2 manifest finalize on R1 (unrel_anchor only includes R3, R2)
+  [, $prUnrel] = $post("$r3/sync.php?lock_freeze", json_encode(["action" => "propose", "proposal" => $plan["unrel_prop"], "current_manifest" => $plan["unrel_m1"]]));
+  $unrelImpReq = json_encode(["anchor_id" => $plan["unrel_anchor"], "active_manifest" => $plan["unrel_m1"], "proposal" => $plan["unrel_prop"], "snapshots" => [$prUnrel["snapshot_export"]], "quorum_certificates" => []]);
+  [$cU1, $uImp3] = $post("$r3/sync.php?lock_import", $unrelImpReq);
+  [$cU2, $uImp2] = $post("$r2/sync.php?lock_import", $unrelImpReq);
+  if ($cU1 !== 200 || $cU2 !== 200) throw new RuntimeException("unrel import failed $cU1/$cU2");
+  [$cUSc, $uSc] = $post("$r3/sync.php?lock_commit", json_encode(["action" => "sign_commit", "anchor_id" => $plan["unrel_anchor"], "proposal" => $plan["unrel_prop"], "imported_state_hash" => $uImp3["import_ack"]["imported_state_hash"], "import_acks" => [$uImp3["import_ack"], $uImp2["import_ack"]]]));
+  if ($cUSc !== 200) throw new RuntimeException("unrel sc failed $cUSc");
+  $unrelM2 = ["revision" => 2, "threshold" => 2, "servers" => $plan["unrel_prop"]["new_servers"], "successors" => [], "authority" => $plan["unrel_m1"]["authority"], "migration_chain" => [["anchor_id" => $plan["unrel_anchor"], "genesis_manifest" => $plan["unrel_m1"], "proposal" => $plan["unrel_prop"], "imported_state_hash" => $uImp3["import_ack"]["imported_state_hash"], "import_acks" => [$uImp3["import_ack"], $uImp2["import_ack"]], "commit_sigs" => [$uSc["committee_signature"]]]], "issued_at_ms" => $plan["unrel_prop"]["proposed_at"] * 1000, "retain_until_quarter" => $plan["unrel_m1"]["retain_until_quarter"]];
+  [$cUnrelFin, ] = $post("$r1/sync.php?lock_commit", json_encode(["action" => "finalize", "anchor_id" => $plan["unrel_anchor"], "new_manifest" => $unrelM2]));
+
+  // Rotate rot_anchor Rev 2 -> Rev 3 ([R1, R2] -> [R1, R2, R3], pure growth -> 0s timelock even on R1!)
+  [, $pr123_1] = $post("$r1/sync.php?lock_freeze", json_encode(["action" => "propose", "proposal" => $plan["rot_prop23"]]));
+  [, $pr123_2] = $post("$r2/sync.php?lock_freeze", json_encode(["action" => "propose", "proposal" => $plan["rot_prop23"]]));
+  $imp23Req = json_encode(["anchor_id" => $plan["rot_anchor"], "active_manifest" => $rotM2, "proposal" => $plan["rot_prop23"], "snapshots" => [$pr123_1["snapshot_export"], $pr123_2["snapshot_export"]], "quorum_certificates" => []]);
+  [$c23a, $r1Imp23] = $post("$r1/sync.php?lock_import", $imp23Req);
+  [$c23b, $r2Imp23] = $post("$r2/sync.php?lock_import", $imp23Req);
+  [$c23c, $r3Imp23] = $post("$r3/sync.php?lock_import", $imp23Req);
+  if ($c23a !== 200 || $c23b !== 200 || $c23c !== 200) throw new RuntimeException("rot23 import failed $c23a/$c23b/$c23c");
+  [, $sc23_1] = $post("$r1/sync.php?lock_commit", json_encode(["action" => "sign_commit", "anchor_id" => $plan["rot_anchor"], "proposal" => $plan["rot_prop23"], "imported_state_hash" => $r2Imp23["import_ack"]["imported_state_hash"], "import_acks" => [$r1Imp23["import_ack"], $r2Imp23["import_ack"], $r3Imp23["import_ack"]]]));
+  [, $sc23_2] = $post("$r2/sync.php?lock_commit", json_encode(["action" => "sign_commit", "anchor_id" => $plan["rot_anchor"], "proposal" => $plan["rot_prop23"], "imported_state_hash" => $r2Imp23["import_ack"]["imported_state_hash"], "import_acks" => [$r1Imp23["import_ack"], $r2Imp23["import_ack"], $r3Imp23["import_ack"]]]));
+  $rotM3 = ["revision" => 3, "threshold" => 2, "servers" => $plan["rot_prop23"]["new_servers"], "successors" => [], "authority" => $plan["rot_m1"]["authority"], "migration_chain" => array_merge($rotM2["migration_chain"], [["anchor_id" => $plan["rot_anchor"], "genesis_manifest" => null, "proposal" => $plan["rot_prop23"], "imported_state_hash" => $r2Imp23["import_ack"]["imported_state_hash"], "import_acks" => [$r1Imp23["import_ack"], $r2Imp23["import_ack"], $r3Imp23["import_ack"]], "commit_sigs" => [$sc23_1["committee_signature"], $sc23_2["committee_signature"]]]]), "issued_at_ms" => $plan["rot_prop23"]["proposed_at"] * 1000, "retain_until_quarter" => $plan["rot_m1"]["retain_until_quarter"]];
+  $fin23Body = json_encode(["action" => "finalize", "anchor_id" => $plan["rot_anchor"], "new_manifest" => $rotM3]);
+  $post("$r1/sync.php?lock_commit", $fin23Body);
+  $post("$r2/sync.php?lock_commit", $fin23Body);
+  $post("$r3/sync.php?lock_commit", $fin23Body);
+  // Test downgrade rev 3 -> rev 2 on R1!
+  [$cDowngrade, ] = $post("$r1/sync.php?lock_commit", $fin12Body);
+  // Test veto with stale from_rev=1 on rev3 R1!
+  $fakeVeto = ["anchor_id" => $plan["rot_anchor"], "from_rev" => 1, "proposal_hash" => str_repeat("aa", 32), "vetoer_pub" => $plan["rot_m1"]["authority"]["creator_mig_pub"], "vetoed_at" => time(), "sig" => str_repeat("00", 64)];
+  [$cStaleVeto, ] = $post("$r1/sync.php?lock_freeze", json_encode(["action" => "veto", "veto" => $fakeVeto]));
+  echo json_encode([
+    "sf_fin_code" => $cFin,
+    "sf_after_fin_code" => $cAfterFin,
+    "sf_after_fin_err" => $afterFin["error"] ?? "",
+    "idem_fin_code" => $cIdemFin,
+    "stale_prop_code" => $cStaleProp,
+    "stale_imp_code" => $cStaleImp,
+    "unrel_fin_code" => $cUnrelFin,
+    "downgrade_code" => $cDowngrade,
+    "stale_veto_code" => $cStaleVeto,
+  ]);
+' "$TMP_DIR/s07_rot_plan.json" "$R1_URL" "$R2_URL" "$R3_URL" "$R1_DOC" "$R1_ADMIN_SK" "$R1_ADMIN_PK" "$R1_LP" "$R2_ADMIN_SK" "$R2_ADMIN_PK" "$R3_ADMIN_SK" "$R3_ADMIN_PK")"
+assert_contains "$S07_6B_OUT" '"sf_fin_code":200' "SYNC-S07-03: pure-growth finalize on self_frozen R1 succeeds"
+assert_contains "$S07_6B_OUT" '"sf_after_fin_code":409' "SYNC-S07-03: R1 stays frozen after propose -> finalize"
+assert_contains "$S07_6B_OUT" '"sf_after_fin_err":"bucket_self_frozen"' "SYNC-S07-03: R1 remains bucket_self_frozen after finalize"
+assert_contains "$S07_6B_OUT" '"idem_fin_code":200' "SYNC-S07-04: idempotent finalize retry on inNew server returns 200"
+assert_contains "$S07_6B_OUT" '"stale_prop_code":409' "SYNC-S07-04: stale rev1 propose on active rev2 server returns 409"
+assert_contains "$S07_6B_OUT" '"stale_imp_code":409' "SYNC-S07-04: stale rev1->2 import replay on rev2 server returns 409"
+assert_contains "$S07_6B_OUT" '"unrel_fin_code":400' "SYNC-S07-04: unrelated manifest finalize returns 400"
+assert_contains "$S07_6B_OUT" '"downgrade_code":409' "SYNC-S07-04: manifest revision downgrade finalize returns 409"
+assert_contains "$S07_6B_OUT" '"stale_veto_code":409' "SYNC-S07-04: stale rev1 veto on rev3 server returns 409"
+
+echo "--- Test 7 (SYNC-S07-05): Static If-None-Match, __anchor method/type & CLI router hardening ---"
+ROT_ANCHOR_HEX="$(php -r 'echo json_decode(file_get_contents($argv[1]), true)["rot_anchor"];' "$TMP_DIR/s07_rot_plan.json")"
+ANCHOR_ETAG="$(curl -sI "${R1_URL}/anchors/${ROT_ANCHOR_HEX}.bin" | tr -d '\r' | sed -n 's/^[Ee][Tt][Aa][Gg]: *//p')"
+[[ -n "$ANCHOR_ETAG" ]] || fail "Missing ETag on /anchors/<id>.bin"
+assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -H "If-None-Match: \"0000\", W/${ANCHOR_ETAG}" "${R1_URL}/sync.php?__anchor=${ROT_ANCHOR_HEX}.bin")" "304" "SYNC-S07-05: __anchor honors comma-separated weak W/ ETag list (304)"
+assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -H "If-None-Match: *" "${R1_URL}/anchors/${ROT_ANCHOR_HEX}.bin")" "304" "SYNC-S07-05: static anchor honors If-None-Match: * (304)"
+ANCHOR_POST_HDRS="$(curl -si -X POST "${R1_URL}/sync.php?__anchor=${ROT_ANCHOR_HEX}.bin" | tr -d '\r' | tr '[:upper:]' '[:lower:]')"
+assert_contains "$ANCHOR_POST_HDRS" "405 method not allowed" "SYNC-S07-05: POST ?__anchor returns 405"
+assert_contains "$ANCHOR_POST_HDRS" "allow: get, head" "SYNC-S07-05: POST ?__anchor includes Allow: GET, HEAD"
+assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "${R1_URL}/sync.php?__anchor[]=bad")" "404" "SYNC-S07-05: array __anchor[] returns 404"
+assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "${R1_URL}/sync.php?lock_selftest&extra=1")" "405" "SYNC-S07-05: extra query param on lock route returns 405"
+
+printf 'secret-tmp' > "${R1_DOC}/humoco_sync_data/leak.tmp.1"
+printf 'secret-ld' > "${R1_DOC}/humoco_sync_data/foo.lockdir"
+assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "${R1_URL}/humoco_sync_data/leak.tmp.1")" "403" "SYNC-S07-05: CLI router blocks *.tmp* artifact (403)"
+assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "${R1_URL}/humoco_sync_data/foo.lockdir")" "403" "SYNC-S07-05: CLI router blocks *.lockdir artifact (403)"
+assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "${R1_URL}/humoco_sync_data/%2elock_key.php")" "403" "SYNC-S07-05: CLI router blocks URL-encoded dotfile (403)"
+assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "${R1_URL}/humoco_sync_data/.locks_meta/nonces.json")" "403" "SYNC-S07-05: CLI router blocks .locks_meta internals (403)"
+
+echo "--- Test 8 (SYNC-S07-06): Bounded bodies, TypeError-safe JSON parsing & strict schema parity ---"
+dd if=/dev/zero bs=1024 count=20 of="$TMP_DIR/s07_big_16k.bin" 2>/dev/null
+dd if=/dev/zero bs=1024 count=260 of="$TMP_DIR/s07_big_256k.bin" 2>/dev/null
+assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' --data-binary "@$TMP_DIR/s07_big_16k.bin" "${R1_URL}/sync.php?lock_ticket")" "413" "SYNC-S07-06: POST ?lock_ticket >16KiB returns 413"
+assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' --data-binary "@$TMP_DIR/s07_big_256k.bin" "${R1_URL}/sync.php?lock_freeze")" "413" "SYNC-S07-06: POST ?lock_freeze >256KiB returns 413"
+
+# Scalar JSON and nested non-arrays must return 400 (not 500 TypeError)
+assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '"hello"' "${R1_URL}/sync.php?lock_freeze")" "400" "SYNC-S07-06: scalar JSON string on ?lock_freeze returns 400"
+assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '"hello"' "${R1_URL}/sync.php?lock_commit")" "400" "SYNC-S07-06: scalar JSON string on ?lock_commit returns 400"
+assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{"action":"heartbeat","heartbeat":"bad"}' "${R1_URL}/sync.php?lock_freeze")" "400" "SYNC-S07-06: non-array heartbeat on ?lock_freeze returns 400"
+printf '{"anchor_id":"%s","active_manifest":{"revision":1,"threshold":1,"servers":["bad"],"successors":[],"authority":{"creator_mig_pub":"%s","guarantor_mig_pubs":[]},"migration_chain":[],"issued_at_ms":1,"retain_until_quarter":8125},"proposal":{},"snapshots":[],"quorum_certificates":[]}' "$ROT_ANCHOR_HEX" "$R1_ADMIN_PK" > "$TMP_DIR/s07_bad_imp.json"
+assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' --data-binary "@$TMP_DIR/s07_bad_imp.json" "${R1_URL}/sync.php?lock_import")" "400" "SYNC-S07-06: non-array server element on ?lock_import returns 400"
+
+# Float timestamp rejected with 400
+assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "X-Drop-Pubkey: $R1_ADMIN_PK" -H "X-Drop-Timestamp: 1795000000.5" -H "X-Drop-Nonce: $(rand_nonce)" -H "X-Drop-Signature: $(printf '0%.0s' {1..128})" -H 'Content-Type: application/json' -d '{}' "${R1_URL}/sync.php?lock_ticket")" "400" "SYNC-S07-06: float X-Drop-Timestamp on ?lock_ticket returns 400"
+
+# Scalar JSON and uppercase hex on PUT ?lock_delegate rejected with 400
+printf '"hello"' > "$TMP_DIR/s07_del_scalar.json"
+ts="$(date +%s)"; nonce="$(rand_nonce)"
+sig="$("$SERVER_BIN" sign-test sign-admin --sk "$R1_ADMIN_SK" --action PUT_LOCK_DELEGATE --ts "$ts" --nonce "$nonce" --body-file "$TMP_DIR/s07_del_scalar.json")"
+assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "X-Drop-Pubkey: $R1_ADMIN_PK" -H "X-Drop-Timestamp: $ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig" --data-binary "@$TMP_DIR/s07_del_scalar.json" "${R1_URL}/sync.php?lock_delegate")" "400" "SYNC-S07-06: scalar JSON on PUT ?lock_delegate returns 400"
+
+"$SERVER_BIN" sign-test sign-lock-delegate --sk "$R1_ADMIN_SK" --lock-pub "$R1_LP" --write-url "${R1_URL}/sync.php" --read-url "${R1_URL}/humoco_sync_data" --issued "$(date +%s)" > "$TMP_DIR/s07_del_upper.json"
+php -r '$j = json_decode(file_get_contents($argv[1]), true); $j["admin_pub"] = strtoupper($j["admin_pub"]); file_put_contents($argv[1], json_encode($j));' "$TMP_DIR/s07_del_upper.json"
+ts="$(date +%s)"; nonce="$(rand_nonce)"
+sig="$("$SERVER_BIN" sign-test sign-admin --sk "$R1_ADMIN_SK" --action PUT_LOCK_DELEGATE --ts "$ts" --nonce "$nonce" --body-file "$TMP_DIR/s07_del_upper.json")"
+assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "X-Drop-Pubkey: $R1_ADMIN_PK" -H "X-Drop-Timestamp: $ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig" --data-binary "@$TMP_DIR/s07_del_upper.json" "${R1_URL}/sync.php?lock_delegate")" "400" "SYNC-S07-06: uppercase admin_pub on PUT ?lock_delegate returns 400"
+
+# Rev-2 manifest with issued_at_ms=0 must be rejected with 400 on finalize
+php -r '
+  $m = json_decode(file_get_contents($argv[1]), true);
+  $m["issued_at_ms"] = 0;
+  file_put_contents($argv[2], json_encode(["action" => "finalize", "anchor_id" => $argv[3], "new_manifest" => $m]));
+' "${R1_DOC}/humoco_sync_data/anchors/${ROT_ANCHOR_HEX}.bin" "$TMP_DIR/s07_bad_ts_fin.json" "$ROT_ANCHOR_HEX"
+assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' --data-binary "@$TMP_DIR/s07_bad_ts_fin.json" "${R1_URL}/sync.php?lock_commit")" "400" "SYNC-S07-06: Rev-2+ finalize with issued_at_ms=0 returns 400"
 
 echo ""
 echo "All PHP lock concurrency, rollback, quota & GC tests passed! (${PASS} assertions)"

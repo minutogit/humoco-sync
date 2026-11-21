@@ -48,23 +48,29 @@ function lock_encode_server_list(array $list, int $gCount): ?string {
 
 function lock_proposal_digest(array $prop): ?string {
     $aid = lock_hex_bytes($prop['anchor_id'] ?? null, 32);
-    if ($aid === null || !is_int($prop['from_rev'] ?? null) || !is_int($prop['to_rev'] ?? null) || !is_int($prop['new_threshold'] ?? null)
-        || !is_int($prop['retain_until_quarter'] ?? null) || !is_int($prop['proposed_at'] ?? null) || $prop['proposed_at'] <= 0) return null;
+    $fromRev = $prop['from_rev'] ?? null; $toRev = $prop['to_rev'] ?? null;
+    $newThr = $prop['new_threshold'] ?? null; $retQ = $prop['retain_until_quarter'] ?? null;
+    $propAt = $prop['proposed_at'] ?? null;
+    if ($aid === null || !is_int($fromRev) || $fromRev < 1 || !is_int($toRev) || $toRev < 2
+        || !is_int($newThr) || $newThr < 1 || $newThr > 5
+        || !is_int($retQ) || $retQ < 0 || $retQ > 65535
+        || !is_int($propAt) || $propAt <= 0) return null;
     $init = $prop['initiator'] ?? null;
+    if (!is_array($init)) return null;
     $k = $init['kind'] ?? null;
     if ($k === 'creator') $initBytes = "\x00";
-    elseif ($k === 'guarantor' && is_int($init['guarantor_index'] ?? null)) $initBytes = "\x01" . chr($init['guarantor_index']);
+    elseif ($k === 'guarantor' && is_int($init['guarantor_index'] ?? null) && $init['guarantor_index'] >= 0 && $init['guarantor_index'] <= 255) $initBytes = "\x01" . chr($init['guarantor_index']);
     elseif ($k === 'holder_standby') $initBytes = "\x02";
     else return null;
-    $srvs = $prop['new_servers'] ?? [];
-    $succs = $prop['new_successors'] ?? [];
-    if (!is_array($srvs) || !is_array($succs) || count($srvs) > 5) return null;
+    $srvs = $prop['new_servers'] ?? null;
+    $succs = $prop['new_successors'] ?? null;
+    if (!is_array($srvs) || !is_array($succs) || !array_is_list($srvs) || !array_is_list($succs) || count($srvs) > 5 || count($succs) > 65535) return null;
     $sBin = '';
-    foreach ($srvs as $s) { $e = lock_encode_server($s, 32); if ($e === null) return null; $sBin .= $e; }
+    foreach ($srvs as $s) { $e = is_array($s) ? lock_encode_server($s, 32) : null; if ($e === null) return null; $sBin .= $e; }
     $suBin = '';
-    foreach ($succs as $s) { $e = lock_encode_server($s, 32); if ($e === null) return null; $suBin .= $e; }
-    $pre = 'HUMOCO_MIGRATION_PROP_V1' . $aid . pack('P', $prop['from_rev']) . pack('P', $prop['to_rev']) . chr($prop['new_threshold'])
-        . chr(count($srvs)) . $sBin . pack('v', count($succs)) . $suBin . pack('v', $prop['retain_until_quarter']) . pack('P', $prop['proposed_at']) . $initBytes;
+    foreach ($succs as $s) { $e = is_array($s) ? lock_encode_server($s, 32) : null; if ($e === null) return null; $suBin .= $e; }
+    $pre = 'HUMOCO_MIGRATION_PROP_V1' . $aid . pack('P', $fromRev) . pack('P', $toRev) . chr($newThr)
+        . chr(count($srvs)) . $sBin . pack('v', count($succs)) . $suBin . pack('v', $retQ) . pack('P', $propAt) . $initBytes;
     return hash('sha256', $pre, true);
 }
 
@@ -88,19 +94,25 @@ function lock_check_role_nomination(mixed $role, array $prev, array $prop): bool
 }
 
 function lock_verify_proposal(array $prop, string $anchor32, array $prev): bool {
-    if (($prop['anchor_id'] ?? '') !== bin2hex($anchor32) || ($prop['from_rev'] ?? 0) !== ($prev['revision'] ?? 0)
-        || ($prop['to_rev'] ?? 0) !== ($prev['revision'] ?? 0) + 1 || ($prop['retain_until_quarter'] ?? -1) !== ($prev['retain_until_quarter'] ?? -2)) return false;
-    $gPubs = $prev['authority']['guarantor_mig_pubs'] ?? [];
+    if (($prop['anchor_id'] ?? '') !== bin2hex($anchor32)
+        || !is_int($prop['from_rev'] ?? null) || $prop['from_rev'] !== ($prev['revision'] ?? 0)
+        || !is_int($prop['to_rev'] ?? null) || $prop['to_rev'] !== ($prev['revision'] ?? 0) + 1
+        || !is_int($prop['retain_until_quarter'] ?? null) || $prop['retain_until_quarter'] !== ($prev['retain_until_quarter'] ?? -2)
+        || !is_int($prop['new_threshold'] ?? null)) return false;
+    $auth = $prev['authority'] ?? null;
+    $gPubs = is_array($auth) ? ($auth['guarantor_mig_pubs'] ?? null) : null;
+    if (!is_array($gPubs)) return false;
     $gCnt = count($gPubs);
-    $newSrvs = $prop['new_servers'] ?? [];
-    $newSucc = $prop['new_successors'] ?? [];
-    $comm = lock_validate_committee($newSrvs, (int)($prop['new_threshold'] ?? 0));
+    $newSrvs = $prop['new_servers'] ?? null;
+    $newSucc = $prop['new_successors'] ?? null;
+    if (!is_array($newSrvs) || !is_array($newSucc) || !array_is_list($newSrvs) || !array_is_list($newSucc)) return false;
+    $comm = lock_validate_committee($newSrvs, $prop['new_threshold']);
     if ($comm === null) return false;
     $activeMap = array_flip($comm['members']);
     $succMap = [];
-    foreach ($newSrvs as $s) { if (lock_encode_server($s, $gCnt) === null) return false; }
+    foreach ($newSrvs as $s) { if (!is_array($s) || lock_encode_server($s, $gCnt) === null) return false; }
     foreach ($newSucc as $s) {
-        if (lock_encode_server($s, $gCnt) === null || isset($activeMap[$s['lock_pub']]) || isset($succMap[$s['lock_pub']])) return false;
+        if (!is_array($s) || lock_encode_server($s, $gCnt) === null || isset($activeMap[$s['lock_pub']]) || isset($succMap[$s['lock_pub']])) return false;
         $succMap[$s['lock_pub']] = true;
     }
     $digest = lock_proposal_digest($prop);
@@ -108,7 +120,7 @@ function lock_verify_proposal(array $prop, string $anchor32, array $prev): bool 
     $init = $prop['initiator'];
     $pSigHex = $prop['proposer_sig'] ?? null;
     $cosigs = $prop['guarantor_cosigs'] ?? [];
-    if (!is_array($cosigs)) return false;
+    if (!is_array($cosigs) || !array_is_list($cosigs)) return false;
     $signedG = [];
     $seenCosig = [];
     if ($init['kind'] === 'creator') {
@@ -138,6 +150,7 @@ function lock_verify_proposal(array $prop, string $anchor32, array $prev): bool 
         return lock_encode_server_list($newSucc, $gCnt) === lock_encode_server_list($pool, $gCnt);
     }
     foreach ($cosigs as $cs) {
+        if (!is_array($cs)) return false;
         $gi = $cs['guarantor_index'] ?? -1;
         $sig = lock_hex_bytes($cs['sig'] ?? null, 64);
         $gpk = (is_int($gi) && isset($gPubs[$gi])) ? lock_hex_bytes($gPubs[$gi], 32) : null;
@@ -161,13 +174,14 @@ function lock_verify_proposal(array $prop, string $anchor32, array $prev): bool 
 }
 
 function lock_verify_import_acks(array $acks, array $newComm, string $a32, string $pHash32, int $toRev, string $ish32, int $q): bool {
-    if (count($acks) !== count($newComm['members'])) return false;
+    if (!array_is_list($acks) || count($acks) !== count($newComm['members'])) return false;
     $aHex = bin2hex($a32);
     $pHashHex = bin2hex($pHash32);
     $ishHex = bin2hex($ish32);
     $newSet = array_flip($newComm['members']);
     $seen = [];
     foreach ($acks as $ack) {
+        if (!is_array($ack)) return false;
         $lph = $ack['lock_pub'] ?? '';
         $lp = lock_hex_bytes($lph, 32);
         $sig = lock_hex_bytes($ack['sig'] ?? null, 64);
@@ -185,29 +199,44 @@ function lock_verify_import_acks(array $acks, array $newComm, string $a32, strin
 function lock_verify_manifest_chain(array $m, string $expectedAnchor32): ?array {
     $rev = $m['revision'] ?? 0;
     $chain = $m['migration_chain'] ?? null;
-    if (!is_int($rev) || $rev < 1 || !is_array($chain) || count($chain) > LOCK_MAX_CHAIN_LEN) return null;
+    $thr = $m['threshold'] ?? null;
+    $issMs = $m['issued_at_ms'] ?? null;
+    $retQ = $m['retain_until_quarter'] ?? null;
+    $mSrvs = $m['servers'] ?? null;
+    $mSuccs = $m['successors'] ?? null;
+    $mAuth = $m['authority'] ?? null;
+    if (!is_int($rev) || $rev < 1 || !is_int($thr) || !is_int($issMs) || $issMs <= 0
+        || !is_int($retQ) || lock_decode_quarter($retQ) === null
+        || !is_array($mSrvs) || !is_array($mSuccs) || !array_is_list($mSrvs) || !array_is_list($mSuccs)
+        || !is_array($mAuth) || !is_array($mAuth['guarantor_mig_pubs'] ?? null) || !array_is_list($mAuth['guarantor_mig_pubs'])
+        || !is_array($chain) || !array_is_list($chain) || count($chain) > LOCK_MAX_CHAIN_LEN) return null;
     if ($rev === 1) {
         if (!empty($chain) || lock_rev1_anchor_id($m) !== $expectedAnchor32) return null;
-        return [lock_validate_committee($m['servers'], (int)$m['threshold'])];
+        return [lock_validate_committee($mSrvs, $thr)];
     }
-    if (count($chain) !== $rev - 1) return null;
+    if (count($chain) !== $rev - 1 || !is_array($chain[0])) return null;
     $gen = $chain[0]['genesis_manifest'] ?? null;
     if (!is_array($gen) || lock_rev1_anchor_id($gen) !== $expectedAnchor32) return null;
     $comms = [lock_validate_committee($gen['servers'], (int)$gen['threshold'])];
     $cur = $gen;
     foreach ($chain as $idx => $cert) {
+        if (!is_array($cert)) return null;
         if ($idx > 0 && ($cert['genesis_manifest'] ?? null) !== null) return null;
         $prop = $cert['proposal'] ?? null;
         $ish = lock_hex_bytes($cert['imported_state_hash'] ?? null, 32);
-        if (!is_array($prop) || $ish === null || ($cert['anchor_id'] ?? '') !== bin2hex($expectedAnchor32) || !lock_verify_proposal($prop, $expectedAnchor32, $cur)) return null;
+        $impAcks = $cert['import_acks'] ?? null;
+        $commitSigs = $cert['commit_sigs'] ?? null;
+        if (!is_array($prop) || $ish === null || !is_array($impAcks) || !is_array($commitSigs)
+            || ($cert['anchor_id'] ?? '') !== bin2hex($expectedAnchor32) || !lock_verify_proposal($prop, $expectedAnchor32, $cur)) return null;
         $pHash = lock_proposal_digest($prop);
         $newC = lock_validate_committee($prop['new_servers'], (int)$prop['new_threshold']);
-        if ($newC === null || !lock_verify_import_acks($cert['import_acks'] ?? [], $newC, $expectedAnchor32, $pHash, (int)$prop['to_rev'], $ish, (int)$prop['retain_until_quarter'])) return null;
+        if ($newC === null || !lock_verify_import_acks($impAcks, $newC, $expectedAnchor32, $pHash, (int)$prop['to_rev'], $ish, (int)$prop['retain_until_quarter'])) return null;
         $prevC = $comms[count($comms) - 1];
         $prevSet = array_flip($prevC['members']);
         $cDig = hash('sha256', 'HUMOCO_MIGRATION_CERT_V1' . $expectedAnchor32 . $pHash . pack('P', $prop['to_rev']) . $ish, true);
         $cSeen = [];
-        foreach (($cert['commit_sigs'] ?? []) as $cs) {
+        foreach ($commitSigs as $cs) {
+            if (!is_array($cs)) return null;
             $lp = lock_hex_bytes($cs['lock_pub'] ?? null, 32);
             $sig = lock_hex_bytes($cs['sig'] ?? null, 64);
             if ($lp === null || $sig === null || !isset($prevSet[$cs['lock_pub']]) || isset($cSeen[$cs['lock_pub']]) || !is_int($cs['committed_at'] ?? null) || $cs['committed_at'] <= 0 || !lock_verify_sig($lp, $sig, $cDig)) return null;
@@ -217,12 +246,13 @@ function lock_verify_manifest_chain(array $m, string $expectedAnchor32): ?array 
         $cur = ['revision' => $prop['to_rev'], 'threshold' => $prop['new_threshold'], 'servers' => $prop['new_servers'], 'successors' => $prop['new_successors'], 'authority' => $cur['authority'], 'issued_at_ms' => $prop['proposed_at'] * 1000, 'retain_until_quarter' => $cur['retain_until_quarter']];
         $comms[] = $newC;
     }
-    $gCnt = count($m['authority']['guarantor_mig_pubs'] ?? []);
-    if ($cur['revision'] !== $rev || $cur['threshold'] !== $m['threshold'] || lock_encode_server_list($cur['servers'], $gCnt) !== lock_encode_server_list($m['servers'], $gCnt)
-        || lock_encode_server_list($cur['successors'], $gCnt) !== lock_encode_server_list($m['successors'], $gCnt)
-        || ($cur['authority']['creator_mig_pub'] ?? '') !== ($m['authority']['creator_mig_pub'] ?? '')
-        || ($cur['authority']['guarantor_mig_pubs'] ?? []) !== ($m['authority']['guarantor_mig_pubs'] ?? [])
-        || $cur['retain_until_quarter'] !== $m['retain_until_quarter']) return null;
+    $gCnt = count($mAuth['guarantor_mig_pubs']);
+    if ($cur['revision'] !== $rev || $cur['threshold'] !== $thr || lock_validate_committee($mSrvs, $thr) === null
+        || lock_encode_server_list($cur['servers'], $gCnt) !== lock_encode_server_list($mSrvs, $gCnt)
+        || lock_encode_server_list($cur['successors'], $gCnt) !== lock_encode_server_list($mSuccs, $gCnt)
+        || ($cur['authority']['creator_mig_pub'] ?? '') !== ($mAuth['creator_mig_pub'] ?? '')
+        || ($cur['authority']['guarantor_mig_pubs'] ?? []) !== $mAuth['guarantor_mig_pubs']
+        || $cur['retain_until_quarter'] !== $retQ) return null;
     return $comms;
 }
 
@@ -281,13 +311,19 @@ function lock_export_snapshot(array $keys, array $p, array $b, string $bucketHex
     ];
 }
 
-function lock_bootstrap_anchor(array $cfg, array $keys, array $p, string $aHex, string $bHex, ?array $m, int $now): array {
+function lock_restore_non_proposal_freeze_state(array $r): string|array {
+    $sf = $r['self_frozen_origin'] ?? null;
+    return is_array($sf) ? ['self_frozen' => $sf] : 'active';
+}
+
+function lock_bootstrap_anchor(array $cfg, array $keys, array $p, string $aHex, string $bHex, mixed $m, int $now): array {
+    if ($m !== null && !is_array($m)) lock_fail(400, 'Invalid current_manifest');
     $bFile = $p['meta'] . "/buckets/{$bHex}.json";
     $rFile = $p['meta'] . "/rotations/{$aHex}.json";
     $b = lock_read_json($bFile);
     $r = lock_read_json($rFile);
     if ($b !== null && $r !== null) {
-        if (lock_auto_expire_pre_freeze($b, $now)) lock_atomic_write($bFile, json_encode($b, JSON_UNESCAPED_SLASHES));
+        if (lock_auto_expire_pre_freeze($b, $now)) lock_write_json($bFile, $b);
         return [$b, $r];
     }
     if (!is_array($m)) lock_fail(404, 'Anchor bucket not initialized on this server');
@@ -299,13 +335,13 @@ function lock_bootstrap_anchor(array $cfg, array $keys, array $p, string $aHex, 
     if ($b === null) {
         if (lock_used_inodes_get($p) >= $cfg['max_inodes']) lock_fail(507, 'Lock inode budget exhausted');
         $b = ['anchor_id' => $aHex, 'retain_until_quarter' => $q, 'creator_mig_pub' => $m['authority']['creator_mig_pub'], 'write_seq' => 0, 'bucket_head' => hash('sha256', 'HUMOCO_BUCKET_INIT_V1' . hex2bin($bHex) . pack('v', $q)), 'freeze_state' => 'active', 'slots' => [], 'conflicts' => [], 'output_claims' => []];
-        lock_atomic_write($bFile, json_encode($b, JSON_UNESCAPED_SLASHES));
+        lock_write_json($bFile, $b);
     }
     if ($r === null) {
         $r = ['active_manifest' => $m, 'last_creator_activity_secs' => min($now, intdiv((int)$m['issued_at_ms'], 1000)), 'voted_proposals_by_rev' => [], 'vetoed_proposal_hashes' => [], 'imported_proposal' => null];
-        lock_atomic_write($rFile, json_encode($r, JSON_UNESCAPED_SLASHES));
+        lock_write_json($rFile, $r);
     }
-    if (!file_exists($p['anchors'] . "/{$aHex}.bin")) lock_atomic_write($p['anchors'] . "/{$aHex}.bin", json_encode($m, JSON_UNESCAPED_SLASHES));
+    if (!file_exists($p['anchors'] . "/{$aHex}.bin")) lock_write_json($p['anchors'] . "/{$aHex}.bin", $m);
     return [$b, $r];
 }
 
@@ -331,16 +367,18 @@ function lock_handle_freeze(string $method, array $cfg, array $keys, string $dat
     lock_check_revoked($dataDir);
     $p = lock_paths($dataDir);
     if ($method === 'GET') {
-        $aHex = (string)($_GET['anchor_id'] ?? '');
-        if (lock_hex_bytes($aHex, 32) === null) lock_fail(400, 'Invalid anchor_id hex');
+        $aHex = $_GET['anchor_id'] ?? null;
+        if (!is_string($aHex) || lock_hex_bytes($aHex, 32) === null) lock_fail(400, 'Invalid anchor_id hex');
         lock_ok(200, lock_freeze_status($keys, $p, $aHex, $now));
     }
-    $req = json_decode((string)file_get_contents('php://input'), true);
+    $rawBody = lock_read_bounded_body(262144, 'Lock freeze payload too large');
+    $req = json_decode($rawBody, true);
+    if (!is_array($req)) lock_fail(400, 'Invalid lock_freeze JSON');
     $act = $req['action'] ?? null;
-    if (!is_array($req) || !is_string($act)) lock_fail(400, 'Invalid lock_freeze JSON');
+    if (!is_string($act)) lock_fail(400, 'Invalid lock_freeze JSON');
     if ($act === 'fetch_snapshot') {
-        $aHex = (string)($req['anchor_id'] ?? '');
-        if (lock_hex_bytes($aHex, 32) === null) lock_fail(400, 'Invalid anchor_id hex');
+        $aHex = $req['anchor_id'] ?? null;
+        if (!is_string($aHex) || lock_hex_bytes($aHex, 32) === null) lock_fail(400, 'Invalid anchor_id hex');
         lock_ok(200, lock_freeze_status($keys, $p, $aHex, $now));
     }
     if ($act === 'pre_freeze') {
@@ -360,23 +398,24 @@ function lock_handle_freeze(string $method, array $cfg, array $keys, string $dat
             }
             $exp = $now + $cfg['pre_freeze_ttl_secs'];
             $b['freeze_state'] = ['pre_proposal' => ['frozen_at' => $now, 'expires_at' => $exp]];
-            lock_atomic_write($p['meta'] . "/buckets/{$bHex}.json", json_encode($b, JSON_UNESCAPED_SLASHES));
+            lock_write_json($p['meta'] . "/buckets/{$bHex}.json", $b);
             return ['status' => 'pre_frozen', 'expires_at' => $exp, 'snapshot_export' => lock_export_snapshot($keys, $p, $b, $bHex, $rev, false, null, $now, $exp)];
         });
         lock_ok(200, $res);
     }
     if ($act === 'heartbeat') {
         $hb = $req['heartbeat'] ?? null;
-        $a32 = is_array($hb) ? lock_hex_bytes($hb['anchor_id'] ?? null, 32) : null;
-        $ts = $hb['timestamp_secs'] ?? null; $sig = is_array($hb) ? lock_hex_bytes($hb['sig'] ?? null, 64) : null;
+        if (!is_array($hb)) lock_fail(400, 'Invalid CreatorHeartbeat');
+        $a32 = lock_hex_bytes($hb['anchor_id'] ?? null, 32);
+        $ts = $hb['timestamp_secs'] ?? null; $sig = lock_hex_bytes($hb['sig'] ?? null, 64);
         if ($a32 === null || !is_int($ts) || $ts <= 0 || $sig === null) lock_fail(400, 'Invalid CreatorHeartbeat');
-        if ($ts > $now + 60) lock_fail(400, 'Heartbeat timestamp is in the future');
+        if ($ts > ($now + 60)) lock_fail(400, 'Heartbeat timestamp is in the future');
         $aHex = $hb['anchor_id']; $bHex = hash('sha256', 'HUMOCO_SYNC_BUCKET_V1' . $a32 . $keys['pk32']);
         $actSecs = lock_with_lock($p['meta'] . "/buckets/{$bHex}.lockdir", static function () use ($cfg, $keys, $p, $a32, $aHex, $bHex, $ts, $sig, $req, $now): int {
             [, $r] = lock_bootstrap_anchor($cfg, $keys, $p, $aHex, $bHex, $req['current_manifest'] ?? null, $now);
             if (!lock_verify_sig(hex2bin($r['active_manifest']['authority']['creator_mig_pub']), $sig, hash('sha256', 'HUMOCO_CREATOR_HB_V1' . $a32 . pack('P', $ts), true))) lock_fail(401, 'Invalid CreatorHeartbeat signature');
             $r['last_creator_activity_secs'] = max((int)$r['last_creator_activity_secs'], $ts);
-            lock_atomic_write($p['meta'] . "/rotations/{$aHex}.json", json_encode($r, JSON_UNESCAPED_SLASHES));
+            lock_write_json($p['meta'] . "/rotations/{$aHex}.json", $r);
             return (int)$r['last_creator_activity_secs'];
         });
         lock_ok(200, ['status' => 'heartbeat_recorded', 'last_creator_activity_secs' => $actSecs]);
@@ -391,6 +430,7 @@ function lock_handle_freeze(string $method, array $cfg, array $keys, string $dat
             [$b, $r] = lock_bootstrap_anchor($cfg, $keys, $p, $aHex, $bHex, $req['current_manifest'] ?? null, $now);
             if (is_array($b['freeze_state']) && isset($b['freeze_state']['epoch_frozen'])) lock_fail(409, 'epoch_frozen');
             if (in_array($pHashHex, $r['vetoed_proposal_hashes'] ?? [], true)) lock_fail(409, 'Proposal was previously vetoed');
+            if ((int)$prop['from_rev'] !== (int)$r['active_manifest']['revision']) lock_fail(409, 'Manifest revision mismatch');
             $revKey = (string)$prop['from_rev'];
             if (isset($r['voted_proposals_by_rev'][$revKey])) {
                 $vp = $r['voted_proposals_by_rev'][$revKey];
@@ -404,9 +444,10 @@ function lock_handle_freeze(string $method, array $cfg, array $keys, string $dat
             if ($prop['initiator']['kind'] === 'creator') $r['last_creator_activity_secs'] = max((int)$r['last_creator_activity_secs'], $now);
             $effAt = $now + lock_effective_timelock_secs($cfg, $r['active_manifest'], $prop);
             $r['voted_proposals_by_rev'][$revKey] = ['proposal' => $prop, 'proposal_hash' => $pHashHex, 'accepted_at' => $now, 'effective_at' => $effAt];
+            if (is_array($b['freeze_state']) && isset($b['freeze_state']['self_frozen'])) $r['self_frozen_origin'] = $b['freeze_state']['self_frozen'];
             $b['freeze_state'] = ['permanent_proposal' => ['from_rev' => (int)$prop['from_rev'], 'proposal_hash' => $pHashHex, 'frozen_at' => $now, 'effective_at' => $effAt]];
-            lock_atomic_write($p['meta'] . "/buckets/{$bHex}.json", json_encode($b, JSON_UNESCAPED_SLASHES));
-            lock_atomic_write($p['meta'] . "/rotations/{$aHex}.json", json_encode($r, JSON_UNESCAPED_SLASHES));
+            lock_write_json($p['meta'] . "/buckets/{$bHex}.json", $b);
+            lock_write_json($p['meta'] . "/rotations/{$aHex}.json", $r);
             return ['status' => 'proposed', 'proposal_hash' => $pHashHex, 'effective_at' => $effAt, 'snapshot_export' => lock_export_snapshot($keys, $p, $b, $bHex, (int)$prop['from_rev'], true, $pHash32, $now, null)];
         });
         lock_ok(200, $res);
@@ -423,6 +464,8 @@ function lock_handle_freeze(string $method, array $cfg, array $keys, string $dat
         lock_with_lock($p['meta'] . "/buckets/{$bHex}.lockdir", static function () use ($p, $v, $a32, $aHex, $bHex, $ph32, $vp32, $sig, $now): void {
             $b = lock_read_json($p['meta'] . "/buckets/{$bHex}.json"); $r = lock_read_json($p['meta'] . "/rotations/{$aHex}.json");
             if ($b === null || $r === null) lock_fail(404, 'Anchor rotation record not found');
+            if (is_array($b['freeze_state']) && isset($b['freeze_state']['epoch_frozen'])) lock_fail(409, 'epoch_frozen');
+            if ((int)$v['from_rev'] !== (int)$r['active_manifest']['revision']) lock_fail(409, 'Manifest revision mismatch');
             $revKey = (string)$v['from_rev']; $vp = $r['voted_proposals_by_rev'][$revKey] ?? null;
             if ($vp === null) lock_fail(404, 'No pending proposal in this revision');
             if ($vp['proposal_hash'] !== $v['proposal_hash']) lock_fail(409, 'Veto proposal_hash mismatch');
@@ -436,9 +479,9 @@ function lock_handle_freeze(string $method, array $cfg, array $keys, string $dat
             if ($isC) $r['last_creator_activity_secs'] = max((int)$r['last_creator_activity_secs'], $now);
             unset($r['voted_proposals_by_rev'][$revKey]);
             if (!in_array($v['proposal_hash'], $r['vetoed_proposal_hashes'] ?? [], true)) $r['vetoed_proposal_hashes'][] = $v['proposal_hash'];
-            if (is_array($b['freeze_state']) && isset($b['freeze_state']['permanent_proposal'])) $b['freeze_state'] = 'active';
-            lock_atomic_write($p['meta'] . "/buckets/{$bHex}.json", json_encode($b, JSON_UNESCAPED_SLASHES));
-            lock_atomic_write($p['meta'] . "/rotations/{$aHex}.json", json_encode($r, JSON_UNESCAPED_SLASHES));
+            if (is_array($b['freeze_state']) && isset($b['freeze_state']['permanent_proposal'])) $b['freeze_state'] = lock_restore_non_proposal_freeze_state($r);
+            lock_write_json($p['meta'] . "/buckets/{$bHex}.json", $b);
+            lock_write_json($p['meta'] . "/rotations/{$aHex}.json", $r);
         });
         lock_ok(200, ['status' => 'vetoed', 'proposal_hash' => $v['proposal_hash']]);
     }
@@ -448,27 +491,35 @@ function lock_handle_freeze(string $method, array $cfg, array $keys, string $dat
 function lock_handle_import(array $cfg, array $keys, string $dataDir, int $now): never {
     lock_check_revoked($dataDir);
     $p = lock_paths($dataDir);
-    $req = json_decode((string)file_get_contents('php://input'), true);
+    $rawBody = lock_read_bounded_body(8388608, 'Lock import payload too large');
+    $req = json_decode($rawBody, true);
     $a32 = is_array($req) ? lock_hex_bytes($req['anchor_id'] ?? null, 32) : null;
-    $m = $req['active_manifest'] ?? null; $prop = $req['proposal'] ?? null;
-    if ($a32 === null || !is_array($m) || !is_array($prop) || !is_array($req['snapshots'] ?? null) || !is_array($req['quorum_certificates'] ?? null)) lock_fail(400, 'Invalid lock_import JSON');
+    $m = is_array($req) ? ($req['active_manifest'] ?? null) : null;
+    $prop = is_array($req) ? ($req['proposal'] ?? null) : null;
+    $snaps = is_array($req) ? ($req['snapshots'] ?? null) : null;
+    $qcs = is_array($req) ? ($req['quorum_certificates'] ?? null) : null;
+    if ($a32 === null || !is_array($m) || !is_array($prop) || !is_array($snaps) || !is_array($qcs) || !array_is_list($snaps) || !array_is_list($qcs)) lock_fail(400, 'Invalid lock_import JSON');
     $histComms = lock_verify_manifest_chain($m, $a32) ?? lock_fail(400, 'Invalid active_manifest chain');
     if (!lock_verify_proposal($prop, $a32, $m)) lock_fail(400, 'Invalid MigrationProposal');
     $newC = lock_validate_committee($prop['new_servers'], (int)$prop['new_threshold']);
     if ($newC === null || !in_array($keys['pkHex'], $newC['members'], true)) lock_fail(400, 'Target server lock_pub is not in proposal.new_servers');
     if ((int)$prop['retain_until_quarter'] > $cfg['max_retention_quarter']) lock_fail(422, 'Proposal retain_until_quarter exceeds server max_retention_quarter');
     $timelockSecs = lock_effective_timelock_secs($cfg, $m, $prop);
-    if ($now < ((int)$prop['proposed_at'] + $timelockSecs)) lock_fail(409, 'Proposal 72h timelock has not elapsed yet');
+    if ((int)$prop['proposed_at'] > ($now - $timelockSecs)) lock_fail(409, 'Proposal 72h timelock has not elapsed yet');
 
-    $oldC = $histComms[count($histComms) - 1]; $snaps = $req['snapshots'];
+    $oldC = $histComms[count($histComms) - 1];
     if (count($snaps) < $oldC['threshold']) lock_fail(400, 'Fewer than Q_old freeze snapshots supplied');
     $pHash32 = lock_proposal_digest($prop); $pHashHex = bin2hex($pHash32);
     $seenSrv = []; $matured = 0; $candBySlot = [];
 
     foreach ($snaps as $exp) {
+        if (!is_array($exp)) lock_fail(400, 'Invalid FreezeSnapshot');
         $sn = $exp['snapshot'] ?? null;
         if (!is_array($sn) || ($sn['anchor_id'] ?? '') !== $req['anchor_id'] || ($sn['from_rev'] ?? 0) !== $m['revision']
-            || ($sn['retain_until_quarter'] ?? -1) !== $m['retain_until_quarter'] || empty($sn['permanent'])
+            || ($sn['retain_until_quarter'] ?? -1) !== $m['retain_until_quarter']
+            || ($sn['permanent'] ?? null) !== true || ($sn['expires_at'] ?? null) !== null
+            || !is_int($sn['write_seq'] ?? null) || $sn['write_seq'] < 0
+            || !is_int($sn['frozen_at'] ?? null) || $sn['frozen_at'] <= 0
             || ($sn['proposal_hash'] ?? '') !== $pHashHex || !in_array($sn['lock_pub'] ?? '', $oldC['members'], true) || isset($seenSrv[$sn['lock_pub']])) lock_fail(400, 'Invalid or duplicate FreezeSnapshot');
         $seenSrv[$sn['lock_pub']] = true;
         $slp = hex2bin($sn['lock_pub']); $sbk = lock_hex_bytes($sn['bucket'] ?? null, 32);
@@ -476,13 +527,16 @@ function lock_handle_import(array $cfg, array $keys, string $dataDir, int $now):
         if ($sbk === null || $sbk !== hash('sha256', 'HUMOCO_SYNC_BUCKET_V1' . $a32 . $slp, true) || $sbh === null || $ssh === null || $ssig === null) lock_fail(400, 'Invalid FreezeSnapshot fields');
         $sPre = 'HUMOCO_FREEZE_SNAP_V1' . $a32 . $sbk . pack('P', $sn['from_rev']) . pack('v', $sn['retain_until_quarter']) . pack('P', $sn['write_seq']) . $sbh . $ssh . "\x01\x01" . $pHash32 . pack('P', $sn['frozen_at']) . pack('P', 0) . $slp;
         if (!lock_verify_sig($slp, $ssig, hash('sha256', $sPre, true))) lock_fail(400, 'Invalid FreezeSnapshot signature');
-        if ($now >= ((int)$sn['frozen_at'] + $timelockSecs)) $matured++;
+        if ((int)$sn['frozen_at'] <= ($now - $timelockSecs)) $matured++;
 
+        $expEntries = $exp['entries'] ?? []; $expConflicts = $exp['conflicts'] ?? [];
+        if (!is_array($expEntries) || !is_array($expConflicts)) lock_fail(400, 'Invalid FreezeSnapshot entry lists');
         $parsedE = []; $parsedC = [];
-        foreach (($exp['entries'] ?? []) as $h) { $e = lock_parse_entry($h) ?? lock_fail(400, 'Corrupted snapshot entry'); $parsedE[] = $e; $candBySlot[$e['slot']][$e['entryHash']] = $e; }
-        foreach (($exp['conflicts'] ?? []) as $grp) {
+        foreach ($expEntries as $h) { $e = is_string($h) ? lock_parse_entry($h) : null; if ($e === null) lock_fail(400, 'Corrupted snapshot entry'); $parsedE[] = $e; $candBySlot[$e['slot']][$e['entryHash']] = $e; }
+        foreach ($expConflicts as $grp) {
+            if (!is_array($grp)) lock_fail(400, 'Corrupted snapshot conflict group');
             $pg = [];
-            foreach ($grp as $h) { $e = lock_parse_entry($h) ?? lock_fail(400, 'Corrupted conflict entry'); $pg[] = $e; $candBySlot[$e['slot']][$e['entryHash']] = $e; }
+            foreach ($grp as $h) { $e = is_string($h) ? lock_parse_entry($h) : null; if ($e === null) lock_fail(400, 'Corrupted conflict entry'); $pg[] = $e; $candBySlot[$e['slot']][$e['entryHash']] = $e; }
             $parsedC[] = $pg;
         }
         if (lock_freeze_state_hash($a32, (int)$sn['from_rev'], $parsedE, $parsedC) !== $ssh) lock_fail(400, 'FreezeSnapshot state_hash mismatch');
@@ -514,12 +568,14 @@ function lock_handle_import(array $cfg, array $keys, string $dataDir, int $now):
         $outClaims[$k] = $sH;
     };
     $qcMatchesComm = static function (array $qc, array $e, array $comm, string $a32, int $q): bool {
-        $rs = $qc['receipts'] ?? []; if (count($rs) < $comm['threshold']) return false;
+        $qcSlot = $qc['slot'] ?? null; $qcCl = $qc['child_lock'] ?? null; $rs = $qc['receipts'] ?? null;
+        if (!is_string($qcSlot) || !is_string($qcCl) || !is_array($rs) || count($rs) < $comm['threshold']) return false;
         $memSet = array_flip($comm['members']); $seen = []; $ehHex = bin2hex($e['entryHash']);
         foreach ($rs as $r) {
+            if (!is_array($r)) return false;
             $lph = $r['lock_pub'] ?? ''; $lp = lock_hex_bytes($lph, 32);
             if ($lp === null || !isset($memSet[$lph]) || isset($seen[$lph]) || ($r['kind'] ?? '') !== 'first_write'
-                || ($r['slot'] ?? '') !== $qc['slot'] || ($r['child_lock'] ?? '') !== $qc['child_lock'] || ($r['entry_hash'] ?? '') !== $ehHex
+                || ($r['slot'] ?? '') !== $qcSlot || ($r['child_lock'] ?? '') !== $qcCl || ($r['entry_hash'] ?? '') !== $ehHex
                 || ($r['retain_until_quarter'] ?? -1) !== $q || !lock_verify_receipt($r, $lp, hash('sha256', 'HUMOCO_SYNC_BUCKET_V1' . $a32 . $lp, true))) return false;
             $seen[$lph] = true;
         }
@@ -533,6 +589,7 @@ function lock_handle_import(array $cfg, array $keys, string $dataDir, int $now):
         foreach ($list as $e) {
             $clHex = bin2hex($e['childLock']);
             foreach ($qcs as $qc) {
+                if (!is_array($qc)) lock_fail(400, 'Invalid QuorumCertificate');
                 if (($qc['slot'] ?? '') !== $slotHex || ($qc['child_lock'] ?? '') !== $clHex) continue;
                 foreach ($histComms as $hc) { if ($qcMatchesComm($qc, $e, $hc, $a32, $q)) { $winner = $e; break 3; } }
             }
@@ -552,7 +609,9 @@ function lock_handle_import(array $cfg, array $keys, string $dataDir, int $now):
 
     $ackedAt = lock_with_lock($p['meta'] . "/buckets/{$bHex}.lockdir", static function () use ($cfg, $keys, $p, $m, $prop, $a32, $b32, $aHex, $bHex, $pHashHex, $impHashHex, $q, $qStr, $slotsResolved, $outClaims, $now): int {
         $bFile = $p['meta'] . "/buckets/{$bHex}.json"; $rFile = $p['meta'] . "/rotations/{$aHex}.json";
-        $r = lock_read_json($rFile) ?? ['active_manifest' => $m, 'last_creator_activity_secs' => min($now, intdiv((int)$m['issued_at_ms'], 1000)), 'voted_proposals_by_rev' => [], 'vetoed_proposal_hashes' => [], 'imported_proposal' => null];
+        $existingR = lock_read_json($rFile);
+        if ($existingR !== null && (int)$prop['to_rev'] <= (int)$existingR['active_manifest']['revision']) lock_fail(409, 'Target revision has already been finalized');
+        $r = $existingR ?? ['active_manifest' => $m, 'last_creator_activity_secs' => min($now, intdiv((int)$m['issued_at_ms'], 1000)), 'voted_proposals_by_rev' => [], 'vetoed_proposal_hashes' => [], 'imported_proposal' => null];
         if (in_array($pHashHex, $r['vetoed_proposal_hashes'] ?? [], true)) lock_fail(409, 'Proposal was vetoed on this server');
         $ei = $r['imported_proposal'] ?? null;
         if (is_array($ei) && $ei['proposal_hash'] === $pHashHex && (int)$ei['to_rev'] === (int)$prop['to_rev'] && $ei['imported_state_hash'] === $impHashHex) return (int)$ei['acked_at'];
@@ -575,14 +634,14 @@ function lock_handle_import(array $cfg, array $keys, string $dataDir, int $now):
         $fState = 'active';
         if ($oldB !== null && is_array($oldB['freeze_state'])) {
             $ofs = $oldB['freeze_state'];
-            if (isset($ofs['self_frozen']) || isset($ofs['permanent_proposal'])) $fState = $ofs;
+            if (isset($ofs['self_frozen']) || isset($ofs['permanent_proposal']) || isset($ofs['epoch_frozen'])) $fState = $ofs;
             elseif (isset($ofs['pre_proposal']) && $now < (int)$ofs['pre_proposal']['expires_at']) $fState = $ofs;
         }
-        lock_atomic_write($bFile, json_encode(['anchor_id' => $aHex, 'retain_until_quarter' => $q, 'creator_mig_pub' => $m['authority']['creator_mig_pub'], 'write_seq' => $ws, 'bucket_head' => bin2hex($bh), 'freeze_state' => $fState, 'slots' => $newSlots, 'conflicts' => $newConflicts, 'output_claims' => $outClaims], JSON_UNESCAPED_SLASHES));
+        lock_write_json($bFile, ['anchor_id' => $aHex, 'retain_until_quarter' => $q, 'creator_mig_pub' => $m['authority']['creator_mig_pub'], 'write_seq' => $ws, 'bucket_head' => bin2hex($bh), 'freeze_state' => $fState, 'slots' => $newSlots, 'conflicts' => $newConflicts, 'output_claims' => $outClaims]);
         lock_used_inodes_add($p, $newInodes - $oldInodes);
         $r['imported_proposal'] = ['proposal_hash' => $pHashHex, 'to_rev' => (int)$prop['to_rev'], 'imported_state_hash' => $impHashHex, 'acked_at' => $now];
-        lock_atomic_write($rFile, json_encode($r, JSON_UNESCAPED_SLASHES));
-        if (!file_exists($p['anchors'] . "/{$aHex}.bin")) lock_atomic_write($p['anchors'] . "/{$aHex}.bin", json_encode($m, JSON_UNESCAPED_SLASHES));
+        lock_write_json($rFile, $r);
+        if (!file_exists($p['anchors'] . "/{$aHex}.bin")) lock_write_json($p['anchors'] . "/{$aHex}.bin", $m);
         return $now;
     });
 
@@ -593,22 +652,26 @@ function lock_handle_import(array $cfg, array $keys, string $dataDir, int $now):
 function lock_handle_commit(array $cfg, array $keys, string $dataDir, int $now): never {
     lock_check_revoked($dataDir);
     $p = lock_paths($dataDir);
-    $req = json_decode((string)file_get_contents('php://input'), true);
+    $rawBody = lock_read_bounded_body(2097152, 'Lock commit payload too large');
+    $req = json_decode($rawBody, true);
+    if (!is_array($req)) lock_fail(400, 'Invalid lock_commit JSON');
     $act = $req['action'] ?? null;
-    if (!is_array($req) || !is_string($act)) lock_fail(400, 'Invalid lock_commit JSON');
+    if (!is_string($act)) lock_fail(400, 'Invalid lock_commit JSON');
     $a32 = lock_hex_bytes($req['anchor_id'] ?? null, 32) ?? lock_fail(400, 'Invalid anchor_id');
     $aHex = $req['anchor_id'];
 
     if ($act === 'sign_commit') {
         $prop = $req['proposal'] ?? null; $ish32 = lock_hex_bytes($req['imported_state_hash'] ?? null, 32); $acks = $req['import_acks'] ?? null;
-        if (!is_array($prop) || ($prop['anchor_id'] ?? '') !== $aHex || $ish32 === null || !is_array($acks)) lock_fail(400, 'Invalid sign_commit payload');
+        if (!is_array($prop) || ($prop['anchor_id'] ?? '') !== $aHex || $ish32 === null || !is_array($acks) || !array_is_list($acks)) lock_fail(400, 'Invalid sign_commit payload');
+        $pHash32 = lock_proposal_digest($prop);
+        if ($pHash32 === null || lock_decode_quarter((int)$prop['retain_until_quarter']) === null) lock_fail(400, 'Invalid MigrationProposal');
+        $pHashHex = bin2hex($pHash32);
         $r = lock_read_json($p['meta'] . "/rotations/{$aHex}.json") ?? lock_fail(404, 'Anchor rotation record not found');
         $am = $r['active_manifest'];
         if ((int)$am['revision'] !== (int)$prop['from_rev']) lock_fail(409, 'Manifest revision mismatch');
         $oldC = lock_validate_committee($am['servers'], (int)$am['threshold']);
         if (!in_array($keys['pkHex'], $oldC['members'], true)) lock_fail(400, 'Server is not in previous committee');
         $vp = $r['voted_proposals_by_rev'][(string)$prop['from_rev']] ?? null;
-        $pHash32 = lock_proposal_digest($prop); $pHashHex = $pHash32 !== null ? bin2hex($pHash32) : '';
         if ($vp === null || $vp['proposal_hash'] !== $pHashHex) lock_fail(409, 'Proposal does not match voted_proposal[rev]');
         $timelockSecs = lock_effective_timelock_secs($cfg, $am, $prop);
         if ($timelockSecs > 0 && $now < (int)$vp['effective_at']) lock_fail(409, 'Proposal 72h timelock has not elapsed yet');
@@ -619,8 +682,11 @@ function lock_handle_commit(array $cfg, array $keys, string $dataDir, int $now):
     }
     if ($act === 'finalize') {
         $nm = $req['new_manifest'] ?? null;
-        if (!is_array($nm) || ($nm['revision'] ?? 0) <= 1) lock_fail(400, 'Finalize requires migrated manifest revision >= 2');
+        if (!is_array($nm) || !is_int($nm['revision'] ?? null) || $nm['revision'] <= 1) lock_fail(400, 'Finalize requires migrated manifest revision >= 2');
         $comms = lock_verify_manifest_chain($nm, $a32) ?? lock_fail(400, 'Invalid new_manifest chain');
+        $inChain = false;
+        foreach ($comms as $hc) { if (in_array($keys['pkHex'], $hc['members'], true)) { $inChain = true; break; } }
+        if (!$inChain) lock_fail(400, 'Server lock_pub is not a member of manifest chain');
         $q = (int)$nm['retain_until_quarter'];
         if ($q > $cfg['max_retention_quarter']) lock_fail(422, 'Manifest retain_until_quarter exceeds server limit');
         $latest = $nm['migration_chain'][count($nm['migration_chain']) - 1];
@@ -630,17 +696,33 @@ function lock_handle_commit(array $cfg, array $keys, string $dataDir, int $now):
 
         $newState = lock_with_lock($p['meta'] . "/buckets/{$bHex}.lockdir", static function () use ($p, $keys, $nm, $aHex, $bHex, $b32, $q, $inNew, $lpHashHex, $latest, $now) {
             $bFile = $p['meta'] . "/buckets/{$bHex}.json"; $rFile = $p['meta'] . "/rotations/{$aHex}.json";
-            $r = lock_read_json($rFile) ?? ['active_manifest' => $nm, 'last_creator_activity_secs' => min($now, intdiv((int)$nm['issued_at_ms'], 1000)), 'voted_proposals_by_rev' => [], 'vetoed_proposal_hashes' => [], 'imported_proposal' => null];
+            $existingR = lock_read_json($rFile);
+            if ($existingR !== null) {
+                $exRev = (int)$existingR['active_manifest']['revision'];
+                if ((int)$nm['revision'] < $exRev) lock_fail(409, 'Cannot downgrade active manifest revision');
+                if ((int)$nm['revision'] === $exRev) {
+                    $exChain = $existingR['active_manifest']['migration_chain'] ?? [];
+                    $exLatest = !empty($exChain) ? $exChain[count($exChain) - 1] : null;
+                    $exDig = is_array($exLatest['proposal'] ?? null) ? lock_proposal_digest($exLatest['proposal']) : null;
+                    $sameTransition = is_array($exLatest) && $exDig !== null && bin2hex($exDig) === $lpHashHex && ($exLatest['imported_state_hash'] ?? null) === $latest['imported_state_hash'];
+                    if (!$sameTransition) lock_fail(409, 'Conflicting manifest already finalized at this revision');
+                    $existingB = lock_read_json($bFile);
+                    if ($existingB !== null) return $existingB['freeze_state'];
+                }
+                $r = $existingR;
+            } else {
+                $r = ['active_manifest' => $nm, 'last_creator_activity_secs' => min($now, intdiv((int)$nm['issued_at_ms'], 1000)), 'voted_proposals_by_rev' => [], 'vetoed_proposal_hashes' => [], 'imported_proposal' => null];
+            }
             if ($inNew) {
                 $imp = $r['imported_proposal'] ?? null;
                 if (!is_array($imp) || $imp['proposal_hash'] !== $lpHashHex || (int)$imp['to_rev'] !== (int)$nm['revision'] || $imp['imported_state_hash'] !== $latest['imported_state_hash']) lock_fail(409, 'Target server must complete ?lock_import for this revision before Finalize');
             }
             $r['active_manifest'] = $nm; $r['imported_proposal'] = null;
-            lock_atomic_write($rFile, json_encode($r, JSON_UNESCAPED_SLASHES));
-            lock_atomic_write($p['anchors'] . "/{$aHex}.bin", json_encode($nm, JSON_UNESCAPED_SLASHES));
+            lock_write_json($rFile, $r);
+            lock_write_json($p['anchors'] . "/{$aHex}.bin", $nm);
             $b = lock_read_json($bFile) ?? ['anchor_id' => $aHex, 'retain_until_quarter' => $q, 'creator_mig_pub' => $nm['authority']['creator_mig_pub'], 'write_seq' => 0, 'bucket_head' => hash('sha256', 'HUMOCO_BUCKET_INIT_V1' . $b32 . pack('v', $q)), 'freeze_state' => 'active', 'slots' => [], 'conflicts' => [], 'output_claims' => []];
-            $b['freeze_state'] = $inNew ? ((is_array($b['freeze_state']) && isset($b['freeze_state']['self_frozen'])) ? $b['freeze_state'] : 'active') : ['epoch_frozen' => ['committed_rev' => (int)$nm['revision'], 'frozen_at' => $now]];
-            lock_atomic_write($bFile, json_encode($b, JSON_UNESCAPED_SLASHES));
+            $b['freeze_state'] = $inNew ? ((is_array($b['freeze_state']) && isset($b['freeze_state']['self_frozen'])) ? $b['freeze_state'] : lock_restore_non_proposal_freeze_state($r)) : ['epoch_frozen' => ['committed_rev' => (int)$nm['revision'], 'frozen_at' => $now]];
+            lock_write_json($bFile, $b);
             return $b['freeze_state'];
         });
         lock_ok(200, ['status' => 'finalized', 'revision' => (int)$nm['revision'], 'bucket_freeze_state' => $newState]);
