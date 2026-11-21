@@ -1,13 +1,21 @@
-use axum::extract::{Path, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use std::net::SocketAddr;
+
+use axum::body::Body;
+use axum::extract::{ConnectInfo, Path, State};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::middleware::map_response;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
 use crate::crypto::{normalize_pubkey_hex, unix_now};
 use crate::db::AccountStatus;
+use crate::ratelimit::extract_client_ip;
 use crate::state::{db_err_to_response, json_error, AppState};
+
+const ADMIN_API_MAX_BODY_BYTES: usize = 65_536;
 
 pub fn admin_api_router() -> Router<AppState> {
     Router::new()
@@ -29,9 +37,31 @@ pub fn admin_api_router() -> Router<AppState> {
             "/api/v1/admin/codes",
             get(api_list_codes).post(api_create_codes),
         )
+        .layer(map_response(add_no_store))
 }
 
-fn check_bearer_auth(state: &AppState, headers: &HeaderMap) -> Option<Response> {
+async fn add_no_store(mut resp: Response) -> Response {
+    resp.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    resp
+}
+
+fn authorize_admin_api(
+    state: &AppState,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: &HeaderMap,
+) -> Option<Response> {
+    let ip = extract_client_ip(
+        peer.map(|ConnectInfo(s)| s),
+        headers,
+        state.config.server.trusted_proxy_hops,
+    );
+    if !state.rate_limiter.allow_ip(ip) {
+        return Some(json_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "IP rate limit exceeded",
+        ));
+    }
     let configured_hash = if !state
         .config
         .security
@@ -70,8 +100,20 @@ fn check_bearer_auth(state: &AppState, headers: &HeaderMap) -> Option<Response> 
     None
 }
 
-async fn api_stats(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Some(resp) = check_bearer_auth(&state, &headers) {
+async fn read_admin_json<T: DeserializeOwned>(body: Body) -> Result<T, Response> {
+    let bytes = axum::body::to_bytes(body, ADMIN_API_MAX_BODY_BYTES)
+        .await
+        .map_err(|_| json_error(StatusCode::PAYLOAD_TOO_LARGE, "Admin API payload too large"))?;
+    serde_json::from_slice::<T>(&bytes)
+        .map_err(|_| json_error(StatusCode::BAD_REQUEST, "Invalid JSON payload"))
+}
+
+async fn api_stats(
+    State(state): State<AppState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(resp) = authorize_admin_api(&state, peer, &headers) {
         return resp;
     }
     let now = unix_now();
@@ -81,8 +123,12 @@ async fn api_stats(State(state): State<AppState>, headers: HeaderMap) -> Respons
     }
 }
 
-async fn api_list_users(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Some(resp) = check_bearer_auth(&state, &headers) {
+async fn api_list_users(
+    State(state): State<AppState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(resp) = authorize_admin_api(&state, peer, &headers) {
         return resp;
     }
     let now = unix_now();
@@ -94,10 +140,11 @@ async fn api_list_users(State(state): State<AppState>, headers: HeaderMap) -> Re
 
 async fn api_get_user(
     State(state): State<AppState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     Path(raw_pk): Path<String>,
 ) -> Response {
-    if let Some(resp) = check_bearer_auth(&state, &headers) {
+    if let Some(resp) = authorize_admin_api(&state, peer, &headers) {
         return resp;
     }
     let Some(pk) = normalize_pubkey_hex(&raw_pk) else {
@@ -122,15 +169,20 @@ struct SetProfilePayload {
 
 async fn api_set_user_profile(
     State(state): State<AppState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     Path(raw_pk): Path<String>,
-    Json(payload): Json<SetProfilePayload>,
+    body: Body,
 ) -> Response {
-    if let Some(resp) = check_bearer_auth(&state, &headers) {
+    if let Some(resp) = authorize_admin_api(&state, peer, &headers) {
         return resp;
     }
     let Some(pk) = normalize_pubkey_hex(&raw_pk) else {
         return json_error(StatusCode::BAD_REQUEST, "Invalid pubkey hex");
+    };
+    let payload: SetProfilePayload = match read_admin_json(body).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
     };
     let now = unix_now();
     if let Err(e) = state.db.register_or_upgrade_user(
@@ -158,15 +210,20 @@ struct SetStatusPayload {
 
 async fn api_set_user_status(
     State(state): State<AppState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     Path(raw_pk): Path<String>,
-    Json(payload): Json<SetStatusPayload>,
+    body: Body,
 ) -> Response {
-    if let Some(resp) = check_bearer_auth(&state, &headers) {
+    if let Some(resp) = authorize_admin_api(&state, peer, &headers) {
         return resp;
     }
     let Some(pk) = normalize_pubkey_hex(&raw_pk) else {
         return json_error(StatusCode::BAD_REQUEST, "Invalid pubkey hex");
+    };
+    let payload: SetStatusPayload = match read_admin_json(body).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
     };
     let now = unix_now();
     if let Err(e) = state.db.set_user_status(&pk, payload.status, now) {
@@ -181,10 +238,11 @@ async fn api_set_user_status(
 
 async fn api_delete_user(
     State(state): State<AppState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     Path(raw_pk): Path<String>,
 ) -> Response {
-    if let Some(resp) = check_bearer_auth(&state, &headers) {
+    if let Some(resp) = authorize_admin_api(&state, peer, &headers) {
         return resp;
     }
     let Some(pk) = normalize_pubkey_hex(&raw_pk) else {
@@ -205,8 +263,12 @@ async fn api_delete_user(
     }
 }
 
-async fn api_list_codes(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Some(resp) = check_bearer_auth(&state, &headers) {
+async fn api_list_codes(
+    State(state): State<AppState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(resp) = authorize_admin_api(&state, peer, &headers) {
         return resp;
     }
     match state.db.list_redeem_codes() {
@@ -241,12 +303,17 @@ fn default_max_uses() -> u32 {
 
 async fn api_create_codes(
     State(state): State<AppState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
-    Json(payload): Json<CreateCodesPayload>,
+    body: Body,
 ) -> Response {
-    if let Some(resp) = check_bearer_auth(&state, &headers) {
+    if let Some(resp) = authorize_admin_api(&state, peer, &headers) {
         return resp;
     }
+    let payload: CreateCodesPayload = match read_admin_json(body).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
     let count = payload.count.clamp(1, 500);
     let now = unix_now();
     match state.db.create_redeem_codes(

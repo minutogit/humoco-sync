@@ -11,7 +11,7 @@ use serde::Deserialize;
 use crate::config::Config;
 use crate::crypto::{
     canonicalize_email, constant_time_eq_str, create_pow_challenge, generate_session_csrf_pair,
-    hmac_email, normalize_pubkey_hex, random_hex, sign_stateless_token, unix_now,
+    hmac_email, normalize_pubkey_hex, random_hex, sha256_hex, sign_stateless_token, unix_now,
     verify_pow_solution, verify_stateless_token, SignedActionToken,
 };
 use crate::db::AccountStatus;
@@ -305,8 +305,12 @@ async fn register_page(State(state): State<AppState>, Query(q): Query<RegisterQu
 
     // Email Double-Opt-In Card
     if state.config.gate_enabled("email") {
-        let default_prof = &state.config.profiles[&state.config.mode.default_public_profile];
-        let pii_note = if default_prof.store_contact_email {
+        let store_contact = state
+            .config
+            .profiles
+            .get(&state.config.mode.default_public_profile)
+            .is_some_and(|p| p.store_contact_email);
+        let pii_note = if store_contact {
             "Email is stored encrypted for account management."
         } else {
             "Zero-PII GDPR Privacy: your email address is NOT saved on disk. Only a keyed HMAC-SHA256 hash is kept to prevent duplicate free registrations and verify self-deletion."
@@ -495,6 +499,9 @@ async fn register_email_submit(
         ))
         .into_response();
     };
+    if let Some(resp) = ensure_pubkey_unregistered_for_public_gate(&state, &pubkey) {
+        return resp;
+    }
     if let Err(err) = state
         .db
         .check_email_not_used_by_other(&canon_email, &pubkey)
@@ -584,9 +591,37 @@ struct TokenQuery {
     token: String,
 }
 
-async fn register_confirm(State(state): State<AppState>, Query(q): Query<TokenQuery>) -> Response {
+async fn register_confirm(
+    State(state): State<AppState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    Query(q): Query<TokenQuery>,
+) -> Response {
     if !state.config.mode.enable_public_registration {
         return Redirect::to("/").into_response();
+    }
+    if !state.config.gate_enabled("email") {
+        return Redirect::to(&format!(
+            "{}?err=Email+registration+disabled",
+            state.config.mode.register_path
+        ))
+        .into_response();
+    }
+    let ip = extract_client_ip(
+        peer.map(|ConnectInfo(s)| s),
+        &headers,
+        state.config.server.trusted_proxy_hops,
+    );
+    if !state.rate_limiter.allow_ip(ip) {
+        return html_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            layout_html(
+                "Rate Limit Exceeded",
+                &state.config.mode.service_name,
+                &state.config.mode.operator_contact,
+                r#"<div class="alert err">Too many requests. Please try again shortly.</div>"#,
+            ),
+        );
     }
     let now = unix_now();
     let claims = match verify_stateless_token(state.db.pepper(), &q.token, "confirm_register", now)
@@ -601,12 +636,19 @@ async fn register_confirm(State(state): State<AppState>, Query(q): Query<TokenQu
             .into_response();
         }
     };
+    let Some(pubkey) = normalize_pubkey_hex(&claims.pubkey) else {
+        return Redirect::to(&format!(
+            "{}?err=Invalid+public+sync+key",
+            state.config.mode.register_path
+        ))
+        .into_response();
+    };
     match state.db.consume_action_jti(&claims.jti, claims.exp, now) {
         Ok(true) => {}
         _ => {
             return Redirect::to(&format!(
                 "{}?key={}&err=Confirmation+link+already+used",
-                state.config.mode.register_path, claims.pubkey
+                state.config.mode.register_path, pubkey
             ))
             .into_response();
         }
@@ -615,7 +657,7 @@ async fn register_confirm(State(state): State<AppState>, Query(q): Query<TokenQu
     // Bind email_hmac directly even if store_contact_email = false
     let res = state.db.register_or_upgrade_user_by_hmac(
         &state.config,
-        &claims.pubkey,
+        &pubkey,
         &claims.profile,
         Some(&claims.email_hmac),
         claims.contact_email.as_deref(),
@@ -627,14 +669,14 @@ async fn register_confirm(State(state): State<AppState>, Query(q): Query<TokenQu
         Ok(_) => Redirect::to(&format!(
             "{}?key={}&msg={}",
             state.config.mode.register_path,
-            claims.pubkey,
+            pubkey,
             url_encode("Key activated! You can return to the Human Money App and click Re-check Activation.")
         ))
         .into_response(),
         Err(e) => Redirect::to(&format!(
             "{}?key={}&err={}",
             state.config.mode.register_path,
-            claims.pubkey,
+            pubkey,
             url_encode(&e.to_string())
         ))
         .into_response(),
@@ -740,6 +782,9 @@ async fn register_pow_submit(
         ))
         .into_response();
     };
+    if let Some(resp) = ensure_pubkey_unregistered_for_public_gate(&state, &pubkey) {
+        return resp;
+    }
     let now = unix_now();
     if let Err(err) = verify_pow_solution(
         state.db.pepper(),
@@ -755,6 +800,24 @@ async fn register_pow_submit(
             url_encode(&err)
         ))
         .into_response();
+    }
+    let pow_exp = form
+        .challenge
+        .trim()
+        .split('.')
+        .nth(2)
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or_else(|| now.saturating_add(300));
+    let pow_jti = format!("pow:{}", sha256_hex(form.challenge.trim().as_bytes()));
+    match state.db.consume_action_jti(&pow_jti, pow_exp, now) {
+        Ok(true) => {}
+        _ => {
+            return Redirect::to(&format!(
+                "{}?key={}&err=PoW+challenge+already+used",
+                state.config.mode.register_path, pubkey
+            ))
+            .into_response();
+        }
     }
     if !state.rate_limiter.check_and_record_registration_subnet(ip) {
         return Redirect::to(&format!(
@@ -821,6 +884,9 @@ async fn register_open_submit(
         ))
         .into_response();
     };
+    if let Some(resp) = ensure_pubkey_unregistered_for_public_gate(&state, &pubkey) {
+        return resp;
+    }
     if !state.rate_limiter.check_and_record_registration_subnet(ip) {
         return Redirect::to(&format!(
             "{}?key={}&err=Daily+subnet+registration+limit+reached",
@@ -936,8 +1002,26 @@ async fn register_delete_request(
 
 async fn register_delete_confirm(
     State(state): State<AppState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     Query(q): Query<TokenQuery>,
 ) -> Response {
+    let ip = extract_client_ip(
+        peer.map(|ConnectInfo(s)| s),
+        &headers,
+        state.config.server.trusted_proxy_hops,
+    );
+    if !state.rate_limiter.allow_ip(ip) {
+        return html_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            layout_html(
+                "Rate Limit Exceeded",
+                &state.config.mode.service_name,
+                &state.config.mode.operator_contact,
+                r#"<div class="alert err">Too many requests. Please try again shortly.</div>"#,
+            ),
+        );
+    }
     let now = unix_now();
     let claims = match verify_stateless_token(state.db.pepper(), &q.token, "delete_account", now) {
         Ok(c) => c,
@@ -950,6 +1034,38 @@ async fn register_delete_confirm(
             .into_response();
         }
     };
+    let Some(pubkey) = normalize_pubkey_hex(&claims.pubkey) else {
+        return Redirect::to(&format!(
+            "{}?err=Invalid+public+sync+key",
+            state.config.mode.register_path
+        ))
+        .into_response();
+    };
+    match state.db.get_registered_user(&pubkey) {
+        Ok(Some(rec)) if rec.email_hmac.as_deref() == Some(claims.email_hmac.as_str()) => {}
+        Ok(Some(_)) => {
+            return Redirect::to(&format!(
+                "{}?key={}&err=Deletion+link+is+no+longer+valid+for+this+account",
+                state.config.mode.register_path, pubkey
+            ))
+            .into_response();
+        }
+        Ok(None) => {
+            return Redirect::to(&format!(
+                "{}?key={}&err=Account+not+found",
+                state.config.mode.register_path, pubkey
+            ))
+            .into_response();
+        }
+        Err(e) => {
+            return Redirect::to(&format!(
+                "{}?err={}",
+                state.config.mode.register_path,
+                url_encode(&e.to_string())
+            ))
+            .into_response();
+        }
+    }
     match state.db.consume_action_jti(&claims.jti, claims.exp, now) {
         Ok(true) => {}
         _ => {
@@ -961,11 +1077,11 @@ async fn register_delete_confirm(
         }
     }
 
-    match state.db.delete_account_and_data(&claims.pubkey, false) {
+    match state.db.delete_account_and_data(&pubkey, false) {
         Ok((slots, media, _)) => Redirect::to(&format!(
             "{}?key={}&msg={}",
             state.config.mode.register_path,
-            claims.pubkey,
+            pubkey,
             url_encode(&format!(
                 "Account and {} slot(s), {} media blob(s) permanently deleted.",
                 slots, media
@@ -1126,7 +1242,7 @@ async fn admin_dashboard(
     // Users table
     body.push_str(r#"<div class="card"><h2>Registered Users</h2><table><thead><tr><th>Pubkey</th><th>Profile</th><th>Usage</th><th>Status</th><th>Actions</th></tr></thead><tbody>"#);
     for u in &users {
-        let short_pk = format!("{}...{}", &u.pubkey[..10], &u.pubkey[58..]);
+        let short_pk = format_short_pubkey(&u.pubkey);
         let next_status = if u.status == AccountStatus::Active {
             "suspended"
         } else {
@@ -1269,13 +1385,19 @@ async fn admin_logout_submit(
     if let Some(sid) = verify_admin_cookie_and_csrf(&state, &headers, &form.csrf) {
         state.rate_limiter.revoke_admin_session(&sid);
     }
-    let mut resp = Redirect::to("/admin").into_response();
-    resp.headers_mut().insert(
-        header::SET_COOKIE,
-        HeaderValue::from_static(
-            "humoco_admin_sess=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/admin",
-        ),
+    let secure = if state.config.server.public_base_url.starts_with("https://") {
+        "; Secure"
+    } else {
+        ""
+    };
+    let cookie = format!(
+        "{}=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/admin{}",
+        ADMIN_SESSION_COOKIE, secure
     );
+    let mut resp = Redirect::to("/admin").into_response();
+    if let Ok(hv) = HeaderValue::from_str(&cookie) {
+        resp.headers_mut().insert(header::SET_COOKIE, hv);
+    }
     resp
 }
 
@@ -1299,12 +1421,12 @@ async fn admin_user_profile_submit(
     let Some(pk) = normalize_pubkey_hex(&form.pubkey) else {
         return Redirect::to("/admin?err=Invalid+pubkey").into_response();
     };
-    let dur = form
-        .duration_days
-        .trim()
-        .parse::<u32>()
-        .ok()
-        .filter(|&d| d > 0);
+    let dur = match parse_optional_positive_days(&form.duration_days) {
+        Ok(d) => d,
+        Err(msg) => {
+            return Redirect::to(&format!("/admin?err={}", url_encode(msg))).into_response();
+        }
+    };
     let now = unix_now();
     match state.db.register_or_upgrade_user(
         &state.config,
@@ -1398,18 +1520,22 @@ async fn admin_create_code_submit(
     if verify_admin_cookie_and_csrf(&state, &headers, &form.csrf).is_none() {
         return Redirect::to("/admin?err=Session+expired").into_response();
     }
-    let count = form
-        .count
-        .trim()
-        .parse::<usize>()
-        .unwrap_or(1)
-        .clamp(1, 100);
-    let dur = form
-        .duration_days
-        .trim()
-        .parse::<u32>()
-        .ok()
-        .filter(|&d| d > 0);
+    let count = match form.count.trim() {
+        "" => 1usize,
+        raw => match raw.parse::<usize>() {
+            Ok(n) if n > 0 => n.clamp(1, 100),
+            _ => {
+                return Redirect::to("/admin?err=Code+count+must+be+a+positive+integer")
+                    .into_response();
+            }
+        },
+    };
+    let dur = match parse_optional_positive_days(&form.duration_days) {
+        Ok(d) => d,
+        Err(msg) => {
+            return Redirect::to(&format!("/admin?err={}", url_encode(msg))).into_response();
+        }
+    };
     let note = Some(form.note.trim().to_string()).filter(|s| !s.is_empty());
     let now = unix_now();
     match state.db.create_redeem_codes(
@@ -1442,15 +1568,41 @@ async fn admin_create_code_submit(
 }
 
 fn extract_admin_session_cookie(headers: &HeaderMap) -> Option<String> {
-    let raw = headers.get(header::COOKIE)?.to_str().ok()?;
-    for part in raw.split(';') {
-        if let Some((k, v)) = part.trim().split_once('=') {
-            if k.trim() == ADMIN_SESSION_COOKIE && !v.trim().is_empty() {
-                return Some(v.trim().to_string());
+    for val in headers.get_all(header::COOKIE) {
+        let Ok(raw) = val.to_str() else {
+            continue;
+        };
+        for part in raw.split(';') {
+            if let Some((k, v)) = part.trim().split_once('=') {
+                if k.trim() == ADMIN_SESSION_COOKIE && !v.trim().is_empty() {
+                    return Some(v.trim().to_string());
+                }
             }
         }
     }
     None
+}
+
+fn format_short_pubkey(pk: &str) -> String {
+    let chars: Vec<char> = pk.chars().collect();
+    if chars.len() >= 18 {
+        let head: String = chars[..10].iter().collect();
+        let tail: String = chars[chars.len() - 6..].iter().collect();
+        format!("{}...{}", head, tail)
+    } else {
+        pk.to_string()
+    }
+}
+
+fn parse_optional_positive_days(raw: &str) -> Result<Option<u32>, &'static str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    match trimmed.parse::<u32>() {
+        Ok(d) if d > 0 => Ok(Some(d)),
+        _ => Err("Duration days must be a positive integer (or leave empty for permanent)"),
+    }
 }
 
 fn verify_admin_cookie_and_csrf(
@@ -1470,6 +1622,105 @@ fn verify_admin_cookie_and_csrf(
     }
 }
 
+fn ensure_pubkey_unregistered_for_public_gate(state: &AppState, pubkey: &str) -> Option<Response> {
+    match state.db.get_registered_user(pubkey) {
+        Ok(Some(rec)) => {
+            let msg = if rec.status == AccountStatus::Suspended {
+                "Account+is+suspended"
+            } else {
+                "Public+key+is+already+registered"
+            };
+            Some(
+                Redirect::to(&format!(
+                    "{}?key={}&err={}",
+                    state.config.mode.register_path, pubkey, msg
+                ))
+                .into_response(),
+            )
+        }
+        Ok(None) => None,
+        Err(e) => Some(
+            Redirect::to(&format!(
+                "{}?key={}&err={}",
+                state.config.mode.register_path,
+                pubkey,
+                url_encode(&e.to_string())
+            ))
+            .into_response(),
+        ),
+    }
+}
+
 fn url_encode(s: &str) -> String {
     form_urlencoded::byte_serialize(s.as_bytes()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tempfile::TempDir;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn test_s05_web_routes_panic_safety_and_https_logout_secure_cookie() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = Config::default();
+        cfg.server.db_path = dir.path().join("web_unit.redb");
+        cfg.server.public_base_url = "https://sync.example.org".to_string();
+        cfg.mode.enable_admin_app = false;
+        cfg.mode.enable_public_registration = true;
+        cfg.mode.registration_gates = vec!["email".to_string()];
+        // Simulate unvalidated Config with missing default_public_profile
+        cfg.mode.default_public_profile = "missing_profile".to_string();
+
+        let state = AppState::from_config(cfg).unwrap();
+        let app = web_router(&state.config).with_state(state.clone());
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/register")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Test HTTPS logout emits Secure attribute
+        let sid = "test_session_id_123456".to_string();
+        state.rate_limiter.create_admin_session(sid.clone(), 3600);
+        let csrf = generate_session_csrf_pair(state.db.pepper(), &sid);
+        let form_body = format!("csrf={}", url_encode(&csrf));
+        let logout_resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/logout")
+                    .header(header::COOKIE, format!("{}={}", ADMIN_SESSION_COOKIE, sid))
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(form_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logout_resp.status(), StatusCode::SEE_OTHER);
+        let sc = logout_resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            sc.contains("; Secure"),
+            "HTTPS logout must include ; Secure, got: {sc}"
+        );
+
+        assert_eq!(format_short_pubkey("short"), "short");
+        assert_eq!(format_short_pubkey("äöüß"), "äöüß");
+        assert_eq!(format_short_pubkey(&"a".repeat(64)), "aaaaaaaaaa...aaaaaa");
+    }
 }

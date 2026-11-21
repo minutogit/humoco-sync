@@ -6809,3 +6809,571 @@ async fn test_s04_static_lock_304_etag_members_capacity_and_fast_fail() {
         404
     );
 }
+
+#[tokio::test]
+async fn test_s05_registration_prechecks_pow_replay_and_delete_binding() {
+    use humoco_sync_server::crypto::{
+        create_pow_challenge, hmac_email, leading_zero_bits, sign_stateless_token,
+        SignedActionToken,
+    };
+    use humoco_sync_server::db::AccountStatus;
+    use sha2::{Digest, Sha256};
+
+    let (_, admin_pk) = gen_keypair();
+    let (_, active_pk) = gen_keypair();
+    let (_, suspended_pk) = gen_keypair();
+    let (_, fresh_pk) = gen_keypair();
+    let (_, pow_pk) = gen_keypair();
+
+    let mut cfg = base_hybrid_config(&admin_pk);
+    cfg.mode.registration_gates = vec!["email".to_string(), "pow".to_string(), "open".to_string()];
+    cfg.email.enabled = true;
+    cfg.email.transport = "log".to_string();
+    cfg.security.pow_difficulty_bits = 4;
+    cfg.security.max_registrations_per_ipv4_24_per_day = 1;
+    let srv = TestServer::start(cfg).await;
+    let now = unix_now();
+
+    srv.state
+        .db
+        .register_or_upgrade_user(
+            &srv.state.config,
+            &active_pk,
+            "free",
+            None,
+            None,
+            "open",
+            now,
+        )
+        .unwrap();
+    srv.state
+        .db
+        .register_or_upgrade_user(
+            &srv.state.config,
+            &suspended_pk,
+            "free",
+            None,
+            None,
+            "open",
+            now,
+        )
+        .unwrap();
+    srv.state
+        .db
+        .set_user_status(&suspended_pk, AccountStatus::Suspended, now)
+        .unwrap();
+
+    // 1. Pre-check in /register/email: must NOT dispatch emails or burn the 1/day subnet slot
+    for (pk, mail) in [
+        (&active_pk, "victim1@example.org"),
+        (&suspended_pk, "victim2@example.org"),
+    ] {
+        let resp = srv
+            .client
+            .post(format!("{}/register/email", srv.base_url))
+            .form(&[("pubkey", pk.as_str()), ("email", mail)])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 303);
+        let loc = resp.headers().get("location").unwrap().to_str().unwrap();
+        assert!(
+            loc.contains("err="),
+            "Expected immediate rejection for existing key, got location: {loc}"
+        );
+    }
+    assert!(
+        srv.state.mailer.take_recorded().is_empty(),
+        "Existing/suspended pubkeys must NEVER trigger confirmation emails"
+    );
+
+    // 2. Pre-check in /register/open and /register/pow: must NOT burn the 1/day subnet slot
+    let open_dup = srv
+        .client
+        .post(format!("{}/register/open", srv.base_url))
+        .form(&[("pubkey", active_pk.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert!(open_dup
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("err="));
+
+    let solve_pow = |pk: &str| -> (String, String) {
+        let chal = create_pow_challenge(srv.state.db.pepper(), pk, 4, unix_now());
+        for n in 0u64..100_000 {
+            let mut h = Sha256::new();
+            h.update(chal.as_bytes());
+            h.update(b":");
+            h.update(n.to_string().as_bytes());
+            if leading_zero_bits(&h.finalize()) >= 4 {
+                return (chal, n.to_string());
+            }
+        }
+        panic!("failed to solve 4-bit PoW");
+    };
+
+    let (act_chal, act_nonce) = solve_pow(&active_pk);
+    let pow_dup = srv
+        .client
+        .post(format!("{}/register/pow", srv.base_url))
+        .form(&[
+            ("pubkey", active_pk.as_str()),
+            ("challenge", act_chal.as_str()),
+            ("nonce", act_nonce.as_str()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert!(pow_dup
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("err="));
+
+    // Fresh user MUST still succeed using the untouched 1/day subnet slot
+    let fresh_resp = srv
+        .client
+        .post(format!("{}/register/open", srv.base_url))
+        .form(&[("pubkey", fresh_pk.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        fresh_resp
+            .headers()
+            .get("location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("msg="),
+        "Subnet quota must NOT have been burned by already-registered keys"
+    );
+
+    // 3. PoW challenge must be strictly single-use across DELETE ?account + re-register
+    let mut cfg_pow = base_hybrid_config(&admin_pk);
+    cfg_pow.mode.registration_gates = vec!["pow".to_string()];
+    cfg_pow.security.pow_difficulty_bits = 4;
+    let srv_pow = TestServer::start(cfg_pow).await;
+
+    let chal = create_pow_challenge(srv_pow.state.db.pepper(), &pow_pk, 4, unix_now());
+    let mut pow_nonce = String::new();
+    for n in 0u64..100_000 {
+        let mut h = Sha256::new();
+        h.update(chal.as_bytes());
+        h.update(b":");
+        h.update(n.to_string().as_bytes());
+        if leading_zero_bits(&h.finalize()) >= 4 {
+            pow_nonce = n.to_string();
+            break;
+        }
+    }
+    let p1 = srv_pow
+        .client
+        .post(format!("{}/register/pow", srv_pow.base_url))
+        .form(&[
+            ("pubkey", pow_pk.as_str()),
+            ("challenge", chal.as_str()),
+            ("nonce", pow_nonce.as_str()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert!(p1
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("msg="));
+
+    srv_pow
+        .state
+        .db
+        .delete_account_and_data(&pow_pk, false)
+        .unwrap();
+    let p_replay = srv_pow
+        .client
+        .post(format!("{}/register/pow", srv_pow.base_url))
+        .form(&[
+            ("pubkey", pow_pk.as_str()),
+            ("challenge", chal.as_str()),
+            ("nonce", pow_nonce.as_str()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        p_replay
+            .headers()
+            .get("location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("err="),
+        "Replayed PoW challenge must be rejected after account deletion"
+    );
+
+    // 4. /register/confirm must reject tokens when 'email' gate is disabled
+    let mut cfg_no_email = base_hybrid_config(&admin_pk);
+    cfg_no_email.mode.registration_gates = vec!["code".to_string()];
+    let srv_no_email = TestServer::start(cfg_no_email).await;
+    let (_, gate_pk) = gen_keypair();
+    let tok = sign_stateless_token(
+        srv_no_email.state.db.pepper(),
+        &SignedActionToken {
+            action: "confirm_register".to_string(),
+            pubkey: gate_pk.clone(),
+            email_hmac: hmac_email(srv_no_email.state.db.pepper(), "a@example.org"),
+            contact_email: None,
+            profile: "free".to_string(),
+            exp: unix_now() + 600,
+            jti: random_hex(16),
+        },
+    );
+    let gate_res = srv_no_email
+        .client
+        .get(format!(
+            "{}/register/confirm?token={}",
+            srv_no_email.base_url, tok
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert!(gate_res.status().is_redirection() || gate_res.status().as_u16() == 403);
+    assert!(
+        srv_no_email
+            .state
+            .db
+            .get_registered_user(&gate_pk)
+            .unwrap()
+            .is_none(),
+        "/register/confirm must NOT activate users when email gate is disabled"
+    );
+
+    // 5. /register/delete-confirm must bind to current account email_hmac (block stale token after email update)
+    let (_, del_pk) = gen_keypair();
+    srv.state
+        .db
+        .register_or_upgrade_user(
+            &srv.state.config,
+            &del_pk,
+            "free",
+            Some("alice@example.org"),
+            None,
+            "email",
+            unix_now(),
+        )
+        .unwrap();
+    srv.client
+        .post(format!("{}/register/delete-request", srv.base_url))
+        .form(&[("pubkey", del_pk.as_str()), ("email", "alice@example.org")])
+        .send()
+        .await
+        .unwrap();
+    let del_mails = srv.state.mailer.take_recorded();
+    assert_eq!(del_mails.len(), 1);
+    let del_url = del_mails[0]
+        .body
+        .lines()
+        .find(|l| l.starts_with("http://"))
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // Admin updates contact email to bob@example.org -> old deletion token must NOT delete!
+    srv.state
+        .db
+        .register_or_upgrade_user(
+            &srv.state.config,
+            &del_pk,
+            "pro",
+            Some("bob@example.org"),
+            Some(30),
+            "admin",
+            unix_now(),
+        )
+        .unwrap();
+    let stale_del = srv.client.get(&del_url).send().await.unwrap();
+    assert!(stale_del
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("err="));
+    assert!(
+        srv.state.db.get_registered_user(&del_pk).unwrap().is_some(),
+        "Stale deletion token for old email must NOT delete account bound to new email"
+    );
+
+    // 6. Confirmation endpoints must enforce IP rate limiting
+    let mut rl_cfg = base_hybrid_config(&admin_pk);
+    rl_cfg.mode.registration_gates = vec!["email".to_string()];
+    rl_cfg.security.ip_requests_per_minute = 2;
+    let rl_srv = TestServer::start(rl_cfg).await;
+    for _ in 0..2 {
+        let _ = rl_srv
+            .client
+            .get(format!(
+                "{}/register/confirm?token=invalid",
+                rl_srv.base_url
+            ))
+            .send()
+            .await
+            .unwrap();
+    }
+    let rl_hit = rl_srv
+        .client
+        .get(format!(
+            "{}/register/delete-confirm?token=invalid",
+            rl_srv.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rl_hit.status().as_u16(), 429);
+}
+
+#[tokio::test]
+async fn test_s05_admin_ui_duration_validation_cookie_and_panic_safety() {
+    use humoco_sync_server::crypto::hash_admin_token;
+
+    let (_, admin_pk) = gen_keypair();
+    let (_, target_pk) = gen_keypair();
+    let raw_token = "super-admin-ui-secret-token";
+
+    let mut cfg = base_hybrid_config(&admin_pk);
+    cfg.security.admin_token_hash = hash_admin_token(raw_token).unwrap();
+    let srv = TestServer::start(cfg).await;
+
+    // 1. Login to /admin
+    let login_resp = srv
+        .client
+        .post(format!("{}/admin/login", srv.base_url))
+        .form(&[("token", raw_token)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login_resp.status().as_u16(), 303);
+    let set_cookie = login_resp
+        .headers()
+        .get(reqwest::header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(set_cookie.contains("HttpOnly"));
+    assert!(set_cookie.contains("SameSite=Strict"));
+    let sess_cookie = set_cookie.split(';').next().unwrap().to_string();
+
+    // 2. Multiple Cookie headers (HTTP/2 style) must authenticate GET /admin
+    let dash = srv
+        .client
+        .get(format!("{}/admin", srv.base_url))
+        .header(reqwest::header::COOKIE, "other_cookie=ignored")
+        .header(reqwest::header::COOKIE, &sess_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(dash.status().as_u16(), 200);
+    let html = dash.text().await.unwrap();
+    let csrf_marker = "name=\"csrf\" value=\"";
+    let csrf = html
+        .split(csrf_marker)
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .expect("Authenticated /admin must render CSRF token")
+        .to_string();
+
+    // 3. Invalid non-empty duration_days must FAIL and NEVER grant permanent profile/code
+    for bad_dur in ["0", "-5", "30d", "999999999999"] {
+        let prof_resp = srv
+            .client
+            .post(format!("{}/admin/users/profile", srv.base_url))
+            .header(reqwest::header::COOKIE, &sess_cookie)
+            .form(&[
+                ("csrf", csrf.as_str()),
+                ("pubkey", target_pk.as_str()),
+                ("profile", "pro"),
+                ("duration_days", bad_dur),
+            ])
+            .send()
+            .await
+            .unwrap();
+        let loc = prof_resp
+            .headers()
+            .get("location")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            loc.contains("err="),
+            "Invalid duration_days '{bad_dur}' must be rejected, got {loc}"
+        );
+        assert!(
+            srv.state
+                .db
+                .get_registered_user(&target_pk)
+                .unwrap()
+                .is_none(),
+            "Invalid duration_days '{bad_dur}' must NOT register a permanent user"
+        );
+
+        let code_resp = srv
+            .client
+            .post(format!("{}/admin/codes", srv.base_url))
+            .header(reqwest::header::COOKIE, &sess_cookie)
+            .form(&[
+                ("csrf", csrf.as_str()),
+                ("profile", "pro"),
+                ("count", "1"),
+                ("duration_days", bad_dur),
+                ("note", "bad"),
+            ])
+            .send()
+            .await
+            .unwrap();
+        let code_loc = code_resp
+            .headers()
+            .get("location")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            code_loc.contains("err="),
+            "Invalid code duration_days '{bad_dur}' must be rejected, got {code_loc}"
+        );
+        assert!(srv.state.db.list_redeem_codes().unwrap().is_empty());
+    }
+
+    // 4. Empty duration_days explicitly means permanent, positive integer means timed
+    let ok_perm = srv
+        .client
+        .post(format!("{}/admin/users/profile", srv.base_url))
+        .header(reqwest::header::COOKIE, &sess_cookie)
+        .form(&[
+            ("csrf", csrf.as_str()),
+            ("pubkey", target_pk.as_str()),
+            ("profile", "pro"),
+            ("duration_days", ""),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert!(ok_perm
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("msg="));
+    assert!(srv
+        .state
+        .db
+        .get_registered_user(&target_pk)
+        .unwrap()
+        .unwrap()
+        .valid_until
+        .is_none());
+}
+
+#[tokio::test]
+async fn test_s05_admin_api_rate_limit_preauth_and_cache_control() {
+    use humoco_sync_server::crypto::hash_admin_token;
+
+    let (_, admin_pk) = gen_keypair();
+    let (_, target_pk) = gen_keypair();
+    let bearer_secret = "argon2-admin-api-secret";
+
+    let mut cfg = base_hybrid_config(&admin_pk);
+    cfg.security.api_bearer_token_hash = hash_admin_token(bearer_secret).unwrap();
+    cfg.security.ip_requests_per_minute = 4;
+    let srv = TestServer::start(cfg).await;
+
+    // 1. Unauthenticated POST with invalid JSON / missing fields must return 401 BEFORE JSON parsing (never 400/422 schema leak)
+    let no_auth_bad_json = srv
+        .client
+        .post(format!("{}/api/v1/admin/codes", srv.base_url))
+        .header("Content-Type", "application/json")
+        .body("{\"not_valid_schema\": true}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        no_auth_bad_json.status().as_u16(),
+        401,
+        "Missing Authorization must fail 401 before JSON deserialization"
+    );
+
+    // 2. Wrong Bearer token with malformed JSON must return 403 BEFORE JSON parsing
+    let bad_auth_bad_json = srv
+        .client
+        .post(format!(
+            "{}/api/v1/admin/users/{}/profile",
+            srv.base_url, target_pk
+        ))
+        .header("Authorization", "Bearer wrong-token")
+        .header("Content-Type", "application/json")
+        .body("{not-json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        bad_auth_bad_json.status().as_u16(),
+        403,
+        "Invalid Bearer token must fail 403 before JSON deserialization"
+    );
+
+    // 3. Valid Bearer request succeeds and emits Cache-Control: no-store
+    let ok_stats = srv
+        .client
+        .get(format!("{}/api/v1/admin/stats", srv.base_url))
+        .header("Authorization", format!("Bearer {}", bearer_secret))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok_stats.status().as_u16(), 200);
+    assert_eq!(
+        ok_stats
+            .headers()
+            .get(reqwest::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+
+    // 4. Oversized authenticated admin JSON payload (> 64 KiB) rejected cleanly with 413
+    let huge_note = "A".repeat(80_000);
+    let huge_resp = srv
+        .client
+        .post(format!("{}/api/v1/admin/codes", srv.base_url))
+        .header("Authorization", format!("Bearer {}", bearer_secret))
+        .json(&serde_json::json!({
+            "profile": "pro",
+            "note": huge_note
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(huge_resp.status().as_u16(), 413);
+
+    // 5. Next request hits IP rate limit (4/min) -> 429 Too Many Requests (protects Argon2id from CPU DoS)
+    let throttled = srv
+        .client
+        .get(format!("{}/api/v1/admin/stats", srv.base_url))
+        .header("Authorization", "Bearer invalid-flood")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        throttled.status().as_u16(),
+        429,
+        "Admin API must enforce IP rate limiting before Argon2id verification"
+    );
+}
