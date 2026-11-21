@@ -5,6 +5,10 @@ services:
       dockerfile: Dockerfile
     container_name: humoco-sync-server
     restart: unless-stopped
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     volumes:
       - ../config.toml:/etc/humoco-sync/config.toml:ro
       - humoco_sync_data:/var/lib/humoco-sync/data

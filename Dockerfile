@@ -17,7 +17,11 @@ WORKDIR /var/lib/humoco-sync
 COPY --from=builder /src/target/release/humoco-sync-server /usr/local/bin/humoco-sync-server
 COPY config.example.toml /etc/humoco-sync/config.example.toml
 
-RUN chown -R humoco:humoco /var/lib/humoco-sync /etc/humoco-sync
+RUN mkdir -p /var/lib/humoco-sync/data \
+    && chown -R humoco:humoco /var/lib/humoco-sync \
+    && chmod 0700 /var/lib/humoco-sync/data \
+    && chmod 0755 /etc/humoco-sync \
+    && chmod 0644 /etc/humoco-sync/config.example.toml
 USER humoco
 
 EXPOSE 8080

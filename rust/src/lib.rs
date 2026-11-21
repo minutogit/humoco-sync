@@ -17,12 +17,15 @@ use axum::Router;
 
 use crate::state::AppState;
 
+const WEB_FORM_MAX_BODY_BYTES: usize = 64 * 1024;
+
 pub fn build_router(state: AppState) -> Router {
-    let max_body = state.config.max_upload_body_bytes().saturating_add(65_536);
     Router::new()
         .merge(sync_routes::sync_router(&state.config))
         .merge(web_routes::web_router(&state.config))
         .merge(admin_api::admin_api_router())
-        .layer(DefaultBodyLimit::max(max_body))
+        // Caps Axum FromRequest extractors (web_routes::Form) without restricting
+        // sync_routes / admin_api streaming Body::to_bytes per-endpoint limits.
+        .layer(DefaultBodyLimit::max(WEB_FORM_MAX_BODY_BYTES))
         .with_state(state)
 }

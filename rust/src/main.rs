@@ -65,6 +65,8 @@ enum Commands {
         public_url: String,
         #[arg(long, default_value = "127.0.0.1:8080")]
         bind: String,
+        #[arg(long)]
+        data_dir: Option<String>,
     },
     /// Deterministic Ed25519 test vector helper for blackbox integration tests
     SignTest {
@@ -305,7 +307,8 @@ async fn main() {
             admin_pubkey,
             public_url,
             bind,
-        } => run_generate_config(mode, admin_pubkey, public_url, bind),
+            data_dir,
+        } => run_generate_config(mode, admin_pubkey, public_url, bind, data_dir),
         Commands::SignTest { action } => run_sign_test(action),
         Commands::LockGc { config, now_secs } => run_lock_gc(config, now_secs),
     };
@@ -391,7 +394,27 @@ async fn run_serve(config_opt: Option<PathBuf>, bind_override: Option<String>) -
 }
 
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                let _ = sigterm.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
     info!("Shutdown signal received, draining server");
 }
 
@@ -427,11 +450,15 @@ fn run_generate_config(
     admin_pubkey: String,
     public_url: String,
     bind: String,
+    data_dir: Option<String>,
 ) -> i32 {
     let mut cfg = Config::default();
-    cfg.server.bind = bind;
-    cfg.server.public_base_url = public_url.trim_end_matches('/').to_string();
-    cfg.server.admin_pubkey = admin_pubkey.trim().to_ascii_lowercase();
+    cfg.server.bind = bind.trim().to_string();
+    cfg.server.public_base_url = public_url;
+    cfg.server.admin_pubkey = admin_pubkey;
+    if let Some(dir) = data_dir {
+        cfg.server.data_dir = dir;
+    }
     match mode {
         ConfigPreset::Friends => {
             cfg.mode.enable_admin_app = true;
@@ -446,6 +473,20 @@ fn run_generate_config(
             cfg.mode.enable_public_registration = true;
         }
     }
+    cfg.normalize();
+
+    let validation_res = if cfg.mode.enable_admin_app && cfg.server.admin_pubkey.is_empty() {
+        let mut check_cfg = cfg.clone();
+        check_cfg.server.admin_pubkey = "0".repeat(64);
+        check_cfg.validate()
+    } else {
+        cfg.validate()
+    };
+    if let Err(e) = validation_res {
+        eprintln!("Invalid config arguments: {}", e);
+        return 1;
+    }
+
     match toml::to_string_pretty(&cfg) {
         Ok(s) => {
             println!("{}", s);
@@ -629,6 +670,10 @@ fn run_sign_test(cmd: SignTestCmd) -> i32 {
             }
         }
         SignTestCmd::SolvePow { challenge, bits } => {
+            if bits > 32 {
+                eprintln!("PoW bits must be <= 32");
+                return 1;
+            }
             for n in 0u64.. {
                 let mut h = Sha256::new();
                 h.update(challenge.trim().as_bytes());
@@ -678,8 +723,16 @@ fn run_sign_test(cmd: SignTestCmd) -> i32 {
                 issued_at: issued,
                 sig: sig_bytes,
             };
-            println!("{}", serde_json::to_string(&del).unwrap());
-            0
+            match serde_json::to_string(&del) {
+                Ok(s) => {
+                    println!("{}", s);
+                    0
+                }
+                Err(e) => {
+                    eprintln!("Serialization failed: {}", e);
+                    1
+                }
+            }
         }
         SignTestCmd::MakeLockSample {
             lock_pub,
@@ -827,7 +880,13 @@ fn run_make_lock_sample(args: MakeLockSampleArgs<'_>) -> i32 {
         slot0
     };
     if variant == "read_path" || variant.starts_with("read_path_seq:") {
-        let q_str = humoco_proto::format_quarter(manifest.retain_until_quarter).unwrap();
+        let q_str = match humoco_proto::format_quarter(manifest.retain_until_quarter) {
+            Ok(q) => q,
+            Err(e) => {
+                eprintln!("Invalid retain_until_quarter: {e}");
+                return 1;
+            }
+        };
         let file_s = derive_slot_file_id(&chosen_slot, &lock_pub);
         println!(
             "locks/{}/{}/{}.lock",
@@ -918,10 +977,20 @@ fn run_make_lock_sample(args: MakeLockSampleArgs<'_>) -> i32 {
         change_pubkey_hash: None,
         causal_sig: [0u8; 64],
     };
-    causal0.causal_sig = genesis_sk.sign(&causal0.digest().unwrap()).to_bytes();
+    let causal0_dig = match causal0.digest() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("causal0 digest error: {e}");
+            return 1;
+        }
+    };
+    causal0.causal_sig = genesis_sk.sign(&causal0_dig).to_bytes();
     let root_mig_digest = compute_root_mig_auth_digest(&anchor_id, &target_slot, &genesis_pub);
     let root_mig_sig = creator_mig_sk.sign(&root_mig_digest).to_bytes();
-    let pow0 = solve_lock_pow(&target_slot, &child0, 0, args.pow_bits, 0, 10_000_000).unwrap();
+    let Some(pow0) = solve_lock_pow(&target_slot, &child0, 0, args.pow_bits, 0, 10_000_000) else {
+        eprintln!("pow0 solve failed within attempt limit");
+        return 1;
+    };
     let entry0 = LockEntry {
         slot: target_slot,
         parent_slot: [0u8; 32],
@@ -938,7 +1007,13 @@ fn run_make_lock_sample(args: MakeLockSampleArgs<'_>) -> i32 {
     };
 
     let entries = if single_only {
-        vec![entry0.to_wire_hex().unwrap()]
+        match entry0.to_wire_hex() {
+            Ok(h) => vec![h],
+            Err(e) => {
+                eprintln!("entry0 encode error: {e}");
+                return 1;
+            }
+        }
     } else {
         let slot1 = derive_slot(&anchor_id, &[0x22; 32]);
         let child1 = [0x22; 32];
@@ -955,8 +1030,18 @@ fn run_make_lock_sample(args: MakeLockSampleArgs<'_>) -> i32 {
             change_pubkey_hash: None,
             causal_sig: [0u8; 64],
         };
-        causal1.causal_sig = recv1_sk.sign(&causal1.digest().unwrap()).to_bytes();
-        let pow1 = solve_lock_pow(&slot1, &child1, 1, args.pow_bits, 0, 10_000_000).unwrap();
+        let causal1_dig = match causal1.digest() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("causal1 digest error: {e}");
+                return 1;
+            }
+        };
+        causal1.causal_sig = recv1_sk.sign(&causal1_dig).to_bytes();
+        let Some(pow1) = solve_lock_pow(&slot1, &child1, 1, args.pow_bits, 0, 10_000_000) else {
+            eprintln!("pow1 solve failed within attempt limit");
+            return 1;
+        };
         let entry1 = LockEntry {
             slot: slot1,
             parent_slot: target_slot,
@@ -971,7 +1056,14 @@ fn run_make_lock_sample(args: MakeLockSampleArgs<'_>) -> i32 {
             encrypted_payload: [0x66; HOP_ENCRYPTED_PAYLOAD_LEN],
             pow_nonce: pow1,
         };
-        vec![entry0.to_wire_hex().unwrap(), entry1.to_wire_hex().unwrap()]
+        let (h0, h1) = match (entry0.to_wire_hex(), entry1.to_wire_hex()) {
+            (Ok(h0), Ok(h1)) => (h0, h1),
+            (Err(e), _) | (_, Err(e)) => {
+                eprintln!("entry encode error: {e}");
+                return 1;
+            }
+        };
+        vec![h0, h1]
     };
 
     let req = serde_json::json!({
@@ -1072,7 +1164,10 @@ fn run_rotation_test(sub: RotationTestCmd) -> i32 {
             let mut prop = MigrationProposal {
                 anchor_id,
                 from_rev: manifest.revision,
-                to_rev: manifest.revision + 1,
+                to_rev: manifest
+                    .revision
+                    .checked_add(1)
+                    .ok_or("Manifest revision overflow")?,
                 new_threshold: 1,
                 new_servers: vec![manifest
                     .successors
@@ -1341,5 +1436,107 @@ fn run_lock_gc(config_opt: Option<PathBuf>, now_secs: u64) -> i32 {
             eprintln!("Lock GC failed: {}", e);
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_s08_cli_generate_config_data_dir_validation_and_panic_free_helpers() {
+        let valid_pk = "a".repeat(64);
+        // 1. README.md generate-config --data-dir CLI flag must parse
+        let parsed = Cli::try_parse_from([
+            "humoco-sync-server",
+            "generate-config",
+            "--admin-pubkey",
+            &valid_pk,
+            "--data-dir",
+            "d-0000000000000000",
+        ]);
+        assert!(
+            parsed.is_ok(),
+            "generate-config must accept --data-dir per README.md"
+        );
+
+        // 2. run_generate_config must reject invalid fields rather than emitting broken TOML
+        assert_ne!(
+            run_generate_config(
+                ConfigPreset::Hybrid,
+                valid_pk.clone(),
+                "https://sync.example.org".to_string(),
+                "127.0.0.1:8080".to_string(),
+                Some("anchors".to_string()),
+            ),
+            0
+        );
+        assert_ne!(
+            run_generate_config(
+                ConfigPreset::Hybrid,
+                valid_pk.clone(),
+                "https://".to_string(),
+                "127.0.0.1:8080".to_string(),
+                None,
+            ),
+            0
+        );
+        assert_ne!(
+            run_generate_config(
+                ConfigPreset::Hybrid,
+                "invalid-pk".to_string(),
+                "https://sync.example.org".to_string(),
+                "127.0.0.1:8080".to_string(),
+                None,
+            ),
+            0
+        );
+        assert_ne!(
+            run_generate_config(
+                ConfigPreset::Hybrid,
+                valid_pk.clone(),
+                "https://sync.example.org".to_string(),
+                "not-a-socket".to_string(),
+                None,
+            ),
+            0
+        );
+        // Empty admin_pubkey template still succeeds
+        assert_eq!(
+            run_generate_config(
+                ConfigPreset::Hybrid,
+                String::new(),
+                "https://sync.example.org".to_string(),
+                "127.0.0.1:8080".to_string(),
+                Some("d-0000000000000000".to_string()),
+            ),
+            0
+        );
+
+        // 3. run_make_lock_sample must not panic on invalid quarter=0
+        let rc = run_make_lock_sample(MakeLockSampleArgs {
+            lock_pub_hex: &"11".repeat(32),
+            admin_pub_hex: &"22".repeat(32),
+            quarter: 0,
+            ticket_json_path: None,
+            receipt_json_path: None,
+            manifest_json_path: None,
+            anchor_tag: None,
+            pow_bits: 8,
+            variant: "read_path",
+        });
+        assert_ne!(
+            rc, 0,
+            "Invalid quarter=0 must return non-zero without panicking"
+        );
+
+        // 4. SolvePow rejects infeasible bit counts instead of spinning indefinitely
+        assert_ne!(
+            run_sign_test(SignTestCmd::SolvePow {
+                challenge: "test".to_string(),
+                bits: 40,
+            }),
+            0
+        );
     }
 }

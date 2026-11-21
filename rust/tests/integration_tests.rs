@@ -8048,3 +8048,101 @@ async fn test_s09_f1_head_index_members_and_delete_parity() {
     let bkp_json: serde_json::Value = bkp_resp.json().await.unwrap();
     assert!(bkp_json["evicted_media"].as_u64().unwrap() >= 1);
 }
+
+#[tokio::test]
+async fn test_s08_router_caps_form_body_and_preserves_large_slot_uploads() {
+    let (_admin_sk, admin_pk) = gen_keypair();
+    let (friend_sk, friend_pk) = gen_keypair();
+
+    let mut cfg = base_hybrid_config(&admin_pk);
+    cfg.mode.register_path = "/join".to_string();
+    let srv = TestServer::start(cfg).await;
+    let now_u = unix_now();
+    let now = now_u as i64;
+    srv.state
+        .db
+        .put_admin_members(
+            &srv.state.config,
+            "backup",
+            std::slice::from_ref(&friend_pk),
+            now_u,
+        )
+        .unwrap();
+
+    // 1. Oversized form POST (> 64 KiB) to public web form must reject with 413 Payload Too Large
+    let big_form = format!("pubkey={}", "a".repeat(256 * 1024));
+    let form_resp = srv
+        .client
+        .post(format!("{}/join/open", srv.base_url))
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(big_form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        form_resp.status().as_u16(),
+        413,
+        "Oversized web form POST must be rejected at 64 KiB DefaultBodyLimit"
+    );
+
+    // 2. Large binary PUT /sync.php (> 64 KiB) still works up to channel quota
+    let big_backup = vec![0x5Au8; 200_000];
+    let mut put_req = srv.client.put(format!("{}/sync.php", srv.base_url));
+    for (k, v) in sign_member_headers(&friend_sk, "PUT", "backup", "", "", now, &big_backup) {
+        put_req = put_req.header(k, v);
+    }
+    let put_resp = put_req.body(big_backup).send().await.unwrap();
+    assert_eq!(
+        put_resp.status().as_u16(),
+        200,
+        "PUT /sync.php slot > 64 KiB must still succeed via streaming Body limit"
+    );
+}
+
+#[test]
+fn test_s08_deployment_hardening_invariants() {
+    let dockerfile = include_str!("../../Dockerfile");
+    assert!(dockerfile.contains("USER humoco"));
+    assert!(
+        dockerfile.contains("/var/lib/humoco-sync/data"),
+        "Dockerfile must pre-create /var/lib/humoco-sync/data for non-root Docker volume ownership"
+    );
+    assert!(
+        dockerfile.contains("chmod 0700 /var/lib/humoco-sync/data"),
+        "Dockerfile must restrict /var/lib/humoco-sync/data permissions to 0700"
+    );
+    assert!(
+        !dockerfile.contains("chown -R humoco:humoco /var/lib/humoco-sync /etc/humoco-sync"),
+        "Dockerfile must not grant humoco user write ownership over /etc/humoco-sync"
+    );
+
+    let compose = include_str!("../../docker/docker-compose.yml");
+    assert!(compose.contains("127.0.0.1:8080:8080"));
+    assert!(compose.contains(":ro"));
+    assert!(compose.contains("cap_drop:"));
+    assert!(compose.contains("ALL"));
+    assert!(compose.contains("no-new-privileges:true"));
+
+    let systemd = include_str!("../../docker/humoco-sync.service");
+    for required in [
+        "User=humoco-sync",
+        "Group=humoco-sync",
+        "UMask=0077",
+        "NoNewPrivileges=true",
+        "ProtectSystem=strict",
+        "PrivateDevices=true",
+        "ProtectKernelLogs=true",
+        "ProtectClock=true",
+        "ProtectHostname=true",
+        "RestrictNamespaces=true",
+        "RestrictRealtime=true",
+        "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX",
+        "SystemCallArchitectures=native",
+        "MemoryDenyWriteExecute=true",
+    ] {
+        assert!(
+            systemd.contains(required),
+            "systemd unit missing hardening directive: {required}"
+        );
+    }
+}
