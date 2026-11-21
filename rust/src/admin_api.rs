@@ -248,7 +248,7 @@ async fn api_delete_user(
     let Some(pk) = normalize_pubkey_hex(&raw_pk) else {
         return json_error(StatusCode::BAD_REQUEST, "Invalid pubkey hex");
     };
-    match state.db.delete_account_and_data(&pk, false) {
+    match state.db.delete_account_and_data(&pk) {
         Ok((deleted_slots, deleted_media, deleted_account)) => (
             StatusCode::OK,
             Json(serde_json::json!({

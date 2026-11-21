@@ -11,7 +11,7 @@ use humoco_sync_server::crypto::{
     canonical_revocation_message, format_admin_put_config_message,
     format_admin_put_members_message, format_admin_put_revoke_message, format_admin_status_message,
     format_delete_account_message, parse_member_message, random_hex, sha256_hex, unix_now,
-    RevocationNotice,
+    RevocationNotice, RevocationReplacementTarget,
 };
 use humoco_sync_server::db::ConditionalPrecondition;
 use humoco_sync_server::state::AppState;
@@ -6993,11 +6993,7 @@ async fn test_s05_registration_prechecks_pow_replay_and_delete_binding() {
         .unwrap()
         .contains("msg="));
 
-    srv_pow
-        .state
-        .db
-        .delete_account_and_data(&pow_pk, false)
-        .unwrap();
+    srv_pow.state.db.delete_account_and_data(&pow_pk).unwrap();
     let p_replay = srv_pow
         .client
         .post(format!("{}/register/pow", srv_pow.base_url))
@@ -7116,6 +7112,7 @@ async fn test_s05_registration_prechecks_pow_replay_and_delete_binding() {
     // 6. Confirmation endpoints must enforce IP rate limiting
     let mut rl_cfg = base_hybrid_config(&admin_pk);
     rl_cfg.mode.registration_gates = vec!["email".to_string()];
+    rl_cfg.email.enabled = true;
     rl_cfg.security.ip_requests_per_minute = 2;
     let rl_srv = TestServer::start(rl_cfg).await;
     for _ in 0..2 {
@@ -8115,8 +8112,22 @@ fn test_s08_deployment_hardening_invariants() {
         !dockerfile.contains("chown -R humoco:humoco /var/lib/humoco-sync /etc/humoco-sync"),
         "Dockerfile must not grant humoco user write ownership over /etc/humoco-sync"
     );
+    assert!(
+        dockerfile.contains("humoco-proto"),
+        "Dockerfile must copy humoco-proto via named BuildKit context"
+    );
+    assert!(
+        dockerfile.contains("RUN cargo build --release --locked"),
+        "Dockerfile must enforce cargo build --release --locked"
+    );
+    assert!(
+        !dockerfile.contains("2>/dev/null || cargo build --release"),
+        "Dockerfile must not fall back past --locked build failures"
+    );
 
     let compose = include_str!("../../docker/docker-compose.yml");
+    assert!(compose.contains("additional_contexts:"));
+    assert!(compose.contains("humoco-proto: ../../humoco-proto"));
     assert!(compose.contains("127.0.0.1:8080:8080"));
     assert!(compose.contains(":ro"));
     assert!(compose.contains("cap_drop:"));
@@ -8145,4 +8156,774 @@ fn test_s08_deployment_hardening_invariants() {
             "systemd unit missing hardening directive: {required}"
         );
     }
+}
+
+#[tokio::test]
+async fn test_s02_cold_pre_freeze_rejected_and_max_buckets_enforced() {
+    let (a1_sk, a1_pk) = gen_keypair();
+    let mut cfg = base_hybrid_config(&a1_pk);
+    cfg.lock.max_buckets = 1;
+    let s1 = TestServer::start(cfg).await;
+
+    let creator_mig_sk = SigningKey::from_bytes(&[141u8; 32]);
+    let creator_mig_pub = creator_mig_sk.verifying_key().to_bytes();
+    let quarter = humoco_proto::encode_quarter(2031, 4).unwrap();
+    let t0 = 1_795_000_000u64;
+    let e_s1 = server_entry_for_test(&s1, &a1_sk, humoco_proto::NominatedBy::Creator);
+
+    let man1 = build_multi_server_manifest(
+        vec![e_s1.clone()],
+        Vec::new(),
+        1,
+        creator_mig_pub,
+        Vec::new(),
+        t0 * 1_000,
+        quarter,
+    );
+    let aid1 = man1.rev1_anchor_id().unwrap();
+
+    // Cold PreFreeze MUST be rejected with 404 even when current_manifest is supplied
+    let cold_pf = s1
+        .client
+        .post(format!("{}/sync.php?lock_freeze", s1.base_url))
+        .json(&serde_json::json!({
+            "action": "pre_freeze",
+            "anchor_id": hex::encode(aid1),
+            "current_manifest": man1,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        cold_pf.status().as_u16(),
+        404,
+        "Unauthenticated cold PreFreeze must return 404 and not allocate bucket state"
+    );
+
+    // Ensure 0 entries in LOCK_BUCKETS / LOCK_ROTATIONS / LOCK_ANCHORS after rejected cold PreFreeze
+    let status_after_pf = s1
+        .state
+        .db
+        .get_lock_freeze_status(&s1.state.config, aid1, t0);
+    assert!(matches!(
+        status_after_pf,
+        Err(humoco_sync_server::db::DbError::Http { status: 404, .. })
+    ));
+
+    // Signed cold CreatorHeartbeat succeeds once (consuming max_buckets = 1)
+    let mut hb1 = humoco_proto::CreatorHeartbeat {
+        anchor_id: aid1,
+        timestamp_secs: t0,
+        sig: [0u8; 64],
+    };
+    hb1.sig = creator_mig_sk.sign(&hb1.digest()).to_bytes();
+    let (hb1_code, _) = s1
+        .state
+        .db
+        .process_lock_freeze(
+            &s1.state.config,
+            humoco_sync_server::lock_rotation::LockFreezeRequest::Heartbeat {
+                heartbeat: hb1,
+                current_manifest: Some(man1),
+            },
+            t0,
+        )
+        .unwrap();
+    assert_eq!(hb1_code, 200);
+
+    // Second distinct anchor cold bootstrap hits max_buckets = 1 -> 507
+    let man2 = build_multi_server_manifest(
+        vec![e_s1],
+        Vec::new(),
+        1,
+        creator_mig_pub,
+        Vec::new(),
+        (t0 + 10) * 1_000,
+        quarter,
+    );
+    let aid2 = man2.rev1_anchor_id().unwrap();
+    let mut hb2 = humoco_proto::CreatorHeartbeat {
+        anchor_id: aid2,
+        timestamp_secs: t0 + 10,
+        sig: [0u8; 64],
+    };
+    hb2.sig = creator_mig_sk.sign(&hb2.digest()).to_bytes();
+    let cap_err = s1
+        .state
+        .db
+        .process_lock_freeze(
+            &s1.state.config,
+            humoco_sync_server::lock_rotation::LockFreezeRequest::Heartbeat {
+                heartbeat: hb2,
+                current_manifest: Some(man2),
+            },
+            t0 + 10,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            cap_err,
+            humoco_sync_server::db::DbError::Http { status: 507, .. }
+        ),
+        "Second cold bucket beyond max_buckets=1 must fail with 507, got: {cap_err:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_audit_decisions_cluster2_auth_permissions_and_ttl() {
+    let (_admin_sk, admin_pk) = gen_keypair();
+    let (backup_sk, backup_pk) = gen_keypair();
+    let (card_sk, card_pk) = gen_keypair();
+    let (media_sk, media_pk) = gen_keypair();
+    let (stranger_sk, stranger_pk) = gen_keypair();
+
+    let mut cfg = base_hybrid_config(&admin_pk);
+    cfg.mode.enable_public_registration = true;
+    cfg.mode.registration_gates = vec!["email".to_string(), "code".to_string()];
+    cfg.email.enabled = false;
+    let srv = TestServer::start(cfg).await;
+    let db = &srv.state.db;
+    let now_u = unix_now();
+    let now = now_u as i64;
+
+    // 1. Unix DB file & newly-created parent permissions (0600 / 0700)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let db_mode = std::fs::metadata(&srv.state.config.server.db_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(db_mode, 0o600, "DB file must have 0600 permissions");
+
+        let sub_dir = srv
+            .state
+            .config
+            .server
+            .db_path
+            .parent()
+            .unwrap()
+            .join("sub");
+        let sub_db = sub_dir.join("perm_check.redb");
+        let _ = humoco_sync_server::db::SyncDb::open(&sub_db, "").unwrap();
+        let dir_mode = std::fs::metadata(&sub_dir).unwrap().permissions().mode() & 0o777;
+        let sub_db_mode = std::fs::metadata(&sub_db).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            dir_mode, 0o700,
+            "Newly created DB parent dir must have 0700"
+        );
+        assert_eq!(sub_db_mode, 0o600, "Nested DB file must have 0600");
+    }
+
+    // 2. SYNC-S05-06: email.enabled = false disables /register/email even if "email" is in registration_gates
+    let mail_off_resp = srv
+        .client
+        .post(format!("{}/register/email", srv.base_url))
+        .form(&[("pubkey", stranger_pk.as_str()), ("email", "a@example.org")])
+        .send()
+        .await
+        .unwrap();
+    let mail_off_loc = mail_off_resp
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        mail_off_loc.contains("disabled") || mail_off_loc.contains("err="),
+        "POST /register/email must reject when email.enabled=false, got {mail_off_loc:?}"
+    );
+
+    // 3. SYNC-S03-08: Unauthorized DELETE media (single & bulk) returns 403
+    let del_media_id = sha256_hex(b"missing-blob");
+    let mut r_del_unauth_single = srv.client.delete(format!("{}/sync.php", srv.base_url));
+    for (k, v) in sign_member_headers(&stranger_sk, "DELETE", "media", "", &del_media_id, now, b"")
+    {
+        r_del_unauth_single = r_del_unauth_single.header(k, v);
+    }
+    assert_eq!(
+        r_del_unauth_single.send().await.unwrap().status().as_u16(),
+        403,
+        "Unauthorized single DELETE media must return 403"
+    );
+    let mut r_del_unauth_bulk = srv.client.delete(format!("{}/sync.php", srv.base_url));
+    for (k, v) in sign_member_headers(&stranger_sk, "DELETE", "media", "", "", now, b"") {
+        r_del_unauth_bulk = r_del_unauth_bulk.header(k, v);
+    }
+    assert_eq!(
+        r_del_unauth_bulk.send().await.unwrap().status().as_u16(),
+        403,
+        "Unauthorized bulk DELETE media must return 403"
+    );
+
+    // 4. SYNC-S09-04: backup-only friend denied media (403); card fallback works when media unconfigured; explicit media isolates & prunes
+    db.put_admin_members(
+        &srv.state.config,
+        "backup",
+        std::slice::from_ref(&backup_pk),
+        now_u,
+    )
+    .unwrap();
+    db.put_admin_members(
+        &srv.state.config,
+        "card",
+        std::slice::from_ref(&card_pk),
+        now_u,
+    )
+    .unwrap();
+
+    let b_mid = sha256_hex(b"backup-only-media");
+    let mut r_backup_media = srv.client.put(format!("{}/sync.php", srv.base_url));
+    for (k, v) in sign_member_headers(&backup_sk, "PUT", "media", "", &b_mid, now, b"backup-media")
+    {
+        r_backup_media = r_backup_media.header(k, v);
+    }
+    assert_eq!(
+        r_backup_media
+            .body(b"backup-media".to_vec())
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        403,
+        "backup-only admin friend must NOT inherit media access"
+    );
+
+    let c_mid = sha256_hex(b"card-fallback-media");
+    let mut r_card_media = srv.client.put(format!("{}/sync.php", srv.base_url));
+    for (k, v) in sign_member_headers(&card_sk, "PUT", "media", "", &c_mid, now, b"card-media") {
+        r_card_media = r_card_media.header(k, v);
+    }
+    assert_eq!(
+        r_card_media
+            .body(b"card-media".to_vec())
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        200,
+        "card member inherits media while media list has not been explicitly configured"
+    );
+
+    // Explicit PUT ?members&channel=media([media_pk]) isolates media from card and prunes card_pk's fallback media
+    db.put_admin_members(
+        &srv.state.config,
+        "media",
+        std::slice::from_ref(&media_pk),
+        now_u + 1,
+    )
+    .unwrap();
+    let status_after_media = db.admin_status(&srv.state.config, now_u + 1).unwrap();
+    assert_eq!(
+        status_after_media.admin_members_count, 3,
+        "ADMIN_MEDIA_CONFIGURED_KEY sentinel must never inflate admin_members_count"
+    );
+    assert_eq!(
+        srv.client
+            .get(format!(
+                "{}/humoco_sync_data/{}.media.bin",
+                srv.base_url, c_mid
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        404,
+        "Setting explicit media list must prune orphaned media of card-only member"
+    );
+
+    let m_mid = sha256_hex(b"explicit-media-blob");
+    let mut r_exp_media = srv.client.put(format!("{}/sync.php", srv.base_url));
+    for (k, v) in sign_member_headers(
+        &media_sk,
+        "PUT",
+        "media",
+        "",
+        &m_mid,
+        now,
+        b"explicit-media",
+    ) {
+        r_exp_media = r_exp_media.header(k, v);
+    }
+    assert_eq!(
+        r_exp_media
+            .body(b"explicit-media".to_vec())
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        200
+    );
+    // Clearing card list leaves explicit media member untouched
+    db.put_admin_members(&srv.state.config, "card", &[], now_u + 2)
+        .unwrap();
+    assert_eq!(
+        srv.client
+            .get(format!(
+                "{}/humoco_sync_data/{}.media.bin",
+                srv.base_url, m_mid
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        200
+    );
+    // Removing from media prunes their media
+    db.put_admin_members(&srv.state.config, "media", &[], now_u + 3)
+        .unwrap();
+    assert_eq!(
+        srv.client
+            .get(format!(
+                "{}/humoco_sync_data/{}.media.bin",
+                srv.base_url, m_mid
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        404
+    );
+
+    // 5. Suspended account slots must still expire by TTL in get_slot_blob and run_maintenance
+    let (_, susp_pk) = gen_keypair();
+    db.register_or_upgrade_user(
+        &srv.state.config,
+        &susp_pk,
+        "free",
+        None,
+        None,
+        "open",
+        now_u,
+    )
+    .unwrap();
+    let old_ts = now_u.saturating_sub(100 * 86_400); // free card ttl = 90d
+    db.put_slot(
+        &srv.state.config,
+        &susp_pk,
+        "card",
+        None,
+        b"susp-expiring-card",
+        &ConditionalPrecondition::None,
+        old_ts,
+    )
+    .unwrap();
+    db.set_user_status(
+        &susp_pk,
+        humoco_sync_server::db::AccountStatus::Suspended,
+        now_u,
+    )
+    .unwrap();
+    assert!(
+        db.get_slot_blob(&srv.state.config, "card", &susp_pk, now_u)
+            .unwrap()
+            .is_none(),
+        "get_slot_blob must enforce TTL expiry even when owner is Suspended"
+    );
+    db.run_maintenance(&srv.state.config, now_u).unwrap();
+    assert_eq!(
+        db.admin_status(&srv.state.config, now_u)
+            .unwrap()
+            .slot_count,
+        0,
+        "run_maintenance must prune TTL-expired slots owned by Suspended users"
+    );
+
+    // 6. create_redeem_codes strict validation
+    assert!(db
+        .create_redeem_codes(
+            &srv.state.config,
+            0,
+            "free",
+            None,
+            1,
+            None,
+            None,
+            None,
+            now_u
+        )
+        .is_err());
+    assert!(db
+        .create_redeem_codes(
+            &srv.state.config,
+            501,
+            "free",
+            None,
+            1,
+            None,
+            None,
+            None,
+            now_u
+        )
+        .is_err());
+    assert!(db
+        .create_redeem_codes(
+            &srv.state.config,
+            1,
+            "free",
+            None,
+            0,
+            None,
+            None,
+            None,
+            now_u
+        )
+        .is_err());
+    assert!(db
+        .create_redeem_codes(
+            &srv.state.config,
+            1,
+            "free",
+            None,
+            1,
+            None,
+            None,
+            Some("BAD\nPREFIX"),
+            now_u
+        )
+        .is_err());
+    assert!(db
+        .create_redeem_codes(
+            &srv.state.config,
+            1,
+            "free",
+            None,
+            1,
+            None,
+            None,
+            Some(&"A".repeat(25)),
+            now_u
+        )
+        .is_err());
+    assert!(db
+        .create_redeem_codes(
+            &srv.state.config,
+            1,
+            "free",
+            None,
+            1,
+            None,
+            None,
+            Some("PROMO_2026-Q4"),
+            now_u
+        )
+        .is_ok());
+}
+
+#[tokio::test]
+async fn test_audit_decisions_cluster4_revoke_and_delete_account_parity() {
+    let (admin_sk, admin_pk) = gen_keypair();
+    let (user_sk, user_pk) = gen_keypair();
+    let (_rep_sk, rep_pk) = gen_keypair();
+    let srv = TestServer::start(base_hybrid_config(&admin_pk)).await;
+    let now = unix_now() as i64;
+
+    let send_revoke = |body_val: serde_json::Value| {
+        let srv = &srv;
+        let admin_sk = &admin_sk;
+        let admin_pk = &admin_pk;
+        async move {
+            let body = serde_json::to_vec(&body_val).unwrap();
+            let nonce = random_hex(16);
+            let msg = format_admin_put_revoke_message(now, &nonce, &sha256_hex(&body));
+            let sig = hex::encode(admin_sk.sign(msg.as_bytes()).to_bytes());
+            srv.client
+                .put(format!("{}/sync.php?revoke", srv.base_url))
+                .header("X-Drop-Pubkey", admin_pk)
+                .header("X-Drop-Timestamp", now.to_string())
+                .header("X-Drop-Nonce", nonce)
+                .header("X-Drop-Signature", sig)
+                .header("Content-Type", "application/json")
+                .body(body)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    let build_signed_notice = |issued_at: u64,
+                               effective_at: u64,
+                               write_url: &str,
+                               read_url: &str,
+                               reason: Option<&str>| {
+        let mut n = RevocationNotice {
+            drop_pub: admin_pk.clone(),
+            issued_at,
+            effective_at,
+            reason: reason.map(|s| s.to_string()),
+            replacement: Some(RevocationReplacementTarget {
+                write_url: write_url.to_string(),
+                read_url: read_url.to_string(),
+                drop_pub: rep_pk.clone(),
+            }),
+            signature: String::new(),
+        };
+        let msg = canonical_revocation_message(&n);
+        n.signature = hex::encode(admin_sk.sign(msg.as_bytes()).to_bytes());
+        n
+    };
+
+    // 1. Non-loopback http:// replacement URL rejected with 400
+    let bad_http = build_signed_notice(
+        100,
+        200,
+        "http://evil.example/sync.php",
+        "https://new.example/data",
+        Some("migrate"),
+    );
+    assert_eq!(
+        send_revoke(serde_json::to_value(&bad_http).unwrap())
+            .await
+            .status()
+            .as_u16(),
+        400
+    );
+
+    // 2. Self-redirect write_url (/sync.php, /sync/) and read_url rejected with 400
+    let self_write_php = build_signed_notice(
+        100,
+        200,
+        &format!("{}/sync.php", srv.base_url),
+        "https://new.example/data",
+        None,
+    );
+    assert_eq!(
+        send_revoke(serde_json::to_value(&self_write_php).unwrap())
+            .await
+            .status()
+            .as_u16(),
+        400
+    );
+
+    let self_write_clean = build_signed_notice(
+        100,
+        200,
+        &format!("{}/sync/", srv.base_url),
+        "https://new.example/data",
+        None,
+    );
+    assert_eq!(
+        send_revoke(serde_json::to_value(&self_write_clean).unwrap())
+            .await
+            .status()
+            .as_u16(),
+        400
+    );
+
+    let self_read = build_signed_notice(
+        100,
+        200,
+        "https://new.example/sync.php",
+        &format!("{}/", srv.state.config.read_url()),
+        None,
+    );
+    assert_eq!(
+        send_revoke(serde_json::to_value(&self_read).unwrap())
+            .await
+            .status()
+            .as_u16(),
+        400
+    );
+
+    // 3. Valid HTTPS replacement with uppercase hex + empty reason "" normalizes to lowercase / null
+    let canonical_valid = build_signed_notice(
+        100,
+        200,
+        "https://new.example/sync.php",
+        "https://new.example/data",
+        None,
+    );
+    let expected_sig = canonical_valid.signature.clone();
+    let upper_payload = serde_json::json!({
+        "drop_pub": admin_pk.to_ascii_uppercase(),
+        "issued_at": 100u64,
+        "effective_at": 200u64,
+        "reason": "",
+        "replacement": {
+            "write_url": "https://new.example/sync.php",
+            "read_url": "https://new.example/data",
+            "drop_pub": rep_pk.to_ascii_uppercase(),
+        },
+        "signature": expected_sig.to_ascii_uppercase(),
+    });
+    let pub_resp = send_revoke(upper_payload).await;
+    assert_eq!(pub_resp.status().as_u16(), 200);
+    let pub_json: serde_json::Value = pub_resp.json().await.unwrap();
+    assert_eq!(pub_json["revoked"], true);
+    assert_eq!(pub_json["revocation"]["drop_pub"], admin_pk);
+    assert_eq!(pub_json["revocation"]["signature"], expected_sig);
+    assert_eq!(pub_json["revocation"]["replacement"]["drop_pub"], rep_pk);
+    assert!(pub_json["revocation"]["reason"].is_null());
+
+    // 4. Stale / non-increasing issued_at rejected with 409 Conflict
+    let equal_ts = build_signed_notice(
+        100,
+        210,
+        "https://new.example/sync.php",
+        "https://new.example/data",
+        None,
+    );
+    assert_eq!(
+        send_revoke(serde_json::to_value(&equal_ts).unwrap())
+            .await
+            .status()
+            .as_u16(),
+        409
+    );
+    let older_ts = build_signed_notice(
+        99,
+        210,
+        "https://new.example/sync.php",
+        "https://new.example/data",
+        None,
+    );
+    assert_eq!(
+        send_revoke(serde_json::to_value(&older_ts).unwrap())
+            .await
+            .status()
+            .as_u16(),
+        409
+    );
+
+    // 5. Strictly greater issued_at succeeds
+    let newer_ts = build_signed_notice(
+        101,
+        220,
+        "https://new.example/sync.php",
+        "https://new.example/data",
+        Some("rotated"),
+    );
+    assert_eq!(
+        send_revoke(serde_json::to_value(&newer_ts).unwrap())
+            .await
+            .status()
+            .as_u16(),
+        200
+    );
+
+    // 6a. effective_at: 0 clears revocation
+    let clear_zero = send_revoke(serde_json::json!({
+        "notice": {
+            "drop_pub": admin_pk,
+            "issued_at": 102,
+            "effective_at": 0
+        }
+    }))
+    .await;
+    assert_eq!(clear_zero.status().as_u16(), 200);
+    assert_eq!(
+        clear_zero.json::<serde_json::Value>().await.unwrap()["revoked"],
+        false
+    );
+    assert!(srv.state.db.get_revocation().unwrap().is_none());
+
+    // 6b. Re-publish then clear with object missing effective_at
+    let repub = build_signed_notice(
+        103,
+        250,
+        "https://new.example/sync.php",
+        "https://new.example/data",
+        None,
+    );
+    assert_eq!(
+        send_revoke(serde_json::to_value(&repub).unwrap())
+            .await
+            .status()
+            .as_u16(),
+        200
+    );
+    let clear_missing = send_revoke(serde_json::json!({
+        "drop_pub": admin_pk,
+        "issued_at": 104
+    }))
+    .await;
+    assert_eq!(clear_missing.status().as_u16(), 200);
+    assert_eq!(
+        clear_missing.json::<serde_json::Value>().await.unwrap()["revoked"],
+        false
+    );
+    assert!(srv.state.db.get_revocation().unwrap().is_none());
+
+    // 7. DELETE ?account returns pubkey string and slot/media counts
+    let members_body = serde_json::to_vec(&serde_json::json!({ "pubkeys": [user_pk] })).unwrap();
+    let m_nonce = random_hex(16);
+    let m_msg = format_admin_put_members_message("card", now, &m_nonce, &sha256_hex(&members_body));
+    let m_sig = hex::encode(admin_sk.sign(m_msg.as_bytes()).to_bytes());
+    let m_resp = srv
+        .client
+        .put(format!("{}/sync.php?members&channel=card", srv.base_url))
+        .header("X-Drop-Pubkey", &admin_pk)
+        .header("X-Drop-Timestamp", now.to_string())
+        .header("X-Drop-Nonce", m_nonce)
+        .header("X-Drop-Signature", m_sig)
+        .header("Content-Type", "application/json")
+        .body(members_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(m_resp.status().as_u16(), 200);
+
+    let mut req_card = srv.client.put(format!("{}/sync.php", srv.base_url));
+    for (k, v) in sign_member_headers(&user_sk, "PUT", "card", "home", "", now, b"card-blob") {
+        req_card = req_card.header(k, v);
+    }
+    assert_eq!(
+        req_card
+            .body(b"card-blob".to_vec())
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        200
+    );
+
+    let parity_media_id = sha256_hex(b"parity-media-01");
+    let mut req_media = srv.client.put(format!("{}/sync.php", srv.base_url));
+    for (k, v) in sign_member_headers(
+        &user_sk,
+        "PUT",
+        "media",
+        "",
+        &parity_media_id,
+        now,
+        b"media-blob",
+    ) {
+        req_media = req_media.header(k, v);
+    }
+    assert_eq!(
+        req_media
+            .body(b"media-blob".to_vec())
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        200
+    );
+
+    let del_nonce = random_hex(16);
+    let del_msg = format_delete_account_message(now, &del_nonce);
+    let del_sig = hex::encode(user_sk.sign(del_msg.as_bytes()).to_bytes());
+    let del_resp = srv
+        .client
+        .delete(format!("{}/sync.php?account", srv.base_url))
+        .header("X-Drop-Pubkey", &user_pk)
+        .header("X-Drop-Timestamp", now.to_string())
+        .header("X-Drop-Nonce", del_nonce)
+        .header("X-Drop-Signature", del_sig)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del_resp.status().as_u16(), 200);
+    let del_json: serde_json::Value = del_resp.json().await.unwrap();
+    assert_eq!(del_json["deleted_account"], user_pk);
+    assert_eq!(del_json["deleted_slots"], 1);
+    assert_eq!(del_json["deleted_media"], 1);
 }

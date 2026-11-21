@@ -455,10 +455,17 @@ async fn handle_put_revoke(state: &AppState, headers: &HeaderMap, body: Body) ->
         Err(_) => return json_error(StatusCode::BAD_REQUEST, "Invalid revocation JSON"),
     };
 
+    let notice_val = val.get("notice").unwrap_or(&val);
+    let missing_or_zero_effective_at = notice_val.is_null()
+        || notice_val.as_object().is_some_and(|obj| {
+            obj.get("effective_at")
+                .is_none_or(|v| v.is_null() || v.as_u64() == Some(0))
+        });
+
     let should_clear = val.is_null()
         || val.get("clear").and_then(|v| v.as_bool()) == Some(true)
         || val.get("revoked").and_then(|v| v.as_bool()) == Some(false)
-        || val.get("effective_at").is_some_and(|v| v.is_null());
+        || missing_or_zero_effective_at;
 
     if should_clear {
         return match state.db.set_revocation(None) {
@@ -471,14 +478,61 @@ async fn handle_put_revoke(state: &AppState, headers: &HeaderMap, body: Body) ->
         };
     }
 
-    let notice_val = val.get("notice").unwrap_or(&val);
-    let notice: RevocationNotice = match serde_json::from_value(notice_val.clone()) {
+    let mut notice: RevocationNotice = match serde_json::from_value(notice_val.clone()) {
         Ok(n) => n,
         Err(_) => return json_error(StatusCode::BAD_REQUEST, "Invalid revocation notice fields"),
     };
 
+    notice.drop_pub = notice.drop_pub.to_ascii_lowercase();
+    notice.signature = notice.signature.to_ascii_lowercase();
+    if notice.reason.as_deref() == Some("") {
+        notice.reason = None;
+    }
+    if let Some(ref mut rep) = notice.replacement {
+        rep.drop_pub = rep.drop_pub.to_ascii_lowercase();
+    }
+
     if let Err(err) = verify_revocation_notice(&notice, &state.config.server.admin_pubkey) {
         return json_error(StatusCode::BAD_REQUEST, &err);
+    }
+
+    if let Some(ref rep) = notice.replacement {
+        let base = state
+            .config
+            .server
+            .public_base_url
+            .trim_end_matches('/')
+            .to_ascii_lowercase();
+        let own_sync_php = format!("{}/sync.php", base);
+        let own_sync = format!("{}/sync", base);
+        let own_read = state
+            .config
+            .read_url()
+            .trim_end_matches('/')
+            .to_ascii_lowercase();
+        let w = rep.write_url.trim_end_matches('/').to_ascii_lowercase();
+        let r = rep.read_url.trim_end_matches('/').to_ascii_lowercase();
+        if (!base.is_empty()
+            && (w == own_sync_php || w == own_sync || r == own_sync_php || r == own_sync))
+            || w == own_read
+            || r == own_read
+        {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "Revocation replacement URLs must not point back to this server",
+            );
+        }
+    }
+
+    match state.db.get_revocation() {
+        Ok(Some(existing)) if notice.issued_at <= existing.issued_at => {
+            return json_error(
+                StatusCode::CONFLICT,
+                "Conflict: revocation issued_at must be strictly greater than existing notice",
+            );
+        }
+        Ok(_) => {}
+        Err(e) => return db_err_to_response(e),
     }
 
     match state.db.set_revocation(Some(&notice)) {
@@ -828,12 +882,12 @@ async fn handle_delete_account(state: &AppState, headers: &HeaderMap, body: Body
         Err(e) => return db_err_to_response(e),
     }
 
-    match state.db.delete_account_and_data(&pubkey, false) {
-        Ok((deleted_slots, deleted_media, deleted_account)) => (
+    match state.db.delete_account_and_data(&pubkey) {
+        Ok((deleted_slots, deleted_media, _deleted_account)) => (
             StatusCode::OK,
             Json(serde_json::json!({
                 "status": "ok",
-                "deleted_account": deleted_account,
+                "deleted_account": pubkey,
                 "deleted_slots": deleted_slots,
                 "deleted_media": deleted_media,
             })),

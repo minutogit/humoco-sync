@@ -60,7 +60,8 @@ ip_requests_per_minute = 120
 pubkey_requests_per_minute = 60
 
 [email]
-enabled = false
+# Set to false to disable email delivery and the "email" registration gate
+enabled = true
 # "log" (dev/test) | "sendmail" | "smtp"
 transport = "log"
 smtp_host = "mail.example.org"
@@ -173,6 +174,8 @@ allow_pow_tickets = false
 ticket_pow_bits = 16
 # Maximum lock slot inodes before rejecting new genesis tickets (active buckets continue)
 max_inodes = 50000
+# Maximum number of cold-bootstrapped / active lock buckets tracked by the rotation state
+max_buckets = 50000
 # Pre-proposal freeze expiration TTL in seconds (default 1800s = 30m)
 pre_freeze_ttl_secs = 1800
 # Proposal timelock window in seconds for authority vetoes (default 259200s = 72h)

@@ -8,7 +8,7 @@ use humoco_proto::{
     LockPubKey, MigrationCert, MigrationProposal, MigrationVeto, ProposalInitiator,
     QuorumCertificate, ResolvedSlot, SnapshotExport, LOCK_ENTRY_WIRE_LEN,
 };
-use redb::{ReadableTable, WriteTransaction};
+use redb::{ReadableTable, ReadableTableMetadata, WriteTransaction};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
@@ -283,6 +283,7 @@ fn bootstrap_bucket_and_rotation_if_supplied(
     lock_pub: LockPubKey,
     supplied_manifest: Option<&AnchorManifest>,
     now_secs: u64,
+    allow_cold_bootstrap: bool,
 ) -> Result<(LockBucketRecord, AnchorRotationRecord), DbError> {
     let anchor_hex = hex::encode(anchor_id);
     let bucket = derive_bucket(&anchor_id, &lock_pub);
@@ -303,7 +304,7 @@ fn bootstrap_bucket_and_rotation_if_supplied(
         None => None,
     };
 
-    if let (Some(mut b), Some(rot)) = (existing_bucket, existing_rot) {
+    if let (Some(mut b), Some(rot)) = (existing_bucket.clone(), existing_rot) {
         if let BucketFreezeState::PreProposal { expires_at, .. } = b.freeze_state {
             if now_secs >= expires_at {
                 b.freeze_state = BucketFreezeState::Active;
@@ -312,6 +313,13 @@ fn bootstrap_bucket_and_rotation_if_supplied(
             }
         }
         return Ok((b, rot));
+    }
+
+    if existing_bucket.is_none() && !allow_cold_bootstrap {
+        return Err(DbError::http(
+            404,
+            "Anchor bucket not initialized on this server",
+        ));
     }
 
     let manifest = supplied_manifest
@@ -333,12 +341,12 @@ fn bootstrap_bucket_and_rotation_if_supplied(
         ));
     }
 
-    let b_raw = buckets
-        .get(bucket_hex.as_str())?
-        .map(|g| g.value().to_vec());
-    let b = match b_raw {
-        Some(bytes) => serde_json::from_slice::<LockBucketRecord>(&bytes)?,
+    let b = match existing_bucket {
+        Some(b) => b,
         None => {
+            if buckets.len()? >= cfg.lock.max_buckets {
+                return Err(DbError::http(507, "Lock bucket budget exhausted"));
+            }
             let used_inodes = read_used_inodes(&meta)?;
             if used_inodes >= cfg.lock.max_inodes {
                 return Err(DbError::http(507, "Lock inode budget exhausted"));
@@ -517,6 +525,7 @@ impl SyncDb {
                     lock_pub,
                     current_manifest.as_ref(),
                     now_secs,
+                    false,
                 )?;
                 {
                     let mut buckets = write_txn.open_table(LOCK_BUCKETS)?;
@@ -616,6 +625,7 @@ impl SyncDb {
                     lock_pub,
                     current_manifest.as_ref(),
                     now_secs,
+                    true,
                 )?;
                 if !heartbeat.verify(&rot.active_manifest.authority.creator_mig_pub) {
                     return Err(DbError::http(401, "Invalid CreatorHeartbeat signature"));
@@ -653,6 +663,7 @@ impl SyncDb {
                     lock_pub,
                     current_manifest.as_ref(),
                     now_secs,
+                    true,
                 )?;
 
                 if matches!(bucket.freeze_state, BucketFreezeState::EpochFrozen { .. }) {

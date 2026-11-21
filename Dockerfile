@@ -1,10 +1,13 @@
-# Multi-stage build for humoco-sync-server
+# syntax=docker/dockerfile:1
+# Multi-stage build for humoco-sync-server (BuildKit context `humoco-proto` -> ../../humoco-proto)
 FROM rust:1.86-bookworm AS builder
 
-WORKDIR /src
-COPY rust/Cargo.toml rust/Cargo.lock* ./
+WORKDIR /workspace/humoco-sync/rust
+COPY --from=humoco-proto Cargo.toml /workspace/humoco-proto/
+COPY --from=humoco-proto src /workspace/humoco-proto/src
+COPY rust/Cargo.toml rust/Cargo.lock ./
 COPY rust/src ./src
-RUN cargo build --release --locked 2>/dev/null || cargo build --release
+RUN cargo build --release --locked
 
 FROM debian:bookworm-slim
 
@@ -14,7 +17,7 @@ RUN apt-get update \
     && useradd --system --uid 10001 --create-home humoco
 
 WORKDIR /var/lib/humoco-sync
-COPY --from=builder /src/target/release/humoco-sync-server /usr/local/bin/humoco-sync-server
+COPY --from=builder /workspace/humoco-sync/rust/target/release/humoco-sync-server /usr/local/bin/humoco-sync-server
 COPY config.example.toml /etc/humoco-sync/config.example.toml
 
 RUN mkdir -p /var/lib/humoco-sync/data \

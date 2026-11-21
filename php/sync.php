@@ -51,7 +51,8 @@ $disableRateLimit = !empty($config['disable_rate_limit'])
 $channels = isset($config['channels']) && is_array($config['channels']) ? $config['channels'] : [];
 $maxTotalStorageMb = isset($config['max_total_storage_mb']) ? (int)$config['max_total_storage_mb'] : 2048;
 $maxTotalBytes = isset($config['max_total_bytes']) ? (int)$config['max_total_bytes'] : ($maxTotalStorageMb * 1024 * 1024);
-$softLimitBytes = (int)floor($maxTotalBytes * 0.8);
+$softWarningPct = isset($config['soft_warning_percent']) ? max(1, min(100, (int)$config['soft_warning_percent'])) : 80;
+$softLimitBytes = (int)floor($maxTotalBytes * ($softWarningPct / 100.0));
 
 // Resolve data directory
 $dataDirSetting = isset($config['data_dir']) && is_string($config['data_dir']) ? $config['data_dir'] : 'data';
@@ -364,7 +365,7 @@ function extract_and_validate_prefix() {
     if (strpos($prefix, '--') !== false) {
         return false;
     }
-    if (!preg_match('/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/', $prefix)) {
+    if (!preg_match('/\A[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\z/', $prefix)) {
         return false;
     }
     return $prefix;
@@ -377,7 +378,7 @@ function build_slot_filename($pubkey, $prefix, $channel) {
 
 // Parse slot filename into id, prefix, and channel
 function parse_slot_filename($basename) {
-    if (!preg_match('/^([0-9a-f]{64})(?:_([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))?\.([a-z0-9_]{1,32})\.bin$/', $basename, $matches)) {
+    if (!preg_match('/\A([0-9a-f]{64})(?:_([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))?\.([a-z0-9_]{1,32})\.bin\z/', $basename, $matches)) {
         return null;
     }
     $prefix = isset($matches[2]) ? $matches[2] : '';
@@ -460,7 +461,7 @@ if (isset($state['admin_config']) && is_array($state['admin_config'])) {
     if (isset($state['admin_config']['max_total_storage_mb'])) {
         $maxTotalStorageMb = (int)$state['admin_config']['max_total_storage_mb'];
         $maxTotalBytes = $maxTotalStorageMb * 1024 * 1024;
-        $softLimitBytes = (int)floor($maxTotalBytes * 0.8);
+        $softLimitBytes = (int)floor($maxTotalBytes * ($softWarningPct / 100.0));
     }
     if (isset($state['admin_config']['max_members'])) {
         $maxMembers = (int)$state['admin_config']['max_members'];
@@ -719,8 +720,8 @@ function lazy_prune_slots($dataDir, array $channels, array &$state, $now) {
     }
 }
 
-// Helper: evict oldest media blobs when higher-priority channels need space
-function evict_oldest_media_for_space($dataDir, array &$state, $neededBytes, $maxTotalBytes): bool {
+// Helper: evict oldest media blobs when space is needed
+function evict_oldest_media_for_space($dataDir, array &$state, $neededBytes, $maxTotalBytes, $skipMediaId = null): bool {
     if ($state['used_bytes'] + $neededBytes <= $maxTotalBytes) {
         return true;
     }
@@ -731,6 +732,9 @@ function evict_oldest_media_for_space($dataDir, array &$state, $neededBytes, $ma
     $candidates = [];
     $evictableTotal = 0;
     foreach ($state['media_blobs'] as $blobId => $blobInfo) {
+        if ($skipMediaId !== null && $blobId === $skipMediaId) {
+            continue;
+        }
         $mFile = $dataDir . DIRECTORY_SEPARATOR . $blobId . '.media.bin';
         $sz = isset($blobInfo['size']) ? (int)$blobInfo['size'] : 0;
         if (file_exists($mFile)) {
@@ -1359,7 +1363,12 @@ if ($method === 'PUT' && isset($_GET['revoke']) && count($_GET) === 1) {
     }
 
     $state['revocation'] = $cleanNotice;
-    sync_save_and_respond(200, $lockFp, $stateFile, $state, $revJson, array_merge($commonHeaders, [
+    $respJson = json_encode([
+        'status'     => 'ok',
+        'revoked'    => true,
+        'revocation' => $cleanNotice,
+    ], JSON_UNESCAPED_SLASHES);
+    sync_save_and_respond(200, $lockFp, $stateFile, $state, $respJson !== false ? $respJson : '{}', array_merge($commonHeaders, [
         'Content-Type' => 'application/json; charset=utf-8',
     ]));
 }
@@ -1573,7 +1582,7 @@ if ($method === 'PUT' && empty($_GET)) {
         }
         $delta = $newSize - $oldBlobSize;
 
-        // Pre-compute non-evictable channel & global usage so 507 never needlessly evicts user media
+        // Pre-compute feasibility against non-evictable storage so 507 never needlessly evicts media
         $maxUserCount = isset($channelCfg['max_user_count']) ? (int)$channelCfg['max_user_count'] : 12;
         $maxUserBytes = min($maxUserBytesLimit, isset($channelCfg['max_user_bytes']) ? (int)$channelCfg['max_user_bytes'] : 6291456);
         $maxChannelMb = isset($channelCfg['max_channel_mb']) ? (int)$channelCfg['max_channel_mb'] : 100;
@@ -1581,22 +1590,27 @@ if ($method === 'PUT' && empty($_GET)) {
         if ($maxUserCount < 1 || $newSize > $maxUserBytes) {
             sync_save_and_respond(507, $lockFp, $stateFile, $state, 'Insufficient Storage: Member media quota exceeded', $commonHeaders);
         }
-        $otherChannelMediaBytes = 0;
-        $userEvictableMediaBytes = 0;
+        if ($newSize > $maxChannelBytes) {
+            sync_save_and_respond(507, $lockFp, $stateFile, $state, 'Insufficient Storage: Media channel quota exceeded', $commonHeaders);
+        }
+        $allOtherMediaBytes = 0;
         if (isset($state['media_blobs']) && is_array($state['media_blobs'])) {
             foreach ($state['media_blobs'] as $mId => $mInfo) {
-                $mSize = isset($mInfo['size']) ? (int)$mInfo['size'] : 0;
-                if (isset($mInfo['owner']) && $mInfo['owner'] === $pubkey && $mId !== $mediaId) {
-                    $userEvictableMediaBytes += $mSize;
-                } elseif ($mId !== $mediaId) {
-                    $otherChannelMediaBytes += $mSize;
+                if ($mId !== $mediaId) {
+                    $mFile = $dataDir . DIRECTORY_SEPARATOR . $mId . '.media.bin';
+                    $mSize = isset($mInfo['size']) ? (int)$mInfo['size'] : 0;
+                    if (file_exists($mFile)) {
+                        $realSz = filesize($mFile);
+                        if ($realSz !== false) {
+                            $mSize = $realSz;
+                        }
+                    }
+                    $allOtherMediaBytes += $mSize;
                 }
             }
         }
-        if (($otherChannelMediaBytes + $newSize) > $maxChannelBytes) {
-            sync_save_and_respond(507, $lockFp, $stateFile, $state, 'Insufficient Storage: Media channel quota exceeded', $commonHeaders);
-        }
-        if (($state['used_bytes'] - $userEvictableMediaBytes) + $delta > $maxTotalBytes) {
+        $nonMediaUsedBytes = max(0, $state['used_bytes'] - $oldBlobSize - $allOtherMediaBytes);
+        if (($nonMediaUsedBytes + $newSize) > $maxTotalBytes) {
             sync_save_and_respond(507, $lockFp, $stateFile, $state, 'Insufficient Storage: Global sync quota exceeded', $commonHeaders);
         }
 
@@ -1604,36 +1618,97 @@ if ($method === 'PUT' && empty($_GET)) {
             sync_save_and_respond(507, $lockFp, $stateFile, $state, 'Insufficient Storage: Account total quota exceeded', $commonHeaders);
         }
 
-        // Compute member's current media count & bytes (excluding $mediaId if overwriting own existing blob)
-        // and total channel media bytes across all $state['media_blobs']
+        $mediaBlobSize = static function ($mId, $mInfo) use ($dataDir): int {
+            $mFile = $dataDir . DIRECTORY_SEPARATOR . $mId . '.media.bin';
+            $sz = isset($mInfo['size']) ? (int)$mInfo['size'] : 0;
+            if (file_exists($mFile)) {
+                $realSz = filesize($mFile);
+                if ($realSz !== false) {
+                    $sz = $realSz;
+                }
+            }
+            return $sz;
+        };
+
+        // Stage 1: Priority-3 ring-buffer LRU eviction for member's own max_user_count / max_user_bytes
+        $userMedia = [];
         $userCount = 0;
         $userBytes = 0;
-        $channelMediaBytes = 0;
         if (isset($state['media_blobs']) && is_array($state['media_blobs'])) {
             foreach ($state['media_blobs'] as $mId => $mInfo) {
-                $mSize = isset($mInfo['size']) ? (int)$mInfo['size'] : 0;
-                $channelMediaBytes += $mSize;
-                if (isset($mInfo['owner']) && $mInfo['owner'] === $pubkey) {
-                    if ($mId !== $mediaId) {
-                        $userCount++;
-                        $userBytes += $mSize;
-                    }
+                if (isset($mInfo['owner']) && $mInfo['owner'] === $pubkey && $mId !== $mediaId) {
+                    $sz = $mediaBlobSize($mId, $mInfo);
+                    $userCount++;
+                    $userBytes += $sz;
+                    $userMedia[$mId] = [
+                        'mtime' => isset($mInfo['mtime']) ? (int)$mInfo['mtime'] : 0,
+                        'size'  => $sz,
+                    ];
                 }
             }
         }
-
-        // Check per-member limits
+        if (($userCount + 1) > $maxUserCount || ($userBytes + $newSize) > $maxUserBytes) {
+            uksort($userMedia, function ($ka, $kb) use ($userMedia) {
+                $cmp = $userMedia[$ka]['mtime'] <=> $userMedia[$kb]['mtime'];
+                return $cmp !== 0 ? $cmp : strcmp((string)$ka, (string)$kb);
+            });
+            foreach ($userMedia as $victimId => $vMeta) {
+                if (($userCount + 1) <= $maxUserCount && ($userBytes + $newSize) <= $maxUserBytes) {
+                    break;
+                }
+                $vFile = $dataDir . DIRECTORY_SEPARATOR . $victimId . '.media.bin';
+                if (file_exists($vFile)) {
+                    @unlink($vFile);
+                }
+                $userCount--;
+                $userBytes -= $vMeta['size'];
+                $state['used_bytes'] = max(0, $state['used_bytes'] - $vMeta['size']);
+                unset($state['media_blobs'][$victimId]);
+            }
+        }
         if (($userCount + 1) > $maxUserCount || ($userBytes + $newSize) > $maxUserBytes) {
             sync_save_and_respond(507, $lockFp, $stateFile, $state, 'Insufficient Storage: Member media quota exceeded', $commonHeaders);
         }
 
-        // Check channel limit
-        if (($channelMediaBytes + $delta) > $maxChannelBytes) {
+        // Stage 2: Priority-3 ring-buffer LRU eviction for global max_channel_mb
+        $channelMedia = [];
+        $channelMediaBytes = 0;
+        if (isset($state['media_blobs']) && is_array($state['media_blobs'])) {
+            foreach ($state['media_blobs'] as $mId => $mInfo) {
+                if ($mId !== $mediaId) {
+                    $sz = $mediaBlobSize($mId, $mInfo);
+                    $channelMediaBytes += $sz;
+                    $channelMedia[$mId] = [
+                        'mtime' => isset($mInfo['mtime']) ? (int)$mInfo['mtime'] : 0,
+                        'size'  => $sz,
+                    ];
+                }
+            }
+        }
+        if (($channelMediaBytes + $newSize) > $maxChannelBytes) {
+            uksort($channelMedia, function ($ka, $kb) use ($channelMedia) {
+                $cmp = $channelMedia[$ka]['mtime'] <=> $channelMedia[$kb]['mtime'];
+                return $cmp !== 0 ? $cmp : strcmp((string)$ka, (string)$kb);
+            });
+            foreach ($channelMedia as $victimId => $vMeta) {
+                if (($channelMediaBytes + $newSize) <= $maxChannelBytes) {
+                    break;
+                }
+                $vFile = $dataDir . DIRECTORY_SEPARATOR . $victimId . '.media.bin';
+                if (file_exists($vFile)) {
+                    @unlink($vFile);
+                }
+                $channelMediaBytes -= $vMeta['size'];
+                $state['used_bytes'] = max(0, $state['used_bytes'] - $vMeta['size']);
+                unset($state['media_blobs'][$victimId]);
+            }
+        }
+        if (($channelMediaBytes + $newSize) > $maxChannelBytes) {
             sync_save_and_respond(507, $lockFp, $stateFile, $state, 'Insufficient Storage: Media channel quota exceeded', $commonHeaders);
         }
 
-        // Check global limit
-        if ($state['used_bytes'] + $delta > $maxTotalBytes) {
+        // Stage 3: Priority-3 ring-buffer LRU eviction for global max_total_storage_mb
+        if (($state['used_bytes'] + $delta) > $maxTotalBytes && !evict_oldest_media_for_space($dataDir, $state, $delta, $maxTotalBytes, $mediaId)) {
             sync_save_and_respond(507, $lockFp, $stateFile, $state, 'Insufficient Storage: Global sync quota exceeded', $commonHeaders);
         }
 
@@ -1782,7 +1857,8 @@ if ($method === 'DELETE' && isset($_GET['account']) && count($_GET) === 1) {
     }
     $state['nonces'][$nonce] = $now;
 
-    $deletedAnySlot = false;
+    $deletedSlots = 0;
+    $deletedMedia = 0;
     $existingBins = glob($dataDir . DIRECTORY_SEPARATOR . '*.*.bin');
     if ($existingBins !== false) {
         foreach ($existingBins as $file) {
@@ -1794,7 +1870,7 @@ if ($method === 'DELETE' && isset($_GET['account']) && count($_GET) === 1) {
                 if ($sz !== false) {
                     $state['used_bytes'] = max(0, $state['used_bytes'] - $sz);
                 }
-                $deletedAnySlot = true;
+                $deletedSlots++;
             }
         }
     }
@@ -1814,17 +1890,20 @@ if ($method === 'DELETE' && isset($_GET['account']) && count($_GET) === 1) {
                     $state['used_bytes'] = max(0, $state['used_bytes'] - $sz);
                 }
                 unset($state['media_blobs'][$mId]);
+                $deletedMedia++;
             }
         }
     }
 
-    if ($deletedAnySlot) {
+    if ($deletedSlots > 0) {
         rebuild_index($dataDir, $channels);
     }
 
     sync_save_and_respond(200, $lockFp, $stateFile, $state, json_encode([
         'status'          => 'ok',
         'deleted_account' => $pubkey,
+        'deleted_slots'   => $deletedSlots,
+        'deleted_media'   => $deletedMedia,
     ], JSON_UNESCAPED_SLASHES), array_merge($commonHeaders, [
         'Content-Type' => 'application/json; charset=utf-8',
     ]));
@@ -1887,7 +1966,7 @@ if ($method === 'DELETE' && empty($_GET)) {
                 }
             }
             if (!$ownsAny) {
-                sync_fail_ip_and_respond(404, $lockFp, 'Not Found', $commonHeaders);
+                sync_fail_ip_and_respond(403, $lockFp, 'Forbidden', $commonHeaders);
             }
         }
 
@@ -1970,7 +2049,7 @@ if ($method === 'DELETE' && empty($_GET)) {
     }
 
     if (!$isMember && !$slotExists) {
-        sync_fail_ip_and_respond(404, $lockFp, 'Not Found', $commonHeaders);
+        sync_fail_ip_and_respond(403, $lockFp, 'Forbidden', $commonHeaders);
     }
 
     sync_check_member_ratelimit($disableRateLimit, $lockFp, $stateFile, $state, $pubkey, $now, $commonHeaders);

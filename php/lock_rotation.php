@@ -316,7 +316,7 @@ function lock_restore_non_proposal_freeze_state(array $r): string|array {
     return is_array($sf) ? ['self_frozen' => $sf] : 'active';
 }
 
-function lock_bootstrap_anchor(array $cfg, array $keys, array $p, string $aHex, string $bHex, mixed $m, int $now): array {
+function lock_bootstrap_anchor(array $cfg, array $keys, array $p, string $aHex, string $bHex, mixed $m, int $now, bool $allowColdBootstrap = true): array {
     if ($m !== null && !is_array($m)) lock_fail(400, 'Invalid current_manifest');
     $bFile = $p['meta'] . "/buckets/{$bHex}.json";
     $rFile = $p['meta'] . "/rotations/{$aHex}.json";
@@ -326,6 +326,7 @@ function lock_bootstrap_anchor(array $cfg, array $keys, array $p, string $aHex, 
         if (lock_auto_expire_pre_freeze($b, $now)) lock_write_json($bFile, $b);
         return [$b, $r];
     }
+    if ($b === null && !$allowColdBootstrap) lock_fail(404, 'Anchor bucket not initialized on this server');
     if (!is_array($m)) lock_fail(404, 'Anchor bucket not initialized on this server');
     $comms = lock_verify_manifest_chain($m, hex2bin($aHex));
     if ($comms === null) lock_fail(400, 'Invalid current_manifest');
@@ -333,6 +334,8 @@ function lock_bootstrap_anchor(array $cfg, array $keys, array $p, string $aHex, 
     $q = (int)$m['retain_until_quarter'];
     if ($q > $cfg['max_retention_quarter']) lock_fail(422, 'Manifest retain_until_quarter exceeds server limit');
     if ($b === null) {
+        $bucketFiles = glob($p['meta'] . '/buckets/*.json') ?: [];
+        if (count($bucketFiles) >= $cfg['max_buckets']) lock_fail(507, 'Lock bucket budget exhausted');
         if (lock_used_inodes_get($p) >= $cfg['max_inodes']) lock_fail(507, 'Lock inode budget exhausted');
         $b = ['anchor_id' => $aHex, 'retain_until_quarter' => $q, 'creator_mig_pub' => $m['authority']['creator_mig_pub'], 'write_seq' => 0, 'bucket_head' => hash('sha256', 'HUMOCO_BUCKET_INIT_V1' . hex2bin($bHex) . pack('v', $q)), 'freeze_state' => 'active', 'slots' => [], 'conflicts' => [], 'output_claims' => []];
         lock_write_json($bFile, $b);
@@ -385,7 +388,7 @@ function lock_handle_freeze(string $method, array $cfg, array $keys, string $dat
         $a32 = lock_hex_bytes($req['anchor_id'] ?? null, 32) ?? lock_fail(400, 'Invalid anchor_id');
         $aHex = $req['anchor_id']; $bHex = hash('sha256', 'HUMOCO_SYNC_BUCKET_V1' . $a32 . $keys['pk32']);
         $res = lock_with_lock($p['meta'] . "/buckets/{$bHex}.lockdir", static function () use ($cfg, $keys, $p, $aHex, $bHex, $req, $now): array {
-            [$b, $r] = lock_bootstrap_anchor($cfg, $keys, $p, $aHex, $bHex, $req['current_manifest'] ?? null, $now);
+            [$b, $r] = lock_bootstrap_anchor($cfg, $keys, $p, $aHex, $bHex, $req['current_manifest'] ?? null, $now, false);
             $rev = (int)$r['active_manifest']['revision']; $fs = $b['freeze_state'];
             if (is_array($fs)) {
                 if (isset($fs['epoch_frozen'])) lock_fail(409, 'epoch_frozen');
@@ -412,7 +415,18 @@ function lock_handle_freeze(string $method, array $cfg, array $keys, string $dat
         if ($ts > ($now + 60)) lock_fail(400, 'Heartbeat timestamp is in the future');
         $aHex = $hb['anchor_id']; $bHex = hash('sha256', 'HUMOCO_SYNC_BUCKET_V1' . $a32 . $keys['pk32']);
         $actSecs = lock_with_lock($p['meta'] . "/buckets/{$bHex}.lockdir", static function () use ($cfg, $keys, $p, $a32, $aHex, $bHex, $ts, $sig, $req, $now): int {
-            [, $r] = lock_bootstrap_anchor($cfg, $keys, $p, $aHex, $bHex, $req['current_manifest'] ?? null, $now);
+            $bExisting = lock_read_json($p['meta'] . "/buckets/{$bHex}.json");
+            $rExisting = lock_read_json($p['meta'] . "/rotations/{$aHex}.json");
+            if ($bExisting === null || $rExisting === null) {
+                $m = $req['current_manifest'] ?? null;
+                if (!is_array($m)) lock_fail(404, 'Anchor bucket not initialized on this server');
+                $comms = lock_verify_manifest_chain($m, $a32);
+                if ($comms === null) lock_fail(400, 'Invalid current_manifest');
+                if (!in_array($keys['pkHex'], $comms[count($comms) - 1]['members'], true)) lock_fail(400, 'Server lock_pub is not a member of active manifest');
+                if ((int)$m['retain_until_quarter'] > $cfg['max_retention_quarter']) lock_fail(422, 'Manifest retain_until_quarter exceeds server limit');
+                if (!lock_verify_sig(hex2bin($m['authority']['creator_mig_pub']), $sig, hash('sha256', 'HUMOCO_CREATOR_HB_V1' . $a32 . pack('P', $ts), true))) lock_fail(401, 'Invalid CreatorHeartbeat signature');
+            }
+            [, $r] = lock_bootstrap_anchor($cfg, $keys, $p, $aHex, $bHex, $req['current_manifest'] ?? null, $now, true);
             if (!lock_verify_sig(hex2bin($r['active_manifest']['authority']['creator_mig_pub']), $sig, hash('sha256', 'HUMOCO_CREATOR_HB_V1' . $a32 . pack('P', $ts), true))) lock_fail(401, 'Invalid CreatorHeartbeat signature');
             $r['last_creator_activity_secs'] = max((int)$r['last_creator_activity_secs'], $ts);
             lock_write_json($p['meta'] . "/rotations/{$aHex}.json", $r);
@@ -427,7 +441,22 @@ function lock_handle_freeze(string $method, array $cfg, array $keys, string $dat
         if ($a32 === null || $pHash32 === null) lock_fail(400, 'Invalid MigrationProposal');
         $aHex = $prop['anchor_id']; $pHashHex = bin2hex($pHash32); $bHex = hash('sha256', 'HUMOCO_SYNC_BUCKET_V1' . $a32 . $keys['pk32']);
         $res = lock_with_lock($p['meta'] . "/buckets/{$bHex}.lockdir", static function () use ($cfg, $keys, $p, $a32, $aHex, $bHex, $prop, $pHash32, $pHashHex, $req, $now): array {
-            [$b, $r] = lock_bootstrap_anchor($cfg, $keys, $p, $aHex, $bHex, $req['current_manifest'] ?? null, $now);
+            $bExisting = lock_read_json($p['meta'] . "/buckets/{$bHex}.json");
+            $rExisting = lock_read_json($p['meta'] . "/rotations/{$aHex}.json");
+            if ($bExisting === null || $rExisting === null) {
+                $m = $req['current_manifest'] ?? null;
+                if (!is_array($m)) lock_fail(404, 'Anchor bucket not initialized on this server');
+                $comms = lock_verify_manifest_chain($m, $a32);
+                if ($comms === null) lock_fail(400, 'Invalid current_manifest');
+                if (!in_array($keys['pkHex'], $comms[count($comms) - 1]['members'], true)) lock_fail(400, 'Server lock_pub is not a member of active manifest');
+                if ((int)$m['retain_until_quarter'] > $cfg['max_retention_quarter']) lock_fail(422, 'Manifest retain_until_quarter exceeds server limit');
+                if ((int)$prop['from_rev'] !== (int)$m['revision']) lock_fail(409, 'Manifest revision mismatch');
+                if ((int)$prop['proposed_at'] > $now + 60 || ($now - (int)$prop['proposed_at']) > 3600) lock_fail(400, 'Proposal proposed_at outside fresh 3600s submission window');
+                if (!lock_verify_proposal($prop, $a32, $m)) lock_fail(400, 'Proposal validation failed');
+                $initAct = min($now, intdiv((int)$m['issued_at_ms'], 1000));
+                if ($prop['initiator']['kind'] === 'guarantor' && $now < ($initAct + $cfg['creator_inactivity_secs'])) lock_fail(403, 'Creator 30-day inactivity window has not elapsed yet');
+            }
+            [$b, $r] = lock_bootstrap_anchor($cfg, $keys, $p, $aHex, $bHex, $req['current_manifest'] ?? null, $now, true);
             if (is_array($b['freeze_state']) && isset($b['freeze_state']['epoch_frozen'])) lock_fail(409, 'epoch_frozen');
             if (in_array($pHashHex, $r['vetoed_proposal_hashes'] ?? [], true)) lock_fail(409, 'Proposal was previously vetoed');
             if ((int)$prop['from_rev'] !== (int)$r['active_manifest']['revision']) lock_fail(409, 'Manifest revision mismatch');

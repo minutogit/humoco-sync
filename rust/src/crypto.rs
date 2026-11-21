@@ -196,6 +196,67 @@ pub fn is_valid_lock_delegation_url(url: &str) -> bool {
         && !url.chars().any(|c| c.is_control() || c.is_whitespace())
 }
 
+/// Validates sync replacement URLs embedded in revocation notices:
+/// requires `https://` with a non-empty host, or `http://` strictly for loopback hosts
+/// (`127.0.0.1`, `localhost`, `[::1]`), with no embedded credentials, whitespace, or control chars.
+pub fn is_valid_sync_revocation_url(url: &str) -> bool {
+    if url.is_empty()
+        || url.len() > 2048
+        || url.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return false;
+    }
+    let (is_https, rest) = if let Some(rest) = url.strip_prefix("https://") {
+        (true, rest)
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        (false, rest)
+    } else {
+        return false;
+    };
+
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') {
+        return false;
+    }
+
+    let (host, port_part) = if authority.starts_with('[') {
+        let Some(end) = authority.find(']') else {
+            return false;
+        };
+        let host = &authority[..=end];
+        let tail = &authority[end + 1..];
+        let port = if tail.is_empty() {
+            None
+        } else if let Some(p) = tail.strip_prefix(':') {
+            Some(p)
+        } else {
+            return false;
+        };
+        (host, port)
+    } else {
+        match authority.split_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (authority, None),
+        }
+    };
+
+    if host.is_empty() || (host.starts_with('[') && host.len() <= 2) {
+        return false;
+    }
+    if let Some(p) = port_part {
+        if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) || p.parse::<u16>().is_err() {
+            return false;
+        }
+    }
+
+    if is_https {
+        true
+    } else {
+        let host_lower = host.to_ascii_lowercase();
+        matches!(host_lower.as_str(), "127.0.0.1" | "localhost" | "[::1]")
+    }
+}
+
 pub fn format_lock_delegate_signature_message(
     admin_pub: &str,
     lock_pub: &str,
@@ -299,8 +360,8 @@ pub fn verify_revocation_notice(
         if !is_hex_exact(&rep.drop_pub.to_ascii_lowercase(), 64) {
             return Err("Invalid replacement drop_pub".to_string());
         }
-        if !is_valid_lock_delegation_url(&rep.write_url)
-            || !is_valid_lock_delegation_url(&rep.read_url)
+        if !is_valid_sync_revocation_url(&rep.write_url)
+            || !is_valid_sync_revocation_url(&rep.read_url)
         {
             return Err("Invalid replacement URLs".to_string());
         }
@@ -807,6 +868,50 @@ mod tests {
             signature: String::new(),
         });
         assert!(verify_revocation_notice(&case_e, &pk_hex).is_err());
+
+        // Case E2: plain non-loopback http:// URL rejected
+        let case_e2 = sign_notice(RevocationNotice {
+            drop_pub: pk_hex.clone(),
+            issued_at: 100,
+            effective_at: 200,
+            reason: None,
+            replacement: Some(RevocationReplacementTarget {
+                write_url: "http://evil.example/sync.php".to_string(),
+                read_url: "https://new.example/data".to_string(),
+                drop_pub: rep_pk_hex.clone(),
+            }),
+            signature: String::new(),
+        });
+        assert!(verify_revocation_notice(&case_e2, &pk_hex).is_err());
+
+        // Case E3: localhost loopback http:// URL and userinfo rejection
+        let case_e3_ok = sign_notice(RevocationNotice {
+            drop_pub: pk_hex.clone(),
+            issued_at: 100,
+            effective_at: 200,
+            reason: None,
+            replacement: Some(RevocationReplacementTarget {
+                write_url: "http://127.0.0.1:8080/sync.php".to_string(),
+                read_url: "http://localhost:8080/data".to_string(),
+                drop_pub: rep_pk_hex.clone(),
+            }),
+            signature: String::new(),
+        });
+        assert!(verify_revocation_notice(&case_e3_ok, &pk_hex).is_ok());
+
+        let case_e4_cred = sign_notice(RevocationNotice {
+            drop_pub: pk_hex.clone(),
+            issued_at: 100,
+            effective_at: 200,
+            reason: None,
+            replacement: Some(RevocationReplacementTarget {
+                write_url: "https://user@new.example/sync.php".to_string(),
+                read_url: "https://new.example/data".to_string(),
+                drop_pub: rep_pk_hex.clone(),
+            }),
+            signature: String::new(),
+        });
+        assert!(verify_revocation_notice(&case_e4_cred, &pk_hex).is_err());
 
         // Case F: valid replacement notice succeeds
         let case_f = sign_notice(RevocationNotice {

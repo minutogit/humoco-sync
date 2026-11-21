@@ -1077,7 +1077,7 @@ async fn register_delete_confirm(
         }
     }
 
-    match state.db.delete_account_and_data(&pubkey, false) {
+    match state.db.delete_account_and_data(&pubkey) {
         Ok((slots, media, _)) => Redirect::to(&format!(
             "{}?key={}&msg={}",
             state.config.mode.register_path,
@@ -1492,7 +1492,7 @@ async fn admin_user_delete_submit(
     let Some(pk) = normalize_pubkey_hex(&form.pubkey) else {
         return Redirect::to("/admin?err=Invalid+pubkey").into_response();
     };
-    match state.db.delete_account_and_data(&pk, false) {
+    match state.db.delete_account_and_data(&pk) {
         Ok(_) => Redirect::to("/admin?msg=User+deleted").into_response(),
         Err(e) => {
             Redirect::to(&format!("/admin?err={}", url_encode(&e.to_string()))).into_response()
@@ -1672,6 +1672,7 @@ mod tests {
         cfg.mode.enable_admin_app = false;
         cfg.mode.enable_public_registration = true;
         cfg.mode.registration_gates = vec!["email".to_string()];
+        cfg.email.enabled = true;
         // Simulate unvalidated Config with missing default_public_profile
         cfg.mode.default_public_profile = "missing_profile".to_string();
 

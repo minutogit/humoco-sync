@@ -85,6 +85,7 @@ pub struct LockConfig {
     pub allow_pow_tickets: bool,
     pub ticket_pow_bits: u32,
     pub max_inodes: u64,
+    pub max_buckets: u64,
     pub pre_freeze_ttl_secs: u64,
     pub proposal_timelock_secs: u64,
     pub creator_inactivity_secs: u64,
@@ -99,6 +100,7 @@ impl Default for LockConfig {
             allow_pow_tickets: false,
             ticket_pow_bits: 16,
             max_inodes: 50_000,
+            max_buckets: 50_000,
             pre_freeze_ttl_secs: humoco_proto::PRE_PROPOSAL_FREEZE_TTL_SECS,
             proposal_timelock_secs: humoco_proto::PROPOSAL_TIMELOCK_SECS,
             creator_inactivity_secs: humoco_proto::CREATOR_INACTIVITY_TAKEOVER_SECS,
@@ -803,6 +805,11 @@ impl Config {
                 "lock.max_inodes must be >= 1".to_string(),
             ));
         }
+        if self.lock.max_buckets == 0 {
+            return Err(ConfigError::Validation(
+                "lock.max_buckets must be >= 1".to_string(),
+            ));
+        }
 
         Ok(())
     }
@@ -841,16 +848,6 @@ impl Config {
         self.media.max_channel_mb.saturating_mul(1024 * 1024)
     }
 
-    pub fn max_upload_body_bytes(&self) -> usize {
-        let profile_max = self
-            .profiles
-            .values()
-            .flat_map(|p| p.channels.values().map(|c| c.max_bytes))
-            .max()
-            .unwrap_or(self.media.max_bytes);
-        profile_max.max(self.media.max_bytes).max(65_536)
-    }
-
     pub fn supported_channels(&self) -> Vec<String> {
         let mut out = Vec::new();
         for ch in ALLOWED_CHANNELS {
@@ -865,8 +862,13 @@ impl Config {
     }
 
     pub fn gate_enabled(&self, gate: &str) -> bool {
-        self.mode.enable_public_registration
-            && self.mode.registration_gates.iter().any(|g| g == gate)
+        if !self.mode.enable_public_registration {
+            return false;
+        }
+        if gate == "email" && !self.email.enabled {
+            return false;
+        }
+        self.mode.registration_gates.iter().any(|g| g == gate)
     }
 }
 
@@ -1104,6 +1106,20 @@ mod tests {
         let mut zero_pk_rl = valid_base_cfg();
         zero_pk_rl.security.pubkey_requests_per_minute = 0;
         assert!(zero_pk_rl.validate().is_err());
+
+        let mut zero_buckets = valid_base_cfg();
+        zero_buckets.lock.max_buckets = 0;
+        assert!(zero_buckets.validate().is_err());
+
+        // EmailConfig.enabled controls gate_enabled("email")
+        let mut mail_gate_cfg = valid_base_cfg();
+        mail_gate_cfg.mode.enable_public_registration = true;
+        mail_gate_cfg.mode.registration_gates = vec!["email".to_string(), "code".to_string()];
+        mail_gate_cfg.email.enabled = false;
+        assert!(!mail_gate_cfg.gate_enabled("email"));
+        assert!(mail_gate_cfg.gate_enabled("code"));
+        mail_gate_cfg.email.enabled = true;
+        assert!(mail_gate_cfg.gate_enabled("email"));
 
         // 6. Debug output must redact secrets
         let mut sec_cfg = valid_base_cfg();

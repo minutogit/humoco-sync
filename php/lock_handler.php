@@ -27,6 +27,7 @@ function lock_cfg(array $config): array {
         'enabled' => array_key_exists('enabled', $l) ? (bool)$l['enabled'] : true,
         'max_retention_quarter' => (int)($l['max_retention_quarter'] ?? 8159),
         'max_inodes' => max(1, (int)($l['max_inodes'] ?? 50000)),
+        'max_buckets' => max(1, (int)($l['max_buckets'] ?? 50000)),
         'pow_base_bits' => min(24, max(0, (int)($l['pow_base_bits'] ?? 8))),
         'allow_pow_tickets' => !empty($l['allow_pow_tickets']),
         'ticket_pow_bits' => min(24, max(0, (int)($l['ticket_pow_bits'] ?? 16))),

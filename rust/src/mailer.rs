@@ -54,6 +54,9 @@ impl Mailer {
     }
 
     pub async fn send_mail(&self, to: &str, subject: &str, body: &str) -> Result<(), String> {
+        if !self.cfg.enabled {
+            return Err("Email delivery is disabled (email.enabled = false)".to_string());
+        }
         let to_trimmed = to.trim();
         if !is_safe_smtp_addr(to_trimmed) || subject.chars().any(|c| c.is_control()) {
             return Err("Invalid email header characters".to_string());
@@ -431,7 +434,20 @@ mod tests {
         srv_task.abort();
 
         // 2. Injection / control chars in recipient, subject, from_address must be rejected
-        let log_mailer = Mailer::new(EmailConfig::default());
+        // Also verify email.enabled = false blocks dispatch cleanly
+        let disabled_mailer = Mailer::new(EmailConfig::default());
+        assert!(
+            disabled_mailer
+                .send_mail("alice@example.org", "Subj", "Body")
+                .await
+                .is_err(),
+            "email.enabled = false must reject mail dispatch"
+        );
+
+        let log_mailer = Mailer::new(EmailConfig {
+            enabled: true,
+            ..Default::default()
+        });
         for bad_to in [
             "alice@example.org,bcc@evil.org",
             "alice@example.org;bcc@evil.org",
@@ -451,6 +467,7 @@ mod tests {
             .is_err());
 
         let bad_from_cfg = EmailConfig {
+            enabled: true,
             from_address: "bad>addr@example.org".to_string(),
             ..Default::default()
         };

@@ -30,6 +30,7 @@ return [
         'enabled'               => true,
         'max_retention_quarter' => 8159,  // 2039-Q4
         'max_inodes'            => 50000, // 80% soft warning in ?info, hard 507 on new tickets at 100%
+        'max_buckets'           => 50000, // hard cap on tracked rotation/lock buckets
         'pow_base_bits'         => 8,
         'allow_pow_tickets'     => false,
         'ticket_pow_bits'       => 16,

@@ -57,7 +57,7 @@ impl RateLimiter {
     }
 
     pub fn allow_ip(&self, ip: IpAddr) -> bool {
-        let norm = normalize_ip(ip);
+        let norm = rate_limit_ip_key(ip);
         Self::consume_key(&self.ip_buckets, &norm, || norm, self.ip_per_min)
     }
 
@@ -239,6 +239,16 @@ fn normalize_ip(ip: IpAddr) -> IpAddr {
     }
 }
 
+fn rate_limit_ip_key(ip: IpAddr) -> IpAddr {
+    match normalize_ip(ip) {
+        IpAddr::V6(v6) if !v6.is_loopback() => {
+            let s = v6.segments();
+            IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+        }
+        other => other,
+    }
+}
+
 pub fn extract_client_ip(
     peer: Option<SocketAddr>,
     headers: &HeaderMap,
@@ -384,6 +394,30 @@ mod tests {
         assert!(
             !rl.check_and_record_registration_subnet(blocked_subnet_ip),
             "Saturated /24 subnet cap must remain enforced under flood"
+        );
+    }
+
+    #[test]
+    fn test_s04_ipv6_slash64_rate_limit_grouping() {
+        let rl = RateLimiter::new(2, 10, 10, 10);
+        let a1: IpAddr = "2001:db8:abcd:0001::1".parse().unwrap();
+        let a2: IpAddr = "2001:db8:abcd:0001:ffff:ffff:ffff:9999".parse().unwrap();
+        let b1: IpAddr = "2001:db8:abcd:0002::1".parse().unwrap();
+        let lo: IpAddr = "::1".parse().unwrap();
+
+        assert!(rl.allow_ip(a1));
+        assert!(rl.allow_ip(a2));
+        assert!(
+            !rl.allow_ip(a2),
+            "Distinct /128 addresses in the same /64 must share one rate-limit bucket"
+        );
+        assert!(
+            rl.allow_ip(b1),
+            "Different /64 prefix must have an independent bucket"
+        );
+        assert!(
+            rl.allow_ip(lo),
+            "IPv6 loopback ::1 must stay isolated from 0000:0000:0000:0000::/64"
         );
     }
 }

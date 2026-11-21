@@ -3,6 +3,8 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
+      additional_contexts:
+        humoco-proto: ../../humoco-proto
     container_name: humoco-sync-server
     restart: unless-stopped
     cap_drop:

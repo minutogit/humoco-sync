@@ -77,6 +77,8 @@ Empty body SHA-256 hex digest: `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934c
    ```text
    HUMOCO-DROP-REQ-V1\nDELETE_ACCOUNT\n\n<timestamp>\n<nonce>\n<sha256_hex('')>
    ```
+   - Returns `200 OK` with `{"status":"ok","deleted_account":"<pubkey_hex>","deleted_slots":<int>,"deleted_media":<int>}`.
+   - Unauthorized `DELETE` requests (slot, single `media`, or bulk `DELETE` when the caller lacks active channel authorization) always return `403 Forbidden` before existence checks (`404` is never leaked to unauthorized callers).
 
 ### 2.2 Admin Requests (`HUMOCO-DROP-ADMIN-V1` & `HUMOCO-DROP-REVOKE-V1`)
 
@@ -104,6 +106,10 @@ Empty body SHA-256 hex digest: `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934c
    ```text
    HUMOCO-DROP-REVOKE-V1\n<drop_pub>\n<issued_at>\n<effective_at>\n<rep_write>\n<rep_read>\n<rep_pub>\n<reason>
    ```
+   - **Canonicalization:** `drop_pub`, `signature`, and `replacement.drop_pub` are normalized to lowercase hex; empty `reason` (`""`) is normalized to `null`.
+   - **Replacement URL policy:** `replacement.write_url` and `replacement.read_url` must be `https://` with a non-empty host (or `http://` strictly for loopback hosts `127.0.0.1`, `localhost`, `[::1]`), free of embedded credentials/whitespace/control characters, and must not redirect back to this server (`<public_base_url>/sync.php`, `<public_base_url>/sync`, or own read URL -> `400 Bad Request`).
+   - **Monotonicity:** Publishing a new notice requires `issued_at > existing.issued_at`, otherwise returning `409 Conflict`.
+   - **Clearing vs. publishing:** `null`, `{"clear": true}`, `{"revoked": false}`, or an object whose notice lacks `effective_at` or sets `effective_at` to `null` or `0` clears the revocation and returns `{"status":"ok","revoked":false}`. Valid publishes return `{"status":"ok","revoked":true,"revocation":<notice>}`.
 5. **`PUT ?lock_delegate`:**
    ```text
    HUMOCO-DROP-ADMIN-V1\nPUT_LOCK_DELEGATE\n<timestamp>\n<nonce>\n<sha256_hex(raw_body)>
@@ -162,7 +168,7 @@ HUMOCO-SLOT-ACK-V1\n<lock_pub>\n<pubkey>\n<prefix_or_empty>\n<channel>\n<etag>\n
 ## 3. Channel Priorities, Quotas & Eviction
 
 - **Priority 1 (`backup`, `post`, `wot`)** and **Priority 2 (`card`)**: Protected. When storage quota is tight, uploading Prio 1/2 slots automatically evicts the oldest **Priority 3 (`media`)** blobs via LRU before returning `507 Insufficient Storage`.
-- **Priority 3 (`media`)**: Ephemeral encrypted image blobs (`max_user_count`, `max_user_bytes`, `max_channel_mb`). Ownership is tracked per `media_id` (`403` if another pubkey attempts overwrite/delete). Never included in `index.json`.
+- **Priority 3 (`media`)**: Ephemeral encrypted image blobs (`max_user_count`, `max_user_bytes`, `max_channel_mb`, plus `max_total_storage_mb`). Acts as a 3-stage ring buffer in both PHP and Rust: uploading a new `media` blob after upfront size feasibility checks automatically evicts the caller's oldest `media` blobs for per-user `max_user_count`/`max_user_bytes`, and globally oldest `media` blobs for `max_channel_mb` and `max_total_storage_mb`. Ownership is tracked per `media_id` (`403` if another or unauthorized pubkey attempts overwrite/delete). Never included in `index.json`.
 
 ---
 

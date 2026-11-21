@@ -566,9 +566,46 @@ run_blackbox_protocol_suite() {
     "$endpoint")" "200" "Bulk DELETE media (omitting X-Media-Id) succeeds"
   assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "${data_url}/${media_id2}.media.bin")" "404" "Bulk-deleted media blob returns 404"
 
+  # Unauthorized non-member DELETE returns 403 (never 404/200) on single media and bulk card
+  local unauth_sk unauth_pk unauth_mid
+  read -r unauth_sk unauth_pk <<< "$("$helper_bin" sign-test keygen)"
+  unauth_mid="0000000000000000000000000000000000000000000000000000000000000099"
+  nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-member --sk "$unauth_sk" --method DELETE --channel media --media-id "$unauth_mid" --ts "$ts" --nonce "$nonce")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
+    -H "X-Drop-Pubkey: $unauth_pk" \
+    -H "X-Channel: media" \
+    -H "X-Media-Id: $unauth_mid" \
+    -H "X-Drop-Timestamp: $ts" \
+    -H "X-Drop-Nonce: $nonce" \
+    -H "X-Drop-Signature: $sig" \
+    "$endpoint")" "403" "Unauthorized DELETE single missing media returns 403"
+  nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-member --sk "$unauth_sk" --method DELETE --channel card --ts "$ts" --nonce "$nonce")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
+    -H "X-Drop-Pubkey: $unauth_pk" \
+    -H "X-Channel: card" \
+    -H "X-Drop-Timestamp: $ts" \
+    -H "X-Drop-Nonce: $nonce" \
+    -H "X-Drop-Signature: $sig" \
+    "$endpoint")" "403" "Unauthorized bulk DELETE card returns 403"
+
   echo "=== Group 8 ($label): Revocation (?revoke -> 410 Gone -> Clear) ==="
   ts="$(date +%s)"
   "$helper_bin" sign-test sign-revoke-notice --sk "$admin_sk" --issued "$ts" --effective "$((ts + 60))" --reason "Server moving" > "$TMP_ROOT/revoke.json"
+  nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-admin --sk "$admin_sk" --action PUT_REVOKE --ts "$ts" --nonce "$nonce" --body-file "$TMP_ROOT/revoke.json")"
+  assert_eq "$(curl -s -o "$TMP_ROOT/revoke_resp.json" -w '%{http_code}' -X PUT \
+    -H "X-Drop-Pubkey: $admin_pk" \
+    -H "X-Drop-Timestamp: $ts" \
+    -H "X-Drop-Nonce: $nonce" \
+    -H "X-Drop-Signature: $sig" \
+    --data-binary "@$TMP_ROOT/revoke.json" \
+    "${endpoint}?revoke")" "200" "PUT ?revoke publishes revocation"
+  assert_contains "$(cat "$TMP_ROOT/revoke_resp.json")" '"revoked":true' "PUT ?revoke returns revoked:true"
+  assert_contains "$(cat "$TMP_ROOT/revoke_resp.json")" '"revocation":{' "PUT ?revoke returns revocation object"
+
+  # Replaying stale/equal issued_at returns 409 Conflict on both PHP and Rust
   nonce="$(rand_nonce)"
   sig="$("$helper_bin" sign-test sign-admin --sk "$admin_sk" --action PUT_REVOKE --ts "$ts" --nonce "$nonce" --body-file "$TMP_ROOT/revoke.json")"
   assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
@@ -577,7 +614,7 @@ run_blackbox_protocol_suite() {
     -H "X-Drop-Nonce: $nonce" \
     -H "X-Drop-Signature: $sig" \
     --data-binary "@$TMP_ROOT/revoke.json" \
-    "${endpoint}?revoke")" "200" "PUT ?revoke publishes revocation"
+    "${endpoint}?revoke")" "409" "PUT ?revoke rejects non-increasing issued_at with 409"
 
   assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -I -H "X-Drop-Pubkey: $friend_pk" "$endpoint")" "410" "Revoked server returns 410 Gone on HEAD"
   assert_contains "$(curl -sf "${data_url}/revocation.json")" "Server moving" "revocation.json published"
@@ -595,7 +632,10 @@ run_blackbox_protocol_suite() {
   read -r rev_acc_sk rev_acc_pk <<< "$("$helper_bin" sign-test keygen)"
   rev_nonce="$(rand_nonce)"
   rev_sig="$("$helper_bin" sign-test sign-member --sk "$rev_acc_sk" --method DELETE_ACCOUNT --ts "$rev_ts" --nonce "$rev_nonce")"
-  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -H "X-Drop-Pubkey: $rev_acc_pk" -H "X-Drop-Timestamp: $rev_ts" -H "X-Drop-Nonce: $rev_nonce" -H "X-Drop-Signature: $rev_sig" "${endpoint}?account")" "200" "DELETE ?account remains available (200) during 410 revocation"
+  assert_eq "$(curl -s -o "$TMP_ROOT/del_rev_acc.json" -w '%{http_code}' -X DELETE -H "X-Drop-Pubkey: $rev_acc_pk" -H "X-Drop-Timestamp: $rev_ts" -H "X-Drop-Nonce: $rev_nonce" -H "X-Drop-Signature: $rev_sig" "${endpoint}?account")" "200" "DELETE ?account remains available (200) during 410 revocation"
+  assert_contains "$(cat "$TMP_ROOT/del_rev_acc.json")" "\"deleted_account\":\"${rev_acc_pk}\"" "DELETE ?account returns pubkey string during revocation"
+  assert_contains "$(cat "$TMP_ROOT/del_rev_acc.json")" '"deleted_slots":0' "DELETE ?account returns deleted_slots:0"
+  assert_contains "$(cat "$TMP_ROOT/del_rev_acc.json")" '"deleted_media":0' "DELETE ?account returns deleted_media:0"
 
   printf '{"issued_at":%s,"effective_at":null}' "$ts" > "$TMP_ROOT/clear_revoke.json"
   nonce="$(rand_nonce)"
@@ -659,12 +699,15 @@ run_blackbox_protocol_suite() {
     ts="$(date +%s)"
     nonce="$(rand_nonce)"
     sig="$("$helper_bin" sign-test sign-member --sk "$intruder_sk" --method DELETE_ACCOUNT --ts "$ts" --nonce "$nonce")"
-    assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
+    assert_eq "$(curl -s -o "$TMP_ROOT/del_intruder.json" -w '%{http_code}' -X DELETE \
       -H "X-Drop-Pubkey: $intruder_pk" \
       -H "X-Drop-Timestamp: $ts" \
       -H "X-Drop-Nonce: $nonce" \
       -H "X-Drop-Signature: $sig" \
       "${endpoint}?account")" "200" "DELETE ?account wipes registered user and blobs"
+    assert_contains "$(cat "$TMP_ROOT/del_intruder.json")" "\"deleted_account\":\"${intruder_pk}\"" "DELETE ?account returns wiped registered pubkey"
+    assert_contains "$(cat "$TMP_ROOT/del_intruder.json")" '"deleted_slots":1' "DELETE ?account returns deleted_slots:1"
+    assert_contains "$(cat "$TMP_ROOT/del_intruder.json")" '"deleted_media":0' "DELETE ?account returns deleted_media:0"
     assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "${data_url}/${intruder_pk}.card.bin")" "404" "Wiped registered user slot returns 404"
   fi
 
@@ -1154,14 +1197,14 @@ return [
     'disable_rate_limit' => true,
     'channels' => [
         'card'   => ['max_bytes' => 524288, 'ttl_days' => 30],
-        'media'  => ['max_bytes' => 524288, 'max_user_count' => 12, 'max_user_bytes' => 3145728, 'max_channel_mb' => 32, 'ttl_days' => 1],
+        'media'  => ['max_bytes' => 524288, 'max_user_count' => 2, 'max_user_bytes' => 3145728, 'max_channel_mb' => 32, 'ttl_days' => 1],
     ],
     'lock' => ['enabled' => true],
 ];
 EOF
   local c3_port
   c3_port="$(pick_free_port 18950)"
-  PHP_CLI_SERVER_WORKERS=2 php -S "127.0.0.1:${c3_port}" -t "$c3_dir" "$c3_dir/sync.php" > "$s06_dir/c3.log" 2>&1 &
+  PHP_CLI_SERVER_WORKERS=2 php -d opcache.enable=0 -S "127.0.0.1:${c3_port}" -t "$c3_dir" "$c3_dir/sync.php" > "$s06_dir/c3.log" 2>&1 &
   local c3_pid=$!
   for _ in $(seq 1 40); do
     if curl -sf "http://127.0.0.1:${c3_port}/sync.php?info" >/dev/null 2>&1; then break; fi
@@ -1256,6 +1299,29 @@ EOF
     file_put_contents($f, str_replace($old, $new, file_get_contents($f)));
   ' "$c3_dir/config.php" "$s_admin_pk" "$rand_pk"
   assert_contains "$(curl -sf "${c3_ep}?info")" "\"drop_pub\":\"${rand_pk}\"" "SYNC-S06-05: GET ?info reflects updated config.php admin_pubkey"
+
+  # SYNC-S06-07: PHP PUT media ring-buffer LRU eviction across max_user_count=2
+  printf 'ring-media-1' > "$s06_dir/rb1.bin"
+  printf 'ring-media-2' > "$s06_dir/rb2.bin"
+  printf 'ring-media-3' > "$s06_dir/rb3.bin"
+  local rb1_id rb2_id rb3_id
+  rb1_id="$(sha256_file_hex "$s06_dir/rb1.bin")"
+  rb2_id="$(sha256_file_hex "$s06_dir/rb2.bin")"
+  rb3_id="$(sha256_file_hex "$s06_dir/rb3.bin")"
+  for idx in 1 2 3; do
+    local rid
+    case "$idx" in
+      1) rid="$rb1_id" ;;
+      2) rid="$rb2_id" ;;
+      3) rid="$rb3_id" ;;
+    esac
+    ts="$(date +%s)"; nonce="$(rand_nonce)"
+    sig="$("$helper_bin" sign-test sign-member --sk "$s_mem_sk" --method PUT --channel media --media-id "$rid" --ts "$ts" --nonce "$nonce" --body-file "$s06_dir/rb${idx}.bin")"
+    assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "X-Drop-Pubkey: $s_mem_pk" -H "X-Channel: media" -H "X-Media-Id: $rid" -H "X-Drop-Timestamp: $ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig" --data-binary "@$s06_dir/rb${idx}.bin" "${c3_ep}")" "200" "SYNC-S06-07: PUT media #${idx} succeeds with LRU ring-buffer eviction"
+    sleep 1
+  done
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "${c3_data}/${rb1_id}.media.bin")" "404" "SYNC-S06-07: oldest media blob rb1 evicted at max_user_count=2"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "${c3_data}/${rb3_id}.media.bin")" "200" "SYNC-S06-07: newest media blob rb3 preserved"
 
   kill "$c3_pid" 2>/dev/null || true
   wait "$c3_pid" 2>/dev/null || true

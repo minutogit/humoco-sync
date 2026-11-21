@@ -697,5 +697,72 @@ php -r '
 ' "${R1_DOC}/humoco_sync_data/anchors/${ROT_ANCHOR_HEX}.bin" "$TMP_DIR/s07_bad_ts_fin.json" "$ROT_ANCHOR_HEX"
 assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' --data-binary "@$TMP_DIR/s07_bad_ts_fin.json" "${R1_URL}/sync.php?lock_commit")" "400" "SYNC-S07-06: Rev-2+ finalize with issued_at_ms=0 returns 400"
 
+stop_php_server
+
+echo "--- Test 9 (SYNC-S07-07): Cold pre_freeze rejection, forged cold heartbeat zero-write & max_buckets=1 cap ---"
+read -r B9_ADMIN_SK B9_ADMIN_PK <<< "$("$SERVER_BIN" sign-test keygen)"
+B9_PORT="$(pick_free_port)"
+B9_DOC="$TMP_DIR/b9_doc"
+start_php_server "$B9_DOC" "$B9_ADMIN_PK" 50 1 "$B9_PORT" "$TMP_DIR/b9.log"
+php -r '
+  $c = file_get_contents($argv[1]);
+  $c = str_replace("'\''max_inodes'\'' => 50,", "'\''max_inodes'\'' => 50,\n        '\''max_buckets'\'' => 1,", $c);
+  file_put_contents($argv[1], $c);
+' "$B9_DOC/config.php"
+B9_URL="http://127.0.0.1:${B9_PORT}"
+B9_LP="$(curl -sf "${B9_URL}/sync.php?lock_selftest" | sed -n 's/.*"lock_pub":"\([0-9a-f]\{64\}\)".*/\1/p')"
+
+B9_OUT="$(php -r '
+  $url = $argv[1]; $doc = $argv[2]; $adminSkHex = $argv[3]; $adminPkHex = $argv[4]; $lpHex = $argv[5]; $qtr = (int)$argv[6];
+  $post = static function (string $u, string $body): array {
+    $ch = curl_init($u);
+    curl_setopt_array($ch, [CURLOPT_POST => true, CURLOPT_POSTFIELDS => $body, CURLOPT_HTTPHEADER => ["Content-Type: application/json"], CURLOPT_RETURNTRANSFER => true]);
+    $resp = curl_exec($ch); $code = curl_getinfo($ch, CURLINFO_HTTP_CODE); curl_close($ch);
+    return [$code, json_decode((string)$resp, true) ?: []];
+  };
+  $migKp1 = sodium_crypto_sign_keypair();
+  $migSk1 = sodium_crypto_sign_secretkey($migKp1); $migPk1 = bin2hex(sodium_crypto_sign_publickey($migKp1));
+  $t0 = time();
+  $mkMan = static function (int $issuedMs) use ($url, $adminPkHex, $lpHex, $migPk1, $qtr): array {
+    $srv = ["write_url" => "$url/sync.php", "read_url" => "$url/humoco_sync_data", "admin_pub" => $adminPkHex, "lock_pub" => $lpHex, "nominated_by" => "creator"];
+    $m = ["revision" => 1, "threshold" => 1, "servers" => [$srv], "successors" => [], "authority" => ["creator_mig_pub" => $migPk1, "guarantor_mig_pubs" => []], "migration_chain" => [], "issued_at_ms" => $issuedMs, "retain_until_quarter" => $qtr];
+    $pre = "HUMOCO_ANCHOR_MANIFEST_V1\x00" . pack("P", 1) . "\x01\x01" . hex2bin($adminPkHex) . hex2bin($lpHex) . "\x00" . pack("v", 0) . hex2bin($migPk1) . "\x00" . pack("P", $issuedMs) . pack("v", $qtr);
+    return [bin2hex(hash("sha256", $pre, true)), $m];
+  };
+  [$aid1, $m1] = $mkMan($t0 * 1000);
+  [$pfCode, ] = $post("$url/sync.php?lock_freeze", json_encode(["action" => "pre_freeze", "anchor_id" => $aid1, "current_manifest" => $m1]));
+  $bucketsAfterPf = count(glob("$doc/humoco_sync_data/.locks_meta/buckets/*.json") ?: []);
+
+  // Forged cold heartbeat -> 401 and still 0 files
+  [$fHbCode, ] = $post("$url/sync.php?lock_freeze", json_encode(["action" => "heartbeat", "heartbeat" => ["anchor_id" => $aid1, "timestamp_secs" => $t0, "sig" => str_repeat("00", 64)], "current_manifest" => $m1]));
+  $bucketsAfterForgedHb = count(glob("$doc/humoco_sync_data/.locks_meta/buckets/*.json") ?: []);
+
+  // Valid signed cold heartbeat -> 200 (consumes max_buckets=1)
+  $hbDig1 = hash("sha256", "HUMOCO_CREATOR_HB_V1" . hex2bin($aid1) . pack("P", $t0), true);
+  $hbSig1 = bin2hex(sodium_crypto_sign_detached($hbDig1, $migSk1));
+  [$okHbCode, ] = $post("$url/sync.php?lock_freeze", json_encode(["action" => "heartbeat", "heartbeat" => ["anchor_id" => $aid1, "timestamp_secs" => $t0, "sig" => $hbSig1], "current_manifest" => $m1]));
+
+  // Second anchor cold heartbeat -> 507
+  [$aid2, $m2] = $mkMan(($t0 + 10) * 1000);
+  $hbDig2 = hash("sha256", "HUMOCO_CREATOR_HB_V1" . hex2bin($aid2) . pack("P", $t0 + 10), true);
+  $hbSig2 = bin2hex(sodium_crypto_sign_detached($hbDig2, $migSk1));
+  [$capHbCode, ] = $post("$url/sync.php?lock_freeze", json_encode(["action" => "heartbeat", "heartbeat" => ["anchor_id" => $aid2, "timestamp_secs" => $t0 + 10, "sig" => $hbSig2], "current_manifest" => $m2]));
+
+  echo json_encode([
+    "pf_code" => $pfCode,
+    "buckets_after_pf" => $bucketsAfterPf,
+    "forged_hb_code" => $fHbCode,
+    "buckets_after_forged_hb" => $bucketsAfterForgedHb,
+    "ok_hb_code" => $okHbCode,
+    "cap_hb_code" => $capHbCode,
+  ]);
+' "$B9_URL" "$B9_DOC" "$B9_ADMIN_SK" "$B9_ADMIN_PK" "$B9_LP" "$QTR")"
+assert_contains "$B9_OUT" '"pf_code":404' "SYNC-S07-07: cold pre_freeze rejected with 404"
+assert_contains "$B9_OUT" '"buckets_after_pf":0' "SYNC-S07-07: cold pre_freeze leaves 0 buckets on disk"
+assert_contains "$B9_OUT" '"forged_hb_code":401' "SYNC-S07-07: forged cold heartbeat rejected with 401"
+assert_contains "$B9_OUT" '"buckets_after_forged_hb":0' "SYNC-S07-07: forged cold heartbeat leaves 0 buckets on disk"
+assert_contains "$B9_OUT" '"ok_hb_code":200' "SYNC-S07-07: valid cold heartbeat succeeds within max_buckets=1"
+assert_contains "$B9_OUT" '"cap_hb_code":507' "SYNC-S07-07: second cold bucket beyond max_buckets=1 returns 507"
+
 echo ""
 echo "All PHP lock concurrency, rollback, quota & GC tests passed! (${PASS} assertions)"
