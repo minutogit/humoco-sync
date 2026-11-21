@@ -5635,3 +5635,628 @@ async fn test_s02_rotation_guards_block_stale_replay_downgrade_and_unrelated_fin
         .unwrap()
         .is_none());
 }
+
+#[tokio::test]
+async fn test_s03_nonce_boundary_and_public_account_integrity() {
+    let (_, admin_pk) = gen_keypair();
+    let (victim_sk, victim_pk) = gen_keypair();
+    let (_, suspended_pk) = gen_keypair();
+
+    let mut cfg = base_hybrid_config(&admin_pk);
+    cfg.mode.registration_gates = vec!["email".to_string(), "code".to_string(), "open".to_string()];
+    cfg.email.enabled = true;
+    cfg.email.transport = "log".to_string();
+
+    let srv = TestServer::start(cfg).await;
+    let db = &srv.state.db;
+    let now = unix_now();
+
+    // 1. SYNC-S03-01: Nonce replay MUST fail at exact expiry boundary (exp == now_secs)
+    let nonce = random_hex(16);
+    assert!(db.check_and_consume_nonce(&nonce, now).unwrap());
+    let exp = now + humoco_sync_server::crypto::NONCE_TTL_SECS;
+    db.run_maintenance(&srv.state.config, exp).unwrap();
+    assert!(
+        !db.check_and_consume_nonce(&nonce, exp).unwrap(),
+        "Nonce replay MUST be rejected at exact expiry boundary exp == now_secs"
+    );
+
+    // 2. SYNC-S03-02: Victim registers via email & upgrades to pro; attacker cannot hijack email,
+    // downgrade via /register/open or pow, or delete victim's account.
+    db.register_or_upgrade_user(
+        &srv.state.config,
+        &victim_pk,
+        "pro",
+        Some("victim@example.org"),
+        Some(30),
+        "admin",
+        now,
+    )
+    .unwrap();
+    let mut victim_slot = sign_member_headers(
+        &victim_sk,
+        "PUT",
+        "card",
+        "",
+        "",
+        now as i64,
+        b"secret-card",
+    );
+    let mut put_req = srv.client.put(format!("{}/sync.php", srv.base_url));
+    for (k, v) in victim_slot.drain(..) {
+        put_req = put_req.header(k, v);
+    }
+    assert_eq!(
+        put_req
+            .body(b"secret-card".to_vec())
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        200
+    );
+
+    // Attacker tries /register/open against victim's public key
+    let open_hijack = srv
+        .client
+        .post(format!("{}/register/open", srv.base_url))
+        .form(&[("pubkey", victim_pk.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(open_hijack.status().as_u16(), 303);
+    let after_open = db.get_registered_user(&victim_pk).unwrap().unwrap();
+    assert_eq!(
+        after_open.profile, "pro",
+        "Public /register/open must NOT downgrade existing pro account"
+    );
+    assert!(after_open.valid_until.is_some());
+
+    // Direct pow gate against existing key must also fail with 409
+    let pow_err = db
+        .register_or_upgrade_user(
+            &srv.state.config,
+            &victim_pk,
+            "free",
+            None,
+            None,
+            "pow",
+            now + 1,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            pow_err,
+            humoco_sync_server::db::DbError::Http { status: 409, .. }
+        ),
+        "Expected 409 for duplicate public registration, got {pow_err:?}"
+    );
+
+    // Attacker tries /register/email + /register/confirm with attacker@evil.com to hijack deletion
+    let _ = srv.state.mailer.take_recorded();
+    let email_resp = srv
+        .client
+        .post(format!("{}/register/email", srv.base_url))
+        .form(&[
+            ("pubkey", victim_pk.as_str()),
+            ("email", "attacker@evil.example"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(email_resp.status().as_u16(), 303);
+    if let Some(mail) = srv.state.mailer.take_recorded().into_iter().next() {
+        let confirm_url = mail
+            .body
+            .lines()
+            .find(|l| l.starts_with("http://"))
+            .unwrap()
+            .trim()
+            .to_string();
+        let _ = srv.client.get(&confirm_url).send().await.unwrap();
+    }
+    let after_email = db.get_registered_user(&victim_pk).unwrap().unwrap();
+    assert_eq!(
+        after_email.profile, "pro",
+        "Email gate must NOT overwrite existing pro profile or email_hmac"
+    );
+    assert!(after_email.encrypted_contact_email.is_some());
+
+    // Attacker tries /register/delete-request with attacker@evil.example -> must NOT send link or delete victim
+    let _ = srv.state.mailer.take_recorded();
+    let _ = srv
+        .client
+        .post(format!("{}/register/delete-request", srv.base_url))
+        .form(&[
+            ("pubkey", victim_pk.as_str()),
+            ("email", "attacker@evil.example"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        srv.state.mailer.take_recorded().is_empty(),
+        "Attacker email must NOT bind to victim pubkey for deletion"
+    );
+    assert!(db.get_registered_user(&victim_pk).unwrap().is_some());
+
+    // 3. Suspended account cannot reactivate via public gates or redeem codes
+    db.register_or_upgrade_user(
+        &srv.state.config,
+        &suspended_pk,
+        "free",
+        None,
+        None,
+        "open",
+        now,
+    )
+    .unwrap();
+    db.set_user_status(
+        &suspended_pk,
+        humoco_sync_server::db::AccountStatus::Suspended,
+        now,
+    )
+    .unwrap();
+
+    let susp_open_err = db
+        .register_or_upgrade_user(
+            &srv.state.config,
+            &suspended_pk,
+            "free",
+            None,
+            None,
+            "open",
+            now + 1,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            susp_open_err,
+            humoco_sync_server::db::DbError::Http { status: 403, .. }
+        ),
+        "Suspended account must NOT reactivate via open gate, got {susp_open_err:?}"
+    );
+    assert_eq!(
+        db.get_registered_user(&suspended_pk)
+            .unwrap()
+            .unwrap()
+            .status,
+        humoco_sync_server::db::AccountStatus::Suspended
+    );
+
+    // 4. SYNC-S03-03: Redeem code protections (suspended blocked, downgrade blocked, timed->unlimited protected)
+    let invite_codes = db
+        .create_redeem_codes(&srv.state.config, 1, "free", None, 1, None, None, None, now)
+        .unwrap();
+    let invite_code = &invite_codes[0].code;
+
+    let susp_code_err = db
+        .redeem_code_for_pubkey(&srv.state.config, &suspended_pk, invite_code, now + 1)
+        .unwrap_err();
+    assert!(
+        matches!(
+            susp_code_err,
+            humoco_sync_server::db::DbError::Http { status: 403, .. }
+        ),
+        "Suspended account must NOT redeem code, got {susp_code_err:?}"
+    );
+
+    let downgrade_code_err = db
+        .redeem_code_for_pubkey(&srv.state.config, &victim_pk, invite_code, now + 1)
+        .unwrap_err();
+    assert!(
+        matches!(
+            downgrade_code_err,
+            humoco_sync_server::db::DbError::Http { status: 409, .. }
+        ),
+        "Invite code must NOT downgrade active pro user, got {downgrade_code_err:?}"
+    );
+    assert_eq!(db.list_redeem_codes().unwrap()[0].used_count, 0);
+
+    // Permanent pro account (valid_until = None) cannot be overwritten with a timed pro code
+    let (_, perm_pro_pk) = gen_keypair();
+    db.register_or_upgrade_user(
+        &srv.state.config,
+        &perm_pro_pk,
+        "pro",
+        None,
+        None,
+        "admin",
+        now,
+    )
+    .unwrap();
+    let pro_codes = db
+        .create_redeem_codes(
+            &srv.state.config,
+            1,
+            "pro",
+            Some(30),
+            2,
+            None,
+            None,
+            None,
+            now,
+        )
+        .unwrap();
+    let pro_code = &pro_codes[0].code;
+    let perm_err = db
+        .redeem_code_for_pubkey(&srv.state.config, &perm_pro_pk, pro_code, now + 1)
+        .unwrap_err();
+    assert!(
+        matches!(
+            perm_err,
+            humoco_sync_server::db::DbError::Http { status: 409, .. }
+        ),
+        "Timed pro code must NOT overwrite permanent pro valid_until=None, got {perm_err:?}"
+    );
+
+    // Legitimate renewal of timed pro account MUST still extend valid_until
+    let prev_exp = db
+        .get_registered_user(&victim_pk)
+        .unwrap()
+        .unwrap()
+        .valid_until
+        .unwrap();
+    let renewed = db
+        .redeem_code_for_pubkey(&srv.state.config, &victim_pk, pro_code, now + 1)
+        .unwrap();
+    assert_eq!(renewed.valid_until.unwrap(), prev_exp + 30 * 86_400);
+}
+
+#[tokio::test]
+async fn test_s03_suspended_pool_isolation_empty_put_and_hybrid_prune() {
+    let (_, admin_pk) = gen_keypair();
+    let (_, pro_pk) = gen_keypair();
+    let (_, free_pk) = gen_keypair();
+    let (hybrid_sk, hybrid_pk) = gen_keypair();
+
+    let mut cfg = base_hybrid_config(&admin_pk);
+    cfg.storage.max_total_storage_mb = 4; // 4 MiB global
+    cfg.storage.max_free_pool_mb = 1; // 1 MiB isolated free pool
+    cfg.media.max_channel_mb = 1; // 1 MiB global media channel
+
+    let srv = TestServer::start(cfg).await;
+    let db = &srv.state.db;
+    let now = unix_now();
+
+    db.register_or_upgrade_user(
+        &srv.state.config,
+        &pro_pk,
+        "pro",
+        None,
+        Some(30),
+        "admin",
+        now,
+    )
+    .unwrap();
+    db.register_or_upgrade_user(&srv.state.config, &free_pk, "free", None, None, "open", now)
+        .unwrap();
+    db.register_or_upgrade_user(
+        &srv.state.config,
+        &hybrid_pk,
+        "pro",
+        None,
+        Some(30),
+        "admin",
+        now,
+    )
+    .unwrap();
+    db.put_admin_members(
+        &srv.state.config,
+        "card",
+        std::slice::from_ref(&hybrid_pk),
+        now,
+    )
+    .unwrap();
+
+    // Pro uploads 800 KB backup + 900 KB media (> 1 MiB free pool)
+    db.put_slot(
+        &srv.state.config,
+        &pro_pk,
+        "backup",
+        None,
+        &vec![1u8; 800_000],
+        &ConditionalPrecondition::None,
+        now,
+    )
+    .unwrap();
+    let pro_media_id = sha256_hex(b"suspended-pro-media");
+    db.put_media(
+        &srv.state.config,
+        &pro_pk,
+        &pro_media_id,
+        &vec![2u8; 900_000],
+        &ConditionalPrecondition::None,
+        now,
+    )
+    .unwrap();
+
+    // Hybrid user uploads card + media before suspension
+    db.put_slot(
+        &srv.state.config,
+        &hybrid_pk,
+        "card",
+        None,
+        &vec![3u8; 40_000],
+        &ConditionalPrecondition::None,
+        now,
+    )
+    .unwrap();
+    let hybrid_media_id = sha256_hex(b"hybrid-media");
+    db.put_media(
+        &srv.state.config,
+        &hybrid_pk,
+        &hybrid_media_id,
+        &vec![4u8; 40_000],
+        &ConditionalPrecondition::None,
+        now,
+    )
+    .unwrap();
+
+    // Suspend pro_pk & hybrid_pk
+    db.set_user_status(
+        &pro_pk,
+        humoco_sync_server::db::AccountStatus::Suspended,
+        now + 1,
+    )
+    .unwrap();
+    db.set_user_status(
+        &hybrid_pk,
+        humoco_sync_server::db::AccountStatus::Suspended,
+        now + 1,
+    )
+    .unwrap();
+
+    // 1. SYNC-S03-04: Suspended pro accounts must NOT pollute free_pool_used_bytes or starve free users
+    let status = db.admin_status(&srv.state.config, now + 2).unwrap();
+    assert_eq!(
+        status.free_pool_used_bytes, 0,
+        "Suspended pro storage must NOT count toward free_pool_used_bytes"
+    );
+
+    db.put_slot(
+        &srv.state.config,
+        &free_pk,
+        "card",
+        None,
+        &vec![5u8; 400_000],
+        &ConditionalPrecondition::None,
+        now + 2,
+    )
+    .expect("Free user must NOT be starved by suspended pro user's storage");
+
+    // Free user media upload exceeding max_channel_mb (1 MiB) must NOT evict suspended pro media!
+    let free_media_id = sha256_hex(b"free-media-overflow");
+    let evict_err = db
+        .put_media(
+            &srv.state.config,
+            &free_pk,
+            &free_media_id,
+            &vec![6u8; 200_000],
+            &ConditionalPrecondition::None,
+            now + 2,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            evict_err,
+            humoco_sync_server::db::DbError::Http { status: 507, .. }
+        ),
+        "Free user must receive 507 instead of evicting suspended pro media, got {evict_err:?}"
+    );
+    assert!(
+        db.get_media_blob(&srv.state.config, &pro_media_id, now + 2)
+            .unwrap()
+            .is_some(),
+        "Suspended pro media must remain intact"
+    );
+
+    // 2. SYNC-S03-05: Empty (0-byte) PUT payloads must be rejected with 400 (parity with PHP)
+    let empty_slot_err = db
+        .put_slot(
+            &srv.state.config,
+            &free_pk,
+            "card",
+            Some("empty"),
+            b"",
+            &ConditionalPrecondition::None,
+            now + 3,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            empty_slot_err,
+            humoco_sync_server::db::DbError::Http { status: 400, .. }
+        ),
+        "Empty put_slot must return 400, got {empty_slot_err:?}"
+    );
+    let empty_media_err = db
+        .put_media(
+            &srv.state.config,
+            &free_pk,
+            &sha256_hex(b""),
+            b"",
+            &ConditionalPrecondition::None,
+            now + 3,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            empty_media_err,
+            humoco_sync_server::db::DbError::Http { status: 400, .. }
+        ),
+        "Empty put_media must return 400, got {empty_media_err:?}"
+    );
+
+    // 3. SYNC-S03-06: PUT ?members removing hybrid_pk must NOT prune suspended registered user's slots/media
+    db.put_admin_members(&srv.state.config, "card", &[], now + 4)
+        .unwrap();
+    assert!(
+        db.get_slot_blob(&srv.state.config, "card", &hybrid_pk, now + 4)
+            .unwrap()
+            .is_some(),
+        "Suspended registered user's card slot must survive admin PUT ?members removal"
+    );
+    assert!(
+        db.get_media_blob(&srv.state.config, &hybrid_media_id, now + 4)
+            .unwrap()
+            .is_some(),
+        "Suspended registered user's media must survive admin PUT ?members removal"
+    );
+    let _ = hybrid_sk;
+}
+
+#[tokio::test]
+async fn test_s03_lock_disabled_capability_ttl_expiry_and_profile_safety() {
+    let (_, admin_pk) = gen_keypair();
+    let (_, lock_only_pk) = gen_keypair();
+    let (_, card_and_lock_pk) = gen_keypair();
+
+    let mut cfg = base_hybrid_config(&admin_pk);
+    cfg.lock.enabled = true;
+
+    let srv = TestServer::start(cfg.clone()).await;
+    let db = &srv.state.db;
+    let now = unix_now();
+
+    db.put_admin_members(
+        &srv.state.config,
+        "lock",
+        &[lock_only_pk.clone(), card_and_lock_pk.clone()],
+        now,
+    )
+    .unwrap();
+    db.put_admin_members(
+        &srv.state.config,
+        "card",
+        std::slice::from_ref(&card_and_lock_pk),
+        now,
+    )
+    .unwrap();
+    db.put_admin_members(
+        &srv.state.config,
+        "post",
+        std::slice::from_ref(&card_and_lock_pk),
+        now,
+    )
+    .unwrap();
+
+    // 1. When lock.enabled = false, lock membership must NOT grant HEAD authorization or appear in allowed_channels
+    let mut no_lock_cfg = (*srv.state.config).clone();
+    no_lock_cfg.lock.enabled = false;
+    assert!(
+        db.resolve_member_access(&no_lock_cfg, &lock_only_pk, now)
+            .unwrap()
+            .is_none(),
+        "Lock-only admin member must NOT appear authorized when lock.enabled = false"
+    );
+    let cap_card_lock = db
+        .head_capability(&no_lock_cfg, &card_and_lock_pk, None, None, None, now)
+        .unwrap();
+    assert!(cap_card_lock.authorized);
+    assert!(
+        !cap_card_lock.allowed_channels.iter().any(|ch| ch == "lock"),
+        "allowed_channels must omit 'lock' when lock.enabled = false"
+    );
+
+    // 2. TTL-expired slot/media parity between GET, HEAD, and PUT If-None-Match: * before maintenance sweeps
+    let put_post = db
+        .put_slot(
+            &srv.state.config,
+            &card_and_lock_pk,
+            "post",
+            None,
+            b"ephemeral-post-v1",
+            &ConditionalPrecondition::None,
+            now,
+        )
+        .unwrap();
+    let mid = sha256_hex(b"ephemeral-media-v1");
+    db.put_media(
+        &srv.state.config,
+        &card_and_lock_pk,
+        &mid,
+        b"ephemeral-media-v1",
+        &ConditionalPrecondition::None,
+        now,
+    )
+    .unwrap();
+
+    let expired_now = now + 91 * 86_400; // friends.post & friends.media ttl_days = 90
+    assert!(db
+        .get_slot_blob(&srv.state.config, "post", &card_and_lock_pk, expired_now)
+        .unwrap()
+        .is_none());
+    let head_post_exp = db
+        .head_capability(
+            &srv.state.config,
+            &card_and_lock_pk,
+            Some("post"),
+            None,
+            None,
+            expired_now,
+        )
+        .unwrap();
+    assert_eq!(
+        head_post_exp.slot_occupied,
+        Some(false),
+        "HEAD must report X-Slot-Occupied: false once TTL expires"
+    );
+    assert!(
+        head_post_exp.slot_etag.is_none(),
+        "HEAD must omit ETag once TTL expires"
+    );
+
+    let head_media_exp = db
+        .head_capability(
+            &srv.state.config,
+            &card_and_lock_pk,
+            Some("media"),
+            None,
+            Some(&mid),
+            expired_now,
+        )
+        .unwrap();
+    assert_eq!(head_media_exp.slot_occupied, Some(false));
+    assert!(head_media_exp.slot_etag.is_none());
+
+    // Old ETag If-Match must reject 412 when expired; If-None-Match: * must succeed
+    let stale_im_err = db
+        .put_slot(
+            &srv.state.config,
+            &card_and_lock_pk,
+            "post",
+            None,
+            b"ephemeral-post-v2",
+            &ConditionalPrecondition::IfMatch(put_post.etag),
+            expired_now,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        stale_im_err,
+        humoco_sync_server::db::DbError::Http { status: 412, .. }
+    ));
+
+    db.put_slot(
+        &srv.state.config,
+        &card_and_lock_pk,
+        "post",
+        None,
+        b"ephemeral-post-v2",
+        &ConditionalPrecondition::IfNoneMatchStar,
+        expired_now,
+    )
+    .expect("If-None-Match: * must succeed once prior slot TTL has expired");
+
+    // 3. Unvalidated Config missing profiles must return Err rather than panicking
+    let mut broken_cfg = (*srv.state.config).clone();
+    broken_cfg.profiles.clear();
+    let missing_prof_err = db
+        .resolve_member_access(&broken_cfg, &card_and_lock_pk, now)
+        .unwrap_err();
+    assert!(matches!(
+        missing_prof_err,
+        humoco_sync_server::db::DbError::Http { status: 500, .. }
+    ));
+}

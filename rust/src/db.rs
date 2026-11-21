@@ -7,6 +7,7 @@ use rand::RngCore;
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::config::{Config, ProfileConfig, ADMIN_MEMBER_CHANNELS};
 use crate::crypto::{
@@ -283,6 +284,12 @@ pub struct SyncDb {
     fallback_drop_pub: String,
 }
 
+impl Drop for SyncDb {
+    fn drop(&mut self) {
+        self.pepper.zeroize();
+    }
+}
+
 impl SyncDb {
     pub fn open(db_path: &Path, config_pepper_hex: &str) -> Result<Self, DbError> {
         if let Some(parent) = db_path.parent() {
@@ -333,8 +340,8 @@ impl SyncDb {
                                 .to_string(),
                         ));
                     }
-                    let mut sk_bytes = [0u8; 32];
-                    OsRng.fill_bytes(&mut sk_bytes);
+                    let mut sk_bytes = Zeroizing::new([0u8; 32]);
+                    OsRng.fill_bytes(sk_bytes.as_mut());
                     server_meta.insert("lock_key", sk_bytes.as_slice())?;
                 }
             }
@@ -361,7 +368,10 @@ impl SyncDb {
         }
         write_txn.commit()?;
 
-        let derived_sk_bytes = blake3::derive_key("humoco-sync server-drop-pub v1", &pepper);
+        let derived_sk_bytes = Zeroizing::new(blake3::derive_key(
+            "humoco-sync server-drop-pub v1",
+            &pepper,
+        ));
         let derived_vk = ed25519_dalek::SigningKey::from_bytes(&derived_sk_bytes).verifying_key();
         let fallback_drop_pub = hex::encode(derived_vk.as_bytes());
 
@@ -394,14 +404,14 @@ impl SyncDb {
             let mut table = write_txn.open_table(NONCES)?;
             let existing = table.get(nonce_hex)?.map(|g| g.value());
             if let Some(exp) = existing {
-                if exp > now_secs {
+                if exp >= now_secs {
                     false
                 } else {
-                    table.insert(nonce_hex, now_secs + NONCE_TTL_SECS)?;
+                    table.insert(nonce_hex, now_secs.saturating_add(NONCE_TTL_SECS))?;
                     true
                 }
             } else {
-                table.insert(nonce_hex, now_secs + NONCE_TTL_SECS)?;
+                table.insert(nonce_hex, now_secs.saturating_add(NONCE_TTL_SECS))?;
                 true
             }
         };
@@ -501,6 +511,19 @@ impl SyncDb {
         Ok(cfg)
     }
 
+    fn has_any_raw_admin_membership<R: ReadableTable<&'static str, &'static [u8]>>(
+        admin_table: &R,
+        pubkey: &str,
+    ) -> Result<bool, DbError> {
+        for ch in ADMIN_MEMBER_CHANNELS {
+            let key = admin_member_key(ch, pubkey);
+            if admin_table.get(key.as_str())?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn admin_channels_for_pubkey_read<R: ReadableTable<&'static str, &'static [u8]>>(
         admin_table: &R,
         cfg: &Config,
@@ -511,6 +534,9 @@ impl SyncDb {
             return Ok(out);
         }
         for ch in ADMIN_MEMBER_CHANNELS {
+            if ch == "lock" && !cfg.lock.enabled {
+                continue;
+            }
             let key = admin_member_key(ch, pubkey);
             if admin_table.get(key.as_str())?.is_some() {
                 out.insert(ch.to_string());
@@ -523,12 +549,17 @@ impl SyncDb {
         rec: &'a RegisteredUserRecord,
         cfg: &'a Config,
         now_secs: u64,
-    ) -> (&'a str, &'a ProfileConfig, bool, Option<u64>) {
+    ) -> Result<(&'a str, &'a ProfileConfig, bool, Option<u64>), DbError> {
         let default_name = cfg.mode.default_public_profile.as_str();
-        let requested_name = if cfg.profiles.contains_key(&rec.profile) {
-            rec.profile.as_str()
-        } else {
-            default_name
+        let default_prof = cfg.profiles.get(default_name).ok_or_else(|| {
+            DbError::http(
+                500,
+                format!("Missing configured default profile '{}'", default_name),
+            )
+        })?;
+        let (requested_name, requested_prof) = match cfg.profiles.get(&rec.profile) {
+            Some(p) => (rec.profile.as_str(), p),
+            None => (default_name, default_prof),
         };
 
         if let Some(valid_until) = rec.valid_until {
@@ -536,15 +567,13 @@ impl SyncDb {
                 let grace_secs = (cfg.storage.downgrade_grace_days as u64).saturating_mul(86_400);
                 let grace_until = valid_until.saturating_add(grace_secs);
                 if now_secs <= grace_until {
-                    let prof = &cfg.profiles[requested_name];
-                    return (requested_name, prof, true, Some(grace_until));
+                    return Ok((requested_name, requested_prof, true, Some(grace_until)));
                 } else {
-                    let prof = &cfg.profiles[default_name];
-                    return (default_name, prof, false, None);
+                    return Ok((default_name, default_prof, false, None));
                 }
             }
         }
-        (requested_name, &cfg.profiles[requested_name], false, None)
+        Ok((requested_name, requested_prof, false, None))
     }
 
     fn resolve_member_access_in_txn<
@@ -580,7 +609,13 @@ impl SyncDb {
             (false, None) => Ok(None),
             (true, None) => {
                 let prof_name = cfg.mode.admin_app_profile.clone();
-                let prof = cfg.profiles[&prof_name].clone();
+                let prof = cfg
+                    .profiles
+                    .get(&prof_name)
+                    .ok_or_else(|| {
+                        DbError::http(500, format!("Missing configured profile '{}'", prof_name))
+                    })?
+                    .clone();
                 let mut allowed = admin_channels;
                 // Admin friend members authorized on any standard blob channel also get media if profile enables it
                 let has_blob_channel = allowed.iter().any(|c| c != "lock");
@@ -600,7 +635,7 @@ impl SyncDb {
             }
             (false, Some(rec)) => {
                 let (eff_name, eff_prof, in_grace, grace_until) =
-                    Self::resolve_registered_profile(rec, cfg, now_secs);
+                    Self::resolve_registered_profile(rec, cfg, now_secs)?;
                 let mut allowed: BTreeSet<String> = eff_prof.channels.keys().cloned().collect();
                 if cfg.lock.enabled && rec.valid_until.is_none_or(|v| now_secs <= v) {
                     allowed.insert("lock".to_string());
@@ -618,9 +653,14 @@ impl SyncDb {
             }
             (true, Some(rec)) => {
                 let (reg_name, reg_prof, in_grace, grace_until) =
-                    Self::resolve_registered_profile(rec, cfg, now_secs);
+                    Self::resolve_registered_profile(rec, cfg, now_secs)?;
                 let admin_prof_name = cfg.mode.admin_app_profile.as_str();
-                let admin_prof = &cfg.profiles[admin_prof_name];
+                let admin_prof = cfg.profiles.get(admin_prof_name).ok_or_else(|| {
+                    DbError::http(
+                        500,
+                        format!("Missing configured profile '{}'", admin_prof_name),
+                    )
+                })?;
                 let (chosen_name, chosen_prof) =
                     if reg_prof.max_total_bytes >= admin_prof.max_total_bytes {
                         (reg_name.to_string(), reg_prof.clone())
@@ -774,7 +814,18 @@ impl SyncDb {
                 if let Some(mid) = media_id {
                     if let Some(g) = media_meta.get(mid)? {
                         let meta: MediaMetaRecord = serde_json::from_slice(g.value())?;
-                        if meta.owner_pubkey == pubkey {
+                        let ttl_days = Self::resolve_member_access_in_txn(
+                            &admin_table,
+                            &reg_table,
+                            cfg,
+                            &meta.owner_pubkey,
+                            now_secs,
+                        )?
+                        .and_then(|a| a.profile.channels.get("media").map(|q| q.ttl_days))
+                        .unwrap_or(cfg.media.ttl_days);
+                        if is_ttl_expired(meta.created_at, ttl_days, now_secs) {
+                            (Some(false), None)
+                        } else if meta.owner_pubkey == pubkey {
                             (Some(true), Some(meta.etag))
                         } else {
                             (Some(true), None)
@@ -791,7 +842,17 @@ impl SyncDb {
                 let skey = slot_key(ch, &slot_id);
                 if let Some(g) = slot_meta.get(skey.as_str())? {
                     let meta: SlotMetaRecord = serde_json::from_slice(g.value())?;
-                    (Some(true), Some(meta.etag))
+                    let ttl_days = access
+                        .profile
+                        .channels
+                        .get(ch)
+                        .map(|q| q.ttl_days)
+                        .unwrap_or(0);
+                    if is_ttl_expired(meta.mtime, ttl_days, now_secs) {
+                        (Some(false), None)
+                    } else {
+                        (Some(true), Some(meta.etag))
+                    }
                 } else {
                     (Some(false), None)
                 }
@@ -830,6 +891,9 @@ impl SyncDb {
                 "Use media endpoint headers for media uploads",
             ));
         }
+        if data.is_empty() {
+            return Err(DbError::http(400, "Empty payload"));
+        }
         let effective_cfg = self.effective_config(cfg)?;
         let cfg = &effective_cfg;
         let slot_id = crate::crypto::format_slot_id(pubkey, prefix);
@@ -854,12 +918,13 @@ impl SyncDb {
             .filter(|a| a.allowed_channels.contains(channel))
             .ok_or_else(|| DbError::http(403, "Pubkey not authorized for channel"))?;
 
-            let max_ch_bytes = access
+            let ch_quota = access
                 .profile
                 .channels
                 .get(channel)
-                .map(|c| c.max_bytes)
                 .ok_or_else(|| DbError::http(403, "Channel disabled in profile"))?;
+            let max_ch_bytes = ch_quota.max_bytes;
+            let ch_ttl_days = ch_quota.ttl_days;
 
             if data.len() > max_ch_bytes {
                 return Err(DbError::http(413, "Payload exceeds channel limit"));
@@ -876,9 +941,13 @@ impl SyncDb {
                 }
             }
 
+            let live_meta = existing_meta
+                .as_ref()
+                .filter(|em| !is_ttl_expired(em.mtime, ch_ttl_days, now_secs));
+
             match precondition {
                 ConditionalPrecondition::None => {}
-                ConditionalPrecondition::IfMatch(expected) => match &existing_meta {
+                ConditionalPrecondition::IfMatch(expected) => match live_meta {
                     Some(em) if &em.etag == expected => {}
                     Some(em) => {
                         return Err(DbError::http(412, format!("ETAG_MISMATCH:{}", em.etag)));
@@ -886,18 +955,17 @@ impl SyncDb {
                     None => return Err(DbError::http(412, "ETAG_MISMATCH:")),
                 },
                 ConditionalPrecondition::IfNoneMatchStar => {
-                    if let Some(em) = &existing_meta {
+                    if let Some(em) = live_meta {
                         return Err(DbError::http(412, format!("ETAG_MISMATCH:{}", em.etag)));
                     }
                 }
             }
 
-            let old_size = existing_meta.as_ref().map(|m| m.size).unwrap_or(0) as i64;
-            let delta = data.len() as i64 - old_size;
+            let old_size = existing_meta.as_ref().map(|m| m.size).unwrap_or(0);
             let mut evicted_media = 0usize;
 
-            if delta > 0 {
-                let delta_u = delta as u64;
+            if data.len() > old_size {
+                let delta_u = (data.len() - old_size) as u64;
                 evicted_media = ensure_quota_with_media_eviction(
                     cfg,
                     &admin_table,
@@ -946,6 +1014,9 @@ impl SyncDb {
         precondition: &ConditionalPrecondition,
         now_secs: u64,
     ) -> Result<PutOutcome, DbError> {
+        if data.is_empty() {
+            return Err(DbError::http(400, "Empty payload"));
+        }
         let effective_cfg = self.effective_config(cfg)?;
         let cfg = &effective_cfg;
         let write_txn = self.db.begin_write()?;
@@ -992,9 +1063,14 @@ impl SyncDb {
                 }
             }
 
+            let media_ttl_days = media_q.map(|q| q.ttl_days).unwrap_or(cfg.media.ttl_days);
+            let live_existing = existing
+                .as_ref()
+                .filter(|em| !is_ttl_expired(em.created_at, media_ttl_days, now_secs));
+
             match precondition {
                 ConditionalPrecondition::None => {}
-                ConditionalPrecondition::IfMatch(expected) => match &existing {
+                ConditionalPrecondition::IfMatch(expected) => match live_existing {
                     Some(em) if &em.etag == expected => {}
                     Some(em) => {
                         return Err(DbError::http(412, format!("ETAG_MISMATCH:{}", em.etag)));
@@ -1002,7 +1078,7 @@ impl SyncDb {
                     None => return Err(DbError::http(412, "ETAG_MISMATCH:")),
                 },
                 ConditionalPrecondition::IfNoneMatchStar => {
-                    if let Some(em) = &existing {
+                    if let Some(em) = live_existing {
                         return Err(DbError::http(412, format!("ETAG_MISMATCH:{}", em.etag)));
                     }
                 }
@@ -1017,12 +1093,12 @@ impl SyncDb {
                     let (_, val) = entry?;
                     let m: MediaMetaRecord = serde_json::from_slice(val.value())?;
                     if m.owner_pubkey == pubkey && m.media_id != media_id {
-                        user_bytes += m.size as u64;
+                        user_bytes = user_bytes.saturating_add(m.size as u64);
                         user_media.push(m);
                     }
                 }
                 let need_count = max_user_count > 0 && user_media.len() >= max_user_count;
-                let need_bytes = user_bytes + data.len() as u64 > max_user_bytes;
+                let need_bytes = user_bytes.saturating_add(data.len() as u64) > max_user_bytes;
                 if !need_count && !need_bytes {
                     break;
                 }
@@ -1045,6 +1121,7 @@ impl SyncDb {
                         "Media exceeds total media channel capacity",
                     ));
                 }
+                let mut free_cache: BTreeMap<String, bool> = BTreeMap::new();
                 loop {
                     let mut all_media: Vec<(MediaMetaRecord, bool)> = Vec::new();
                     let mut total_media_bytes = 0u64;
@@ -1052,20 +1129,19 @@ impl SyncDb {
                         let (_, val) = entry?;
                         let m: MediaMetaRecord = serde_json::from_slice(val.value())?;
                         if m.media_id != media_id {
-                            total_media_bytes += m.size as u64;
-                            let is_free = Self::resolve_member_access_in_txn(
+                            total_media_bytes = total_media_bytes.saturating_add(m.size as u64);
+                            let is_free = is_owner_free_pool(
+                                cfg,
                                 &admin_table,
                                 &reg_table,
-                                cfg,
+                                &mut free_cache,
                                 &m.owner_pubkey,
                                 now_secs,
-                            )?
-                            .map(|a| a.profile.is_free_pool)
-                            .unwrap_or(true);
+                            )?;
                             all_media.push((m, is_free));
                         }
                     }
-                    if total_media_bytes + data.len() as u64 <= max_channel_bytes {
+                    if total_media_bytes.saturating_add(data.len() as u64) <= max_channel_bytes {
                         break;
                     }
                     all_media.sort_by_key(|(m, is_free)| {
@@ -1089,9 +1165,8 @@ impl SyncDb {
                 }
             }
 
-            let old_size = existing.as_ref().map(|m| m.size).unwrap_or(0) as i64;
-            let delta = data.len() as i64 - old_size;
-            if delta > 0 {
+            let old_size = existing.as_ref().map(|m| m.size).unwrap_or(0);
+            if data.len() > old_size {
                 evicted += ensure_quota_with_media_eviction(
                     cfg,
                     &admin_table,
@@ -1101,7 +1176,7 @@ impl SyncDb {
                     &mut media_data,
                     pubkey,
                     &access,
-                    delta as u64,
+                    (data.len() - old_size) as u64,
                     Some(media_id),
                     now_secs,
                 )?;
@@ -1113,7 +1188,7 @@ impl SyncDb {
                 media_id: media_id.to_string(),
                 size: data.len(),
                 etag: etag.clone(),
-                created_at: existing.as_ref().map(|m| m.created_at).unwrap_or(now_secs),
+                created_at: live_existing.map(|m| m.created_at).unwrap_or(now_secs),
                 last_access_at: now_secs,
             };
             media_meta.insert(media_id, serde_json::to_vec(&meta)?.as_slice())?;
@@ -1372,7 +1447,7 @@ impl SyncDb {
                 }
             }
 
-            // Prune orphaned slots in `channel` ONLY for removed pubkeys NOT authorized via REGISTERED_USERS
+            // Prune orphaned slots in `channel` ONLY for removed pubkeys NOT present in REGISTERED_USERS
             let removed_set: BTreeSet<String> = removed_pubkeys.into_iter().collect();
             if !removed_set.is_empty() {
                 let mut slots_to_delete = Vec::new();
@@ -1380,6 +1455,9 @@ impl SyncDb {
                     let (k, v) = entry?;
                     let meta: SlotMetaRecord = serde_json::from_slice(v.value())?;
                     if meta.channel == channel && removed_set.contains(&meta.owner_pubkey) {
+                        if reg_table.get(meta.owner_pubkey.as_str())?.is_some() {
+                            continue;
+                        }
                         let still_authorized = Self::resolve_member_access_in_txn(
                             &admin_table,
                             &reg_table,
@@ -1398,9 +1476,12 @@ impl SyncDb {
                     slot_data.remove(sk.as_str())?;
                 }
 
-                // Prune orphaned media if removed user no longer has ANY authorization on the server
+                // Prune orphaned media if removed user is not a registered user and has no remaining authorization
                 let mut still_unauthorized = BTreeSet::new();
                 for pk in &removed_set {
+                    if reg_table.get(pk.as_str())?.is_some() {
+                        continue;
+                    }
                     if Self::resolve_member_access_in_txn(
                         &admin_table,
                         &reg_table,
@@ -1501,11 +1582,8 @@ impl SyncDb {
             now_secs,
         )? {
             if let Some(q) = access.profile.channels.get(channel) {
-                if q.ttl_days > 0 {
-                    let ttl_secs = (q.ttl_days as u64).saturating_mul(86_400);
-                    if meta.mtime.saturating_add(ttl_secs) < now_secs {
-                        return Ok(None);
-                    }
+                if is_ttl_expired(meta.mtime, q.ttl_days, now_secs) {
+                    return Ok(None);
                 }
             }
         }
@@ -1542,11 +1620,8 @@ impl SyncDb {
         )?
         .and_then(|a| a.profile.channels.get("media").map(|q| q.ttl_days))
         .unwrap_or(cfg.media.ttl_days);
-        if ttl_days > 0 {
-            let ttl_secs = (ttl_days as u64).saturating_mul(86_400);
-            if meta.created_at.saturating_add(ttl_secs) < now_secs {
-                return Ok(None);
-            }
+        if is_ttl_expired(meta.created_at, ttl_days, now_secs) {
+            return Ok(None);
         }
 
         let Some(data_guard) = media_data.get(media_id)? else {
@@ -1610,25 +1685,17 @@ impl SyncDb {
             let (_, v) = entry?;
             let meta: SlotMetaRecord = serde_json::from_slice(v.value())?;
             slot_count += 1;
-            used_bytes += meta.size as u64;
+            used_bytes = used_bytes.saturating_add(meta.size as u64);
             *channel_counts.entry(meta.channel.clone()).or_insert(0) += 1;
-            let is_free = if let Some(&cached) = owner_free_cache.get(&meta.owner_pubkey) {
-                cached
-            } else {
-                let f = Self::resolve_member_access_in_txn(
-                    &admin_table,
-                    &reg_table,
-                    cfg,
-                    &meta.owner_pubkey,
-                    now_secs,
-                )?
-                .map(|a| a.profile.is_free_pool)
-                .unwrap_or(true);
-                owner_free_cache.insert(meta.owner_pubkey.clone(), f);
-                f
-            };
-            if is_free {
-                free_pool_used_bytes += meta.size as u64;
+            if is_owner_free_pool(
+                cfg,
+                &admin_table,
+                &reg_table,
+                &mut owner_free_cache,
+                &meta.owner_pubkey,
+                now_secs,
+            )? {
+                free_pool_used_bytes = free_pool_used_bytes.saturating_add(meta.size as u64);
             }
         }
 
@@ -1636,25 +1703,17 @@ impl SyncDb {
             let (_, v) = entry?;
             let m: MediaMetaRecord = serde_json::from_slice(v.value())?;
             slot_count += 1;
-            used_bytes += m.size as u64;
+            used_bytes = used_bytes.saturating_add(m.size as u64);
             *channel_counts.entry("media".to_string()).or_insert(0) += 1;
-            let is_free = if let Some(&cached) = owner_free_cache.get(&m.owner_pubkey) {
-                cached
-            } else {
-                let f = Self::resolve_member_access_in_txn(
-                    &admin_table,
-                    &reg_table,
-                    cfg,
-                    &m.owner_pubkey,
-                    now_secs,
-                )?
-                .map(|a| a.profile.is_free_pool)
-                .unwrap_or(true);
-                owner_free_cache.insert(m.owner_pubkey.clone(), f);
-                f
-            };
-            if is_free {
-                free_pool_used_bytes += m.size as u64;
+            if is_owner_free_pool(
+                cfg,
+                &admin_table,
+                &reg_table,
+                &mut owner_free_cache,
+                &m.owner_pubkey,
+                now_secs,
+            )? {
+                free_pool_used_bytes = free_pool_used_bytes.saturating_add(m.size as u64);
             }
         }
 
@@ -1747,6 +1806,15 @@ impl SyncDb {
                 Some(g) => Some(serde_json::from_slice(g.value())?),
                 None => None,
             };
+
+            if gate != "admin" {
+                if let Some(ref rec) = existing {
+                    if rec.status == AccountStatus::Suspended {
+                        return Err(DbError::http(403, "Account is suspended"));
+                    }
+                    return Err(DbError::http(409, "Public key is already registered"));
+                }
+            }
 
             let mut final_email_hmac = existing.as_ref().and_then(|r| r.email_hmac.clone());
             let mut final_enc_email = existing
@@ -1919,8 +1987,34 @@ impl SyncDb {
             if code_rec.used_count >= code_rec.max_uses {
                 return Err(DbError::http(409, "Redeem code already exhausted"));
             }
-            if !cfg.profiles.contains_key(&code_rec.profile) {
+            let Some(target_prof) = cfg.profiles.get(&code_rec.profile) else {
                 return Err(DbError::http(500, "Code points to non-existent profile"));
+            };
+
+            let existing: Option<RegisteredUserRecord> = match reg_table.get(pubkey)? {
+                Some(g) => Some(serde_json::from_slice(g.value())?),
+                None => None,
+            };
+            if let Some(ref rec) = existing {
+                if rec.status == AccountStatus::Suspended {
+                    return Err(DbError::http(403, "Account is suspended"));
+                }
+                if rec.profile == code_rec.profile {
+                    if rec.valid_until.is_none() {
+                        return Err(DbError::http(
+                            409,
+                            "Account already has an unlimited subscription for this profile",
+                        ));
+                    }
+                } else {
+                    let (_, eff_prof, _, _) = Self::resolve_registered_profile(rec, cfg, now_secs)?;
+                    if target_prof.max_total_bytes <= eff_prof.max_total_bytes {
+                        return Err(DbError::http(
+                            409,
+                            "Cannot downgrade or overwrite existing higher-or-equal tier account",
+                        ));
+                    }
+                }
             }
 
             code_rec.used_count += 1;
@@ -1928,12 +2022,6 @@ impl SyncDb {
                 code_norm.as_str(),
                 serde_json::to_vec(&code_rec)?.as_slice(),
             )?;
-
-            let existing: Option<RegisteredUserRecord> = match reg_table.get(pubkey)? {
-                Some(g) => Some(serde_json::from_slice(g.value())?),
-                None => None,
-            };
-            let target_prof = &cfg.profiles[&code_rec.profile];
             let valid_until = code_rec.duration_days.map(|days| {
                 let add = (days as u64).saturating_mul(86_400);
                 let base = existing
@@ -2003,7 +2091,7 @@ impl SyncDb {
             let (_, v) = entry?;
             let rec: RegisteredUserRecord = serde_json::from_slice(v.value())?;
             let (eff_name, _, in_grace, grace_until) =
-                Self::resolve_registered_profile(&rec, cfg, now_secs);
+                Self::resolve_registered_profile(&rec, cfg, now_secs)?;
             let effective_profile = eff_name.to_string();
             let is_admin =
                 !Self::admin_channels_for_pubkey_read(&admin_table, cfg, &rec.pubkey)?.is_empty();
@@ -2120,7 +2208,16 @@ impl SyncDb {
 
             // 3. Finalize overdue downgrades after grace period
             let default_prof = &cfg.mode.default_public_profile;
-            let default_stores_email = cfg.profiles[default_prof].store_contact_email;
+            let default_stores_email = cfg
+                .profiles
+                .get(default_prof)
+                .ok_or_else(|| {
+                    DbError::http(
+                        500,
+                        format!("Missing configured default profile '{}'", default_prof),
+                    )
+                })?
+                .store_contact_email;
             let grace_secs = (cfg.storage.downgrade_grace_days as u64).saturating_mul(86_400);
             let mut updates = Vec::new();
             for entry in reg_table.iter()? {
@@ -2156,11 +2253,8 @@ impl SyncDb {
                 )?
                 .and_then(|a| a.profile.channels.get(&m.channel).map(|q| q.ttl_days))
                 .unwrap_or(0);
-                if ttl_days > 0 {
-                    let ttl_secs = (ttl_days as u64).saturating_mul(86_400);
-                    if m.mtime.saturating_add(ttl_secs) < now_secs {
-                        exp_slots.push(k.value().to_string());
-                    }
+                if is_ttl_expired(m.mtime, ttl_days, now_secs) {
+                    exp_slots.push(k.value().to_string());
                 }
             }
             for k in exp_slots {
@@ -2181,11 +2275,8 @@ impl SyncDb {
                 )?
                 .and_then(|a| a.profile.channels.get("media").map(|q| q.ttl_days))
                 .unwrap_or(cfg.media.ttl_days);
-                if ttl_days > 0 {
-                    let ttl_secs = (ttl_days as u64).saturating_mul(86_400);
-                    if m.created_at.saturating_add(ttl_secs) < now_secs {
-                        exp_media.push(k.value().to_string());
-                    }
+                if is_ttl_expired(m.created_at, ttl_days, now_secs) {
+                    exp_media.push(k.value().to_string());
                 }
             }
             for k in exp_media {
@@ -2197,6 +2288,10 @@ impl SyncDb {
         let _ = self.run_lock_gc(now_secs)?;
         Ok(())
     }
+}
+
+fn is_ttl_expired(ts: u64, ttl_days: u32, now_secs: u64) -> bool {
+    ttl_days > 0 && ts.saturating_add((ttl_days as u64).saturating_mul(86_400)) < now_secs
 }
 
 fn admin_member_key(channel: &str, pubkey: &str) -> String {
@@ -2234,7 +2329,7 @@ fn ensure_quota_with_media_eviction<
             let (_, v) = entry?;
             let m: SlotMetaRecord = serde_json::from_slice(v.value())?;
             if m.owner_pubkey == pubkey {
-                acct_used += m.size as u64;
+                acct_used = acct_used.saturating_add(m.size as u64);
             }
         }
         let mut acct_media = Vec::new();
@@ -2242,13 +2337,13 @@ fn ensure_quota_with_media_eviction<
             let (_, v) = entry?;
             let m: MediaMetaRecord = serde_json::from_slice(v.value())?;
             if m.owner_pubkey == pubkey {
-                acct_used += m.size as u64;
+                acct_used = acct_used.saturating_add(m.size as u64);
                 if Some(m.media_id.as_str()) != skip_media_id {
                     acct_media.push(m);
                 }
             }
         }
-        if acct_used + delta_bytes <= access.profile.max_total_bytes {
+        if acct_used.saturating_add(delta_bytes) <= access.profile.max_total_bytes {
             break;
         }
         acct_media.sort_by_key(|m| (m.last_access_at, m.created_at, m.media_id.clone()));
@@ -2280,7 +2375,7 @@ fn ensure_quota_with_media_eviction<
                     &m.owner_pubkey,
                     now_secs,
                 )? {
-                    free_used += m.size as u64;
+                    free_used = free_used.saturating_add(m.size as u64);
                 }
             }
             for entry in media_meta.iter()? {
@@ -2294,13 +2389,13 @@ fn ensure_quota_with_media_eviction<
                     &m.owner_pubkey,
                     now_secs,
                 )? {
-                    free_used += m.size as u64;
+                    free_used = free_used.saturating_add(m.size as u64);
                     if Some(m.media_id.as_str()) != skip_media_id {
                         free_media.push(m);
                     }
                 }
             }
-            if free_used + delta_bytes <= free_cap {
+            if free_used.saturating_add(delta_bytes) <= free_cap {
                 break;
             }
             free_media.sort_by_key(|m| (m.last_access_at, m.created_at, m.media_id.clone()));
@@ -2324,12 +2419,12 @@ fn ensure_quota_with_media_eviction<
         for entry in slot_meta.iter()? {
             let (_, v) = entry?;
             let m: SlotMetaRecord = serde_json::from_slice(v.value())?;
-            total_used += m.size as u64;
+            total_used = total_used.saturating_add(m.size as u64);
         }
         for entry in media_meta.iter()? {
             let (_, v) = entry?;
             let m: MediaMetaRecord = serde_json::from_slice(v.value())?;
-            total_used += m.size as u64;
+            total_used = total_used.saturating_add(m.size as u64);
             if Some(m.media_id.as_str()) != skip_media_id {
                 let is_free = is_owner_free_pool(
                     cfg,
@@ -2342,7 +2437,7 @@ fn ensure_quota_with_media_eviction<
                 candidates.push((m, is_free));
             }
         }
-        if total_used + delta_bytes <= global_cap {
+        if total_used.saturating_add(delta_bytes) <= global_cap {
             break;
         }
         // Always evict free-pool media before paid/friends media.
@@ -2384,10 +2479,24 @@ fn is_owner_free_pool<
     if let Some(&b) = cache.get(owner_pubkey) {
         return Ok(b);
     }
-    let is_free =
+    let is_free = if let Some(access) =
         SyncDb::resolve_member_access_in_txn(admin_table, reg_table, cfg, owner_pubkey, now_secs)?
-            .map(|a| a.profile.is_free_pool)
-            .unwrap_or(true);
+    {
+        access.profile.is_free_pool
+    } else if let Some(g) = reg_table.get(owner_pubkey)? {
+        // Suspended or disabled-gate registered users keep their resolved profile's pool
+        // classification so non-free accounts never pollute or starve the free pool.
+        let rec: RegisteredUserRecord = serde_json::from_slice(g.value())?;
+        SyncDb::resolve_registered_profile(&rec, cfg, now_secs)?
+            .1
+            .is_free_pool
+    } else if SyncDb::has_any_raw_admin_membership(admin_table, owner_pubkey)? {
+        cfg.profiles
+            .get(&cfg.mode.admin_app_profile)
+            .is_none_or(|p| p.is_free_pool)
+    } else {
+        true
+    };
     cache.insert(owner_pubkey.to_string(), is_free);
     Ok(is_free)
 }
