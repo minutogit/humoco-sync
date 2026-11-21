@@ -101,7 +101,15 @@ impl RateLimiter {
                 let remove_n = guard.len().saturating_sub(target_len);
                 let mut candidates: Vec<(String, bool, u32)> = guard
                     .iter()
-                    .map(|(k, v)| (k.clone(), v.count >= limit, v.count))
+                    .map(|(k, v)| {
+                        let entry_limit = if k.starts_with("v6:") {
+                            self.max_ipv6_48_per_day
+                        } else {
+                            self.max_ipv4_24_per_day
+                        };
+                        let saturated = entry_limit > 0 && v.count >= entry_limit;
+                        (k.clone(), saturated, v.count)
+                    })
                     .collect();
                 candidates.sort_by_key(|(_, saturated, count)| (*saturated, *count));
                 for (k, _, _) in candidates.into_iter().take(remove_n) {
@@ -337,7 +345,7 @@ mod tests {
 
     #[test]
     fn test_s04_ratelimiter_bounded_maps_and_preserves_throttled() {
-        let rl = RateLimiter::new(2, 2, 1, 1);
+        let rl = RateLimiter::new(2, 2, 2, 2);
         let attacker_ip = IpAddr::from([198, 51, 100, 1]);
         assert!(rl.allow_ip(attacker_ip));
         assert!(rl.allow_ip(attacker_ip));
@@ -360,6 +368,7 @@ mod tests {
         );
 
         let blocked_subnet_ip = IpAddr::from([192, 0, 2, 10]);
+        assert!(rl.check_and_record_registration_subnet(blocked_subnet_ip));
         assert!(rl.check_and_record_registration_subnet(blocked_subnet_ip));
         assert!(!rl.check_and_record_registration_subnet(blocked_subnet_ip));
 
