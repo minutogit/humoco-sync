@@ -85,12 +85,20 @@ pub struct ImportedProposalRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelfFrozenOrigin {
+    pub frozen_at: u64,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnchorRotationRecord {
     pub active_manifest: AnchorManifest,
     pub last_creator_activity_secs: u64,
     pub voted_proposals_by_rev: BTreeMap<u64, VotedProposalRecord>,
     pub vetoed_proposal_hashes: Vec<[u8; 32]>,
     pub imported_proposal: Option<ImportedProposalRecord>,
+    #[serde(default)]
+    pub self_frozen_origin: Option<SelfFrozenOrigin>,
 }
 
 impl AnchorRotationRecord {
@@ -101,7 +109,18 @@ impl AnchorRotationRecord {
             voted_proposals_by_rev: BTreeMap::new(),
             vetoed_proposal_hashes: Vec::new(),
             imported_proposal: None,
+            self_frozen_origin: None,
         }
+    }
+}
+
+fn restore_non_proposal_freeze_state(rot: &AnchorRotationRecord) -> BucketFreezeState {
+    match &rot.self_frozen_origin {
+        Some(sf) => BucketFreezeState::SelfFrozen {
+            frozen_at: sf.frozen_at,
+            reason: sf.reason.clone(),
+        },
+        None => BucketFreezeState::Active,
     }
 }
 
@@ -642,6 +661,9 @@ impl SyncDb {
                 if rot.vetoed_proposal_hashes.contains(&prop_hash) {
                     return Err(DbError::http(409, "Proposal was previously vetoed"));
                 }
+                if proposal.from_rev != rot.active_manifest.revision {
+                    return Err(DbError::http(409, "Manifest revision mismatch"));
+                }
 
                 // Single-proposal lock (`voted_proposal[rev]`)
                 if let Some(existing_vp) = rot.voted_proposals_by_rev.get(&proposal.from_rev) {
@@ -722,6 +744,16 @@ impl SyncDb {
                         effective_at,
                     },
                 );
+                if let BucketFreezeState::SelfFrozen {
+                    frozen_at,
+                    ref reason,
+                } = bucket.freeze_state
+                {
+                    rot.self_frozen_origin = Some(SelfFrozenOrigin {
+                        frozen_at,
+                        reason: reason.clone(),
+                    });
+                }
                 bucket.freeze_state = BucketFreezeState::PermanentProposal {
                     from_rev: proposal.from_rev,
                     proposal_hash: prop_hash,
@@ -788,6 +820,13 @@ impl SyncDb {
                         None => return Err(DbError::http(404, "Lock bucket not found")),
                     };
 
+                    if matches!(bucket.freeze_state, BucketFreezeState::EpochFrozen { .. }) {
+                        return Err(DbError::http(409, "epoch_frozen"));
+                    }
+                    if veto.from_rev != rot.active_manifest.revision {
+                        return Err(DbError::http(409, "Manifest revision mismatch"));
+                    }
+
                     let Some(vp) = rot.voted_proposals_by_rev.get(&veto.from_rev).cloned() else {
                         return Err(DbError::http(404, "No pending proposal in this revision"));
                     };
@@ -818,7 +857,7 @@ impl SyncDb {
                         bucket.freeze_state,
                         BucketFreezeState::PermanentProposal { .. }
                     ) {
-                        bucket.freeze_state = BucketFreezeState::Active;
+                        bucket.freeze_state = restore_non_proposal_freeze_state(&rot);
                     }
 
                     buckets.insert(bucket_hex.as_str(), serde_json::to_vec(&bucket)?.as_slice())?;
@@ -927,7 +966,16 @@ impl SyncDb {
             let mut anchors_tbl = write_txn.open_table(LOCK_ANCHORS)?;
 
             let mut rot: AnchorRotationRecord = match rotations_tbl.get(anchor_hex.as_str())? {
-                Some(g) => serde_json::from_slice(g.value())?,
+                Some(g) => {
+                    let existing: AnchorRotationRecord = serde_json::from_slice(g.value())?;
+                    if req.proposal.to_rev <= existing.active_manifest.revision {
+                        return Err(DbError::http(
+                            409,
+                            "Target revision has already been finalized",
+                        ));
+                    }
+                    existing
+                }
                 None => AnchorRotationRecord::new(
                     req.active_manifest.clone(),
                     (req.active_manifest.issued_at_ms / 1_000).min(now_secs),
@@ -1027,15 +1075,16 @@ impl SyncDb {
                     let prev_b: LockBucketRecord = serde_json::from_slice(g.value())?;
                     match prev_b.freeze_state {
                         BucketFreezeState::SelfFrozen { .. }
-                        | BucketFreezeState::PermanentProposal { .. } => prev_b.freeze_state,
+                        | BucketFreezeState::PermanentProposal { .. }
+                        | BucketFreezeState::EpochFrozen { .. } => prev_b.freeze_state,
                         BucketFreezeState::PreProposal { expires_at, .. }
                             if now_secs < expires_at =>
                         {
                             prev_b.freeze_state
                         }
-                        BucketFreezeState::Active
-                        | BucketFreezeState::PreProposal { .. }
-                        | BucketFreezeState::EpochFrozen { .. } => BucketFreezeState::Active,
+                        BucketFreezeState::Active | BucketFreezeState::PreProposal { .. } => {
+                            BucketFreezeState::Active
+                        }
                     }
                 }
                 None => BucketFreezeState::Active,
@@ -1215,9 +1264,19 @@ impl SyncDb {
                 anchor_id,
                 new_manifest,
             } => {
-                new_manifest
+                let chain_report = new_manifest
                     .verify_anchor_id(&anchor_id)
                     .map_err(|e| DbError::http(400, format!("Invalid new_manifest chain: {e}")))?;
+                if !chain_report
+                    .historical_committees
+                    .iter()
+                    .any(|c| c.contains(&lock_pub))
+                {
+                    return Err(DbError::http(
+                        400,
+                        "Server lock_pub is not a member of manifest chain",
+                    ));
+                }
                 if new_manifest.revision <= 1 {
                     return Err(DbError::http(
                         400,
@@ -1254,14 +1313,52 @@ impl SyncDb {
                     let mut rotations_tbl = write_txn.open_table(LOCK_ROTATIONS)?;
                     let mut anchors_tbl = write_txn.open_table(LOCK_ANCHORS)?;
 
-                    let mut rot: AnchorRotationRecord =
-                        match rotations_tbl.get(anchor_hex.as_str())? {
-                            Some(g) => serde_json::from_slice(g.value())?,
-                            None => AnchorRotationRecord::new(
-                                new_manifest.clone(),
-                                (new_manifest.issued_at_ms / 1_000).min(now_secs),
-                            ),
-                        };
+                    let mut rot: AnchorRotationRecord = match rotations_tbl
+                        .get(anchor_hex.as_str())?
+                    {
+                        Some(g) => {
+                            let existing: AnchorRotationRecord = serde_json::from_slice(g.value())?;
+                            if new_manifest.revision < existing.active_manifest.revision {
+                                return Err(DbError::http(
+                                    409,
+                                    "Cannot downgrade active manifest revision",
+                                ));
+                            }
+                            if new_manifest.revision == existing.active_manifest.revision {
+                                let same_transition = existing
+                                    .active_manifest
+                                    .migration_chain
+                                    .last()
+                                    .is_some_and(|cert| {
+                                        cert.proposal.core_digest().ok() == Some(latest_prop_hash)
+                                            && cert.imported_state_hash
+                                                == latest_cert.imported_state_hash
+                                    });
+                                if !same_transition {
+                                    return Err(DbError::http(
+                                        409,
+                                        "Conflicting manifest already finalized at this revision",
+                                    ));
+                                }
+                                if let Some(bg) = buckets.get(bucket_hex.as_str())? {
+                                    let b: LockBucketRecord = serde_json::from_slice(bg.value())?;
+                                    return Ok((
+                                        200,
+                                        serde_json::json!({
+                                            "status": "finalized",
+                                            "revision": new_manifest.revision,
+                                            "bucket_freeze_state": b.freeze_state,
+                                        }),
+                                    ));
+                                }
+                            }
+                            existing
+                        }
+                        None => AnchorRotationRecord::new(
+                            new_manifest.clone(),
+                            (new_manifest.issued_at_ms / 1_000).min(now_secs),
+                        ),
+                    };
 
                     let in_new_committee = new_committee.contains(&lock_pub);
                     if in_new_committee {
@@ -1293,7 +1390,7 @@ impl SyncDb {
                             b.freeze_state = if in_new_committee {
                                 match b.freeze_state {
                                     BucketFreezeState::SelfFrozen { .. } => b.freeze_state,
-                                    _ => BucketFreezeState::Active,
+                                    _ => restore_non_proposal_freeze_state(&rot),
                                 }
                             } else {
                                 BucketFreezeState::EpochFrozen {

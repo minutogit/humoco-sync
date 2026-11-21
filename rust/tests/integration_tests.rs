@@ -4593,3 +4593,1045 @@ fn test_s01_ticket_replay_rejected_at_exact_expiry_boundary() {
         humoco_sync_server::db::DbError::Http { status: 409, .. }
     ));
 }
+
+#[tokio::test]
+async fn test_s02_self_frozen_persists_across_propose_veto_and_finalize() {
+    let dir = TempDir::new().unwrap();
+    let db1_path = dir.path().join("s1.redb");
+    let db1_snap_path = dir.path().join("s1.snap.redb");
+
+    let (a1_sk, a1_pk) = gen_keypair();
+    let (a2_sk, _, s2) = start_lock_test_server(true, None).await;
+    let (a3_sk, _, s3) = start_lock_test_server(true, None).await;
+    let (a4_sk, _, s4) = start_lock_test_server(true, None).await;
+
+    let mut cfg1 = base_hybrid_config(&a1_pk);
+    cfg1.lock.allow_pow_tickets = true;
+    cfg1.lock.ticket_pow_bits = 8;
+
+    let creator_mig_sk = SigningKey::from_bytes(&[151u8; 32]);
+    let g_mig_sk = SigningKey::from_bytes(&[152u8; 32]);
+    let creator_mig_pub = creator_mig_sk.verifying_key().to_bytes();
+    let g_mig_pub = g_mig_sk.verifying_key().to_bytes();
+    let quarter = humoco_proto::encode_quarter(2031, 4).unwrap();
+    let t0 = 1_795_000_000u64;
+
+    let (lp1, manifest, anchor_id, bucket1, ticket1, e0, e1, e2, receipt_seq2) = {
+        let db1 = humoco_sync_server::db::SyncDb::open(&db1_path, "").unwrap();
+        let lp1 = db1.lock_pubkey_bytes().unwrap();
+        let e_s1 = humoco_proto::ServerEntry {
+            write_url: "https://s1.example/sync.php".to_string(),
+            read_url: "https://s1.example/humoco_sync_data".to_string(),
+            admin_pub: a1_sk.verifying_key().to_bytes(),
+            lock_pub: lp1,
+            nominated_by: humoco_proto::NominatedBy::Creator,
+        };
+        let e_s2 = server_entry_for_test(&s2, &a2_sk, humoco_proto::NominatedBy::Creator);
+        let e_s3 = server_entry_for_test(&s3, &a3_sk, humoco_proto::NominatedBy::Guarantor(0));
+        let e_s4 = server_entry_for_test(&s4, &a4_sk, humoco_proto::NominatedBy::Guarantor(0));
+        let manifest = build_multi_server_manifest(
+            vec![e_s1, e_s2, e_s3],
+            vec![e_s4],
+            2,
+            creator_mig_pub,
+            vec![g_mig_pub],
+            t0 * 1_000,
+            quarter,
+        );
+        let anchor_id = manifest.rev1_anchor_id().unwrap();
+        let bucket1 = humoco_proto::derive_bucket(&anchor_id, &lp1);
+        let pow_nonce =
+            humoco_proto::solve_ticket_pow(&anchor_id, quarter, t0, 8, 0, 200_000).unwrap();
+        let ticket1 = db1
+            .issue_genesis_ticket(
+                &cfg1,
+                humoco_sync_server::locks::TicketCallerAuth::UnauthenticatedPow,
+                humoco_sync_server::locks::LockTicketRequest {
+                    anchor_id,
+                    retain_until_quarter: quarter,
+                    pow_timestamp: Some(t0),
+                    pow_nonce: Some(pow_nonce),
+                },
+                t0,
+            )
+            .unwrap();
+
+        let g_sk = SigningKey::from_bytes(&[153u8; 32]);
+        let r1_sk = SigningKey::from_bytes(&[154u8; 32]);
+        let r2_sk = SigningKey::from_bytes(&[155u8; 32]);
+        let e0 = sign_lock_entry_helper(
+            anchor_id,
+            [0x61; 32],
+            [0u8; 32],
+            0,
+            0,
+            [0x71; 32],
+            &g_sk,
+            humoco_proto::hash_pubkey_sha3(&r1_sk.verifying_key().to_bytes()),
+            None,
+            Some(&creator_mig_sk),
+            8,
+        );
+        let e1 = sign_lock_entry_helper(
+            anchor_id,
+            [0x62; 32],
+            e0.slot,
+            0,
+            1,
+            [0x72; 32],
+            &r1_sk,
+            humoco_proto::hash_pubkey_sha3(&r2_sk.verifying_key().to_bytes()),
+            None,
+            None,
+            8,
+        );
+        let e2 = sign_lock_entry_helper(
+            anchor_id, [0x63; 32], e1.slot, 0, 2, [0x73; 32], &r2_sk, [0xAA; 32], None, None, 8,
+        );
+
+        let (c0, _) = db1
+            .process_lock_batch(
+                &cfg1,
+                humoco_sync_server::locks::LockBatchRequest {
+                    anchor_id,
+                    bucket: bucket1,
+                    recipient_nonce: [0x11; 32],
+                    entries: vec![e0.to_wire_hex().unwrap()],
+                    manifest: Some(manifest.clone()),
+                    genesis_ticket: Some(ticket1.clone()),
+                    known_head_receipt: None,
+                },
+                t0,
+            )
+            .unwrap();
+        assert_eq!(c0, 200);
+        drop(db1);
+        std::fs::copy(&db1_path, &db1_snap_path).unwrap();
+
+        let db1 = humoco_sync_server::db::SyncDb::open(&db1_path, "").unwrap();
+        let (c1, v1) = db1
+            .process_lock_batch(
+                &cfg1,
+                humoco_sync_server::locks::LockBatchRequest {
+                    anchor_id,
+                    bucket: bucket1,
+                    recipient_nonce: [0x12; 32],
+                    entries: vec![e1.to_wire_hex().unwrap()],
+                    manifest: None,
+                    genesis_ticket: None,
+                    known_head_receipt: None,
+                },
+                t0 + 5,
+            )
+            .unwrap();
+        assert_eq!(c1, 200);
+        let resp1: humoco_sync_server::locks::LockBatchResponse =
+            serde_json::from_value(v1).unwrap();
+        let receipt_seq2 = resp1.receipts.into_iter().next().unwrap();
+        assert_eq!(receipt_seq2.write_seq, 2);
+        (
+            lp1,
+            manifest,
+            anchor_id,
+            bucket1,
+            ticket1,
+            e0,
+            e1,
+            e2,
+            receipt_seq2,
+        )
+    };
+
+    // Roll back S1 to write_seq=1 and trigger SelfFrozen via known_head_receipt
+    std::fs::copy(&db1_snap_path, &db1_path).unwrap();
+    let db1 = humoco_sync_server::db::SyncDb::open(&db1_path, "").unwrap();
+    assert_eq!(db1.lock_pubkey_bytes().unwrap(), lp1);
+
+    let (rb_code, rb_val) = db1
+        .process_lock_batch(
+            &cfg1,
+            humoco_sync_server::locks::LockBatchRequest {
+                anchor_id,
+                bucket: bucket1,
+                recipient_nonce: [0x13; 32],
+                entries: vec![e0.to_wire_hex().unwrap()],
+                manifest: None,
+                genesis_ticket: None,
+                known_head_receipt: Some(receipt_seq2),
+            },
+            t0 + 10,
+        )
+        .unwrap();
+    assert_eq!(rb_code, 409);
+    assert_eq!(rb_val["error"], "bucket_self_frozen");
+
+    // 1. Propose + Veto on SelfFrozen bucket MUST NOT escape back to Active!
+    let p_veto = build_signed_proposal(
+        anchor_id,
+        1,
+        2,
+        vec![
+            manifest.servers[0].clone(),
+            manifest.servers[1].clone(),
+            manifest.successors[0].clone(),
+        ],
+        Vec::new(),
+        quarter,
+        t0 + 20,
+        humoco_proto::ProposalInitiator::HolderStandby,
+        None,
+        Vec::new(),
+    );
+    let p_veto_hash = p_veto.core_digest().unwrap();
+    let (pv_code, _) = db1
+        .process_lock_freeze(
+            &cfg1,
+            humoco_sync_server::lock_rotation::LockFreezeRequest::Propose {
+                proposal: p_veto,
+                current_manifest: None,
+            },
+            t0 + 20,
+        )
+        .unwrap();
+    assert_eq!(pv_code, 200);
+
+    let mut veto = humoco_proto::MigrationVeto {
+        anchor_id,
+        from_rev: 1,
+        proposal_hash: p_veto_hash,
+        vetoer_pub: g_mig_pub,
+        vetoed_at: t0 + 30,
+        sig: [0; 64],
+    };
+    veto.sig = g_mig_sk.sign(&veto.digest()).to_bytes();
+    let (vc, _) = db1
+        .process_lock_freeze(
+            &cfg1,
+            humoco_sync_server::lock_rotation::LockFreezeRequest::Veto { veto },
+            t0 + 30,
+        )
+        .unwrap();
+    assert_eq!(vc, 200);
+
+    let status_after_veto = db1
+        .get_lock_freeze_status(&cfg1, anchor_id, t0 + 35)
+        .unwrap();
+    assert!(
+        status_after_veto["bucket_freeze_state"]["self_frozen"].is_object(),
+        "SelfFrozen must survive Propose + Veto, got: {status_after_veto}"
+    );
+    let (write_code, write_val) = db1
+        .process_lock_batch(
+            &cfg1,
+            humoco_sync_server::locks::LockBatchRequest {
+                anchor_id,
+                bucket: bucket1,
+                recipient_nonce: [0x14; 32],
+                entries: vec![e1.to_wire_hex().unwrap()],
+                manifest: None,
+                genesis_ticket: None,
+                known_head_receipt: None,
+            },
+            t0 + 35,
+        )
+        .unwrap();
+    assert_eq!(write_code, 409);
+    assert_eq!(write_val["error"], "bucket_self_frozen");
+
+    // 2. Propose + Import + SignCommit + Finalize keeping S1 in new_committee MUST keep S1 SelfFrozen!
+    let tkt2 = issue_pow_ticket_db(&s2, anchor_id, quarter, t0);
+    let bkt2 = humoco_proto::derive_bucket(&anchor_id, &s2.state.db.lock_pubkey_bytes().unwrap());
+    s2.state
+        .db
+        .process_lock_batch(
+            &s2.state.config,
+            humoco_sync_server::locks::LockBatchRequest {
+                anchor_id,
+                bucket: bkt2,
+                recipient_nonce: [0x15; 32],
+                entries: vec![e0.to_wire_hex().unwrap(), e1.to_wire_hex().unwrap()],
+                manifest: Some(manifest.clone()),
+                genesis_ticket: Some(tkt2),
+                known_head_receipt: None,
+            },
+            t0 + 10,
+        )
+        .unwrap();
+
+    let t_prop2 = t0 + 40;
+    let p_rot = build_signed_proposal(
+        anchor_id,
+        1,
+        2,
+        vec![
+            manifest.servers[0].clone(),
+            manifest.servers[1].clone(),
+            manifest.successors[0].clone(),
+        ],
+        Vec::new(),
+        quarter,
+        t_prop2,
+        humoco_proto::ProposalInitiator::Creator,
+        Some(&creator_mig_sk),
+        vec![(&g_mig_sk, 0)],
+    );
+
+    let (_, f1_val) = db1
+        .process_lock_freeze(
+            &cfg1,
+            humoco_sync_server::lock_rotation::LockFreezeRequest::Propose {
+                proposal: p_rot.clone(),
+                current_manifest: None,
+            },
+            t_prop2,
+        )
+        .unwrap();
+    let (_, f2_val) = s2
+        .state
+        .db
+        .process_lock_freeze(
+            &s2.state.config,
+            humoco_sync_server::lock_rotation::LockFreezeRequest::Propose {
+                proposal: p_rot.clone(),
+                current_manifest: None,
+            },
+            t_prop2,
+        )
+        .unwrap();
+    let snaps = vec![
+        serde_json::from_value::<humoco_proto::SnapshotExport>(f1_val["snapshot_export"].clone())
+            .unwrap(),
+        serde_json::from_value::<humoco_proto::SnapshotExport>(f2_val["snapshot_export"].clone())
+            .unwrap(),
+    ];
+
+    let t_mature = t_prop2 + cfg1.lock.proposal_timelock_secs;
+    let mut acks = Vec::new();
+    let mut imp_hash = [0u8; 32];
+    for (is_s1, srv_opt) in [(true, None), (false, Some(&s2)), (false, Some(&s4))] {
+        let (code, val) = if is_s1 {
+            db1.process_lock_import(
+                &cfg1,
+                humoco_sync_server::lock_rotation::LockImportRequest {
+                    anchor_id,
+                    active_manifest: manifest.clone(),
+                    proposal: p_rot.clone(),
+                    snapshots: snaps.clone(),
+                    quorum_certificates: Vec::new(),
+                },
+                t_mature,
+            )
+            .unwrap()
+        } else {
+            let srv = srv_opt.unwrap();
+            srv.state
+                .db
+                .process_lock_import(
+                    &srv.state.config,
+                    humoco_sync_server::lock_rotation::LockImportRequest {
+                        anchor_id,
+                        active_manifest: manifest.clone(),
+                        proposal: p_rot.clone(),
+                        snapshots: snaps.clone(),
+                        quorum_certificates: Vec::new(),
+                    },
+                    t_mature,
+                )
+                .unwrap()
+        };
+        assert_eq!(code, 200);
+        let ack: humoco_proto::ImportAck =
+            serde_json::from_value(val["import_ack"].clone()).unwrap();
+        imp_hash = ack.imported_state_hash;
+        acks.push(ack);
+    }
+
+    let (_, sc1) = db1
+        .process_lock_commit(
+            &cfg1,
+            humoco_sync_server::lock_rotation::LockCommitRequest::SignCommit {
+                anchor_id,
+                proposal: p_rot.clone(),
+                imported_state_hash: imp_hash,
+                import_acks: acks.clone(),
+            },
+            t_mature,
+        )
+        .unwrap();
+    let (_, sc2) = s2
+        .state
+        .db
+        .process_lock_commit(
+            &s2.state.config,
+            humoco_sync_server::lock_rotation::LockCommitRequest::SignCommit {
+                anchor_id,
+                proposal: p_rot.clone(),
+                imported_state_hash: imp_hash,
+                import_acks: acks.clone(),
+            },
+            t_mature,
+        )
+        .unwrap();
+    let commit_sigs = vec![
+        serde_json::from_value::<humoco_proto::CommitteeSignature>(
+            sc1["committee_signature"].clone(),
+        )
+        .unwrap(),
+        serde_json::from_value::<humoco_proto::CommitteeSignature>(
+            sc2["committee_signature"].clone(),
+        )
+        .unwrap(),
+    ];
+    let cert = humoco_proto::MigrationCert {
+        anchor_id,
+        genesis_manifest: Some(Box::new(manifest.clone())),
+        proposal: p_rot,
+        imported_state_hash: imp_hash,
+        import_acks: acks,
+        commit_sigs,
+    };
+    let (rev2_manifest, _) = cert.verify_step(&anchor_id, &manifest).unwrap();
+
+    let (fin_code, fin_val) = db1
+        .process_lock_commit(
+            &cfg1,
+            humoco_sync_server::lock_rotation::LockCommitRequest::Finalize {
+                anchor_id,
+                new_manifest: rev2_manifest,
+            },
+            t_mature,
+        )
+        .unwrap();
+    assert_eq!(fin_code, 200);
+    assert!(
+        fin_val["bucket_freeze_state"]["self_frozen"].is_object(),
+        "Finalize keeping SelfFrozen server in committee must preserve SelfFrozen, got: {fin_val}"
+    );
+    let (post_fin_code, post_fin_val) = db1
+        .process_lock_batch(
+            &cfg1,
+            humoco_sync_server::locks::LockBatchRequest {
+                anchor_id,
+                bucket: bucket1,
+                recipient_nonce: [0x16; 32],
+                entries: vec![e2.to_wire_hex().unwrap()],
+                manifest: None,
+                genesis_ticket: None,
+                known_head_receipt: None,
+            },
+            t_mature + 5,
+        )
+        .unwrap();
+    assert_eq!(post_fin_code, 409);
+    assert_eq!(post_fin_val["error"], "bucket_self_frozen");
+    let _ = ticket1;
+}
+
+#[tokio::test]
+async fn test_s02_rotation_guards_block_stale_replay_downgrade_and_unrelated_finalize() {
+    let (a1_sk, _, s1) = start_lock_test_server(true, None).await;
+    let (a2_sk, _, s2) = start_lock_test_server(true, None).await;
+    let (a3_sk, _, s3) = start_lock_test_server(true, None).await;
+    let (a5_sk, _, s5) = start_lock_test_server(true, None).await;
+
+    let creator_mig_sk = SigningKey::from_bytes(&[161u8; 32]);
+    let g_mig_sk = SigningKey::from_bytes(&[162u8; 32]);
+    let creator_mig_pub = creator_mig_sk.verifying_key().to_bytes();
+    let g_mig_pub = g_mig_sk.verifying_key().to_bytes();
+    let quarter = humoco_proto::encode_quarter(2031, 4).unwrap();
+    let t0 = 1_795_000_000u64;
+
+    let e_s1 = server_entry_for_test(&s1, &a1_sk, humoco_proto::NominatedBy::Creator);
+    let e_s2 = server_entry_for_test(&s2, &a2_sk, humoco_proto::NominatedBy::Creator);
+    let e_s3 = server_entry_for_test(&s3, &a3_sk, humoco_proto::NominatedBy::Creator);
+    let e_s5 = server_entry_for_test(&s5, &a5_sk, humoco_proto::NominatedBy::Creator);
+
+    let man_rev1 = build_multi_server_manifest(
+        vec![e_s1.clone(), e_s2.clone(), e_s3.clone()],
+        Vec::new(),
+        2,
+        creator_mig_pub,
+        vec![g_mig_pub],
+        t0 * 1_000,
+        quarter,
+    );
+    let aid = man_rev1.rev1_anchor_id().unwrap();
+    let aid_hex = hex::encode(aid);
+
+    let g_sk = SigningKey::from_bytes(&[163u8; 32]);
+    let r1_sk = SigningKey::from_bytes(&[164u8; 32]);
+    let r2_sk = SigningKey::from_bytes(&[165u8; 32]);
+    let e0 = sign_lock_entry_helper(
+        aid,
+        [0x81; 32],
+        [0u8; 32],
+        0,
+        0,
+        [0x91; 32],
+        &g_sk,
+        humoco_proto::hash_pubkey_sha3(&r1_sk.verifying_key().to_bytes()),
+        None,
+        Some(&creator_mig_sk),
+        8,
+    );
+    let e1 = sign_lock_entry_helper(
+        aid,
+        [0x82; 32],
+        e0.slot,
+        0,
+        1,
+        [0x92; 32],
+        &r1_sk,
+        humoco_proto::hash_pubkey_sha3(&r2_sk.verifying_key().to_bytes()),
+        None,
+        None,
+        8,
+    );
+    let e2 = sign_lock_entry_helper(
+        aid, [0x83; 32], e1.slot, 0, 2, [0x93; 32], &r2_sk, [0xDD; 32], None, None, 8,
+    );
+
+    for srv in [&s1, &s2, &s3] {
+        let tkt = issue_pow_ticket_db(srv, aid, quarter, t0);
+        let bkt = humoco_proto::derive_bucket(&aid, &srv.state.db.lock_pubkey_bytes().unwrap());
+        srv.state
+            .db
+            .process_lock_batch(
+                &srv.state.config,
+                humoco_sync_server::locks::LockBatchRequest {
+                    anchor_id: aid,
+                    bucket: bkt,
+                    recipient_nonce: [0x21; 32],
+                    entries: vec![e0.to_wire_hex().unwrap()],
+                    manifest: Some(man_rev1.clone()),
+                    genesis_ticket: Some(tkt),
+                    known_head_receipt: None,
+                },
+                t0,
+            )
+            .unwrap();
+    }
+
+    // Rotate Rev 1 -> Rev 2: [S1, S2, S3] -> [S1, S2, S5]
+    let t_prop12 = t0 + 10;
+    let prop12 = build_signed_proposal(
+        aid,
+        1,
+        2,
+        vec![e_s1.clone(), e_s2.clone(), e_s5.clone()],
+        Vec::new(),
+        quarter,
+        t_prop12,
+        humoco_proto::ProposalInitiator::Creator,
+        Some(&creator_mig_sk),
+        Vec::new(),
+    );
+    let prop12_hash = prop12.core_digest().unwrap();
+
+    let mut snaps12 = Vec::new();
+    for srv in [&s1, &s2, &s3] {
+        let (_, v) = srv
+            .state
+            .db
+            .process_lock_freeze(
+                &srv.state.config,
+                humoco_sync_server::lock_rotation::LockFreezeRequest::Propose {
+                    proposal: prop12.clone(),
+                    current_manifest: None,
+                },
+                t_prop12,
+            )
+            .unwrap();
+        snaps12.push(
+            serde_json::from_value::<humoco_proto::SnapshotExport>(v["snapshot_export"].clone())
+                .unwrap(),
+        );
+    }
+
+    let t_fin12 = t_prop12 + s1.state.config.lock.proposal_timelock_secs;
+    let mut acks12 = Vec::new();
+    let mut imp_hash12 = [0u8; 32];
+    for srv in [&s1, &s2, &s5] {
+        let (_, v) = srv
+            .state
+            .db
+            .process_lock_import(
+                &srv.state.config,
+                humoco_sync_server::lock_rotation::LockImportRequest {
+                    anchor_id: aid,
+                    active_manifest: man_rev1.clone(),
+                    proposal: prop12.clone(),
+                    snapshots: snaps12.clone(),
+                    quorum_certificates: Vec::new(),
+                },
+                t_fin12,
+            )
+            .unwrap();
+        let ack: humoco_proto::ImportAck = serde_json::from_value(v["import_ack"].clone()).unwrap();
+        imp_hash12 = ack.imported_state_hash;
+        acks12.push(ack);
+    }
+
+    let mut cs12 = Vec::new();
+    for srv in [&s1, &s2] {
+        let (_, v) = srv
+            .state
+            .db
+            .process_lock_commit(
+                &srv.state.config,
+                humoco_sync_server::lock_rotation::LockCommitRequest::SignCommit {
+                    anchor_id: aid,
+                    proposal: prop12.clone(),
+                    imported_state_hash: imp_hash12,
+                    import_acks: acks12.clone(),
+                },
+                t_fin12,
+            )
+            .unwrap();
+        cs12.push(
+            serde_json::from_value::<humoco_proto::CommitteeSignature>(
+                v["committee_signature"].clone(),
+            )
+            .unwrap(),
+        );
+    }
+    let cert12 = humoco_proto::MigrationCert {
+        anchor_id: aid,
+        genesis_manifest: Some(Box::new(man_rev1.clone())),
+        proposal: prop12.clone(),
+        imported_state_hash: imp_hash12,
+        import_acks: acks12,
+        commit_sigs: cs12,
+    };
+    let (man_rev2, _) = cert12.verify_step(&aid, &man_rev1).unwrap();
+
+    for srv in [&s1, &s2, &s3, &s5] {
+        let (code, _) = srv
+            .state
+            .db
+            .process_lock_commit(
+                &srv.state.config,
+                humoco_sync_server::lock_rotation::LockCommitRequest::Finalize {
+                    anchor_id: aid,
+                    new_manifest: man_rev2.clone(),
+                },
+                t_fin12,
+            )
+            .unwrap();
+        assert_eq!(code, 200);
+    }
+
+    // Commit new Rev-2 entry e1 onto S1, S2, S5
+    for srv in [&s1, &s2, &s5] {
+        let bkt = humoco_proto::derive_bucket(&aid, &srv.state.db.lock_pubkey_bytes().unwrap());
+        let (code, _) = srv
+            .state
+            .db
+            .process_lock_batch(
+                &srv.state.config,
+                humoco_sync_server::locks::LockBatchRequest {
+                    anchor_id: aid,
+                    bucket: bkt,
+                    recipient_nonce: [0x22; 32],
+                    entries: vec![e1.to_wire_hex().unwrap()],
+                    manifest: None,
+                    genesis_ticket: None,
+                    known_head_receipt: None,
+                },
+                t_fin12 + 5,
+            )
+            .unwrap();
+        assert_eq!(code, 200);
+    }
+
+    // SYNC-S02-03a: Replaying Rev 1->2 Propose on active Rev-2 overlap server S1 must return 409
+    let stale_prop_err = s1
+        .state
+        .db
+        .process_lock_freeze(
+            &s1.state.config,
+            humoco_sync_server::lock_rotation::LockFreezeRequest::Propose {
+                proposal: prop12.clone(),
+                current_manifest: None,
+            },
+            t_fin12 + 10,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            stale_prop_err,
+            humoco_sync_server::db::DbError::Http { status: 409, .. }
+        ),
+        "Stale Rev-1 Propose replay must reject with 409, got {stale_prop_err:?}"
+    );
+
+    // SYNC-S02-03b: Veto(from_rev=1) after Rev 2 Finalize must reject with 409 (even with clock skew)
+    let mut stale_veto = humoco_proto::MigrationVeto {
+        anchor_id: aid,
+        from_rev: 1,
+        proposal_hash: prop12_hash,
+        vetoer_pub: g_mig_pub,
+        vetoed_at: t_prop12 + 100,
+        sig: [0; 64],
+    };
+    stale_veto.sig = g_mig_sk.sign(&stale_veto.digest()).to_bytes();
+    let stale_veto_err = s1
+        .state
+        .db
+        .process_lock_freeze(
+            &s1.state.config,
+            humoco_sync_server::lock_rotation::LockFreezeRequest::Veto { veto: stale_veto },
+            t_prop12 + 100,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            stale_veto_err,
+            humoco_sync_server::db::DbError::Http { status: 409, .. }
+        ),
+        "Veto on already-finalized revision must reject with 409, got {stale_veto_err:?}"
+    );
+
+    // SYNC-S02-02a: Replaying Rev 1->2 ?lock_import on S1/S5 must reject 409 and preserve Rev-2 entry e1!
+    for srv in [&s1, &s5] {
+        let replay_imp_err = srv
+            .state
+            .db
+            .process_lock_import(
+                &srv.state.config,
+                humoco_sync_server::lock_rotation::LockImportRequest {
+                    anchor_id: aid,
+                    active_manifest: man_rev1.clone(),
+                    proposal: prop12.clone(),
+                    snapshots: snaps12.clone(),
+                    quorum_certificates: Vec::new(),
+                },
+                t_fin12 + 20,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                replay_imp_err,
+                humoco_sync_server::db::DbError::Http { status: 409, .. }
+            ),
+            "Replayed Rev 1->2 lock_import must fail with 409, got {replay_imp_err:?}"
+        );
+        let bkt_hex = hex::encode(humoco_proto::derive_bucket(
+            &aid,
+            &srv.state.db.lock_pubkey_bytes().unwrap(),
+        ));
+        let entries = srv.state.db.lock_entries_in_bucket(&bkt_hex).unwrap();
+        assert!(
+            entries.contains_key(&hex::encode(e1.slot)),
+            "Rev-2 entry e1 must remain intact after rejected replay"
+        );
+    }
+
+    // Rotate Rev 2 -> Rev 3: [S1, S2, S5] -> [S1, S3, S5] (bringing retired S3 back!)
+    let t_prop23 = t_fin12 + 30;
+    let prop23 = build_signed_proposal(
+        aid,
+        2,
+        2,
+        vec![e_s1.clone(), e_s3.clone(), e_s5.clone()],
+        Vec::new(),
+        quarter,
+        t_prop23,
+        humoco_proto::ProposalInitiator::Creator,
+        Some(&creator_mig_sk),
+        Vec::new(),
+    );
+    let mut snaps23 = Vec::new();
+    for srv in [&s1, &s2, &s5] {
+        let (_, v) = srv
+            .state
+            .db
+            .process_lock_freeze(
+                &srv.state.config,
+                humoco_sync_server::lock_rotation::LockFreezeRequest::Propose {
+                    proposal: prop23.clone(),
+                    current_manifest: None,
+                },
+                t_prop23,
+            )
+            .unwrap();
+        snaps23.push(
+            serde_json::from_value::<humoco_proto::SnapshotExport>(v["snapshot_export"].clone())
+                .unwrap(),
+        );
+    }
+    let t_fin23 = t_prop23 + s1.state.config.lock.proposal_timelock_secs;
+    let mut acks23 = Vec::new();
+    let mut imp_hash23 = [0u8; 32];
+    for srv in [&s1, &s3, &s5] {
+        let (_, v) = srv
+            .state
+            .db
+            .process_lock_import(
+                &srv.state.config,
+                humoco_sync_server::lock_rotation::LockImportRequest {
+                    anchor_id: aid,
+                    active_manifest: man_rev2.clone(),
+                    proposal: prop23.clone(),
+                    snapshots: snaps23.clone(),
+                    quorum_certificates: Vec::new(),
+                },
+                t_fin23,
+            )
+            .unwrap();
+        let ack: humoco_proto::ImportAck = serde_json::from_value(v["import_ack"].clone()).unwrap();
+        imp_hash23 = ack.imported_state_hash;
+        acks23.push(ack);
+    }
+
+    // SYNC-S02-02b: Before Finalize(Rev 3), S3 MUST remain EpochFrozen on POST ?lock!
+    let bkt3 = humoco_proto::derive_bucket(&aid, &s3.state.db.lock_pubkey_bytes().unwrap());
+    let (pre_fin_s3_code, pre_fin_s3_val) = s3
+        .state
+        .db
+        .process_lock_batch(
+            &s3.state.config,
+            humoco_sync_server::locks::LockBatchRequest {
+                anchor_id: aid,
+                bucket: bkt3,
+                recipient_nonce: [0x23; 32],
+                entries: vec![e2.to_wire_hex().unwrap()],
+                manifest: None,
+                genesis_ticket: None,
+                known_head_receipt: None,
+            },
+            t_fin23 + 1,
+        )
+        .unwrap();
+    assert_eq!(
+        pre_fin_s3_code, 409,
+        "EpochFrozen S3 must not unlock to Active during ?lock_import before Finalize"
+    );
+    assert_eq!(pre_fin_s3_val["error"], "epoch_frozen");
+
+    let mut cs23 = Vec::new();
+    for srv in [&s1, &s2] {
+        let (_, v) = srv
+            .state
+            .db
+            .process_lock_commit(
+                &srv.state.config,
+                humoco_sync_server::lock_rotation::LockCommitRequest::SignCommit {
+                    anchor_id: aid,
+                    proposal: prop23.clone(),
+                    imported_state_hash: imp_hash23,
+                    import_acks: acks23.clone(),
+                },
+                t_fin23,
+            )
+            .unwrap();
+        cs23.push(
+            serde_json::from_value::<humoco_proto::CommitteeSignature>(
+                v["committee_signature"].clone(),
+            )
+            .unwrap(),
+        );
+    }
+    let cert23 = humoco_proto::MigrationCert {
+        anchor_id: aid,
+        genesis_manifest: None,
+        proposal: prop23,
+        imported_state_hash: imp_hash23,
+        import_acks: acks23,
+        commit_sigs: cs23,
+    };
+    let (man_rev3, _) = cert23.verify_step(&aid, &man_rev2).unwrap();
+
+    for srv in [&s1, &s2, &s3, &s5] {
+        let (code, _) = srv
+            .state
+            .db
+            .process_lock_commit(
+                &srv.state.config,
+                humoco_sync_server::lock_rotation::LockCommitRequest::Finalize {
+                    anchor_id: aid,
+                    new_manifest: man_rev3.clone(),
+                },
+                t_fin23,
+            )
+            .unwrap();
+        assert_eq!(code, 200);
+    }
+
+    // SYNC-S02-04c: Idempotent Finalize(man_rev3) retry succeeds (200) on active S3
+    let (idem_fin_code, _) = s3
+        .state
+        .db
+        .process_lock_commit(
+            &s3.state.config,
+            humoco_sync_server::lock_rotation::LockCommitRequest::Finalize {
+                anchor_id: aid,
+                new_manifest: man_rev3.clone(),
+            },
+            t_fin23 + 2,
+        )
+        .unwrap();
+    assert_eq!(idem_fin_code, 200);
+
+    // SYNC-S02-04b: Replaying old Finalize(man_rev2) onto active Rev-3 S3 MUST fail 409 (no downgrade/freeze!)
+    let downgrade_err = s3
+        .state
+        .db
+        .process_lock_commit(
+            &s3.state.config,
+            humoco_sync_server::lock_rotation::LockCommitRequest::Finalize {
+                anchor_id: aid,
+                new_manifest: man_rev2,
+            },
+            t_fin23 + 5,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            downgrade_err,
+            humoco_sync_server::db::DbError::Http { status: 409, .. }
+        ),
+        "Finalize downgrade from Rev 3 to Rev 2 must fail with 409, got {downgrade_err:?}"
+    );
+    let stored_man: humoco_proto::AnchorManifest = serde_json::from_slice(
+        &s3.state
+            .db
+            .get_static_anchor_manifest(&aid_hex)
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(stored_man.revision, 3);
+    let (s3_ok_code, _) = s3
+        .state
+        .db
+        .process_lock_batch(
+            &s3.state.config,
+            humoco_sync_server::locks::LockBatchRequest {
+                anchor_id: aid,
+                bucket: bkt3,
+                recipient_nonce: [0x24; 32],
+                entries: vec![e2.to_wire_hex().unwrap()],
+                manifest: None,
+                genesis_ticket: None,
+                known_head_receipt: None,
+            },
+            t_fin23 + 6,
+        )
+        .unwrap();
+    assert_eq!(s3_ok_code, 200);
+
+    // SYNC-S02-04a: Unrelated manifest chain not containing S1 anywhere must be rejected (400)
+    let (_, _, s_unrel1) = start_lock_test_server(true, Some(0)).await;
+    let (_, _, s_unrel2) = start_lock_test_server(true, Some(0)).await;
+    let (ua1_sk, _) = gen_keypair();
+    let (ua2_sk, _) = gen_keypair();
+    let u_mig_sk = SigningKey::from_bytes(&[177u8; 32]);
+    let u_e1 = server_entry_for_test(&s_unrel1, &ua1_sk, humoco_proto::NominatedBy::Creator);
+    let u_e2 = server_entry_for_test(&s_unrel2, &ua2_sk, humoco_proto::NominatedBy::Creator);
+    let u_rev1 = build_multi_server_manifest(
+        vec![u_e1],
+        vec![u_e2.clone()],
+        1,
+        u_mig_sk.verifying_key().to_bytes(),
+        Vec::new(),
+        t0 * 1_000,
+        quarter,
+    );
+    let u_aid = u_rev1.rev1_anchor_id().unwrap();
+    let u_prop = build_signed_proposal(
+        u_aid,
+        1,
+        1,
+        vec![u_e2],
+        Vec::new(),
+        quarter,
+        t0 + 10,
+        humoco_proto::ProposalInitiator::Creator,
+        Some(&u_mig_sk),
+        Vec::new(),
+    );
+    let (_, uf1) = s_unrel1
+        .state
+        .db
+        .process_lock_freeze(
+            &s_unrel1.state.config,
+            humoco_sync_server::lock_rotation::LockFreezeRequest::Propose {
+                proposal: u_prop.clone(),
+                current_manifest: Some(u_rev1.clone()),
+            },
+            t0 + 10,
+        )
+        .unwrap();
+    let u_snap: humoco_proto::SnapshotExport =
+        serde_json::from_value(uf1["snapshot_export"].clone()).unwrap();
+    let (_, u_imp) = s_unrel2
+        .state
+        .db
+        .process_lock_import(
+            &s_unrel2.state.config,
+            humoco_sync_server::lock_rotation::LockImportRequest {
+                anchor_id: u_aid,
+                active_manifest: u_rev1.clone(),
+                proposal: u_prop.clone(),
+                snapshots: vec![u_snap],
+                quorum_certificates: Vec::new(),
+            },
+            t0 + 10,
+        )
+        .unwrap();
+    let u_ack: humoco_proto::ImportAck =
+        serde_json::from_value(u_imp["import_ack"].clone()).unwrap();
+    let u_ish = u_ack.imported_state_hash;
+    let (_, u_sc) = s_unrel1
+        .state
+        .db
+        .process_lock_commit(
+            &s_unrel1.state.config,
+            humoco_sync_server::lock_rotation::LockCommitRequest::SignCommit {
+                anchor_id: u_aid,
+                proposal: u_prop.clone(),
+                imported_state_hash: u_ish,
+                import_acks: vec![u_ack.clone()],
+            },
+            t0 + 10,
+        )
+        .unwrap();
+    let u_cs: humoco_proto::CommitteeSignature =
+        serde_json::from_value(u_sc["committee_signature"].clone()).unwrap();
+    let u_cert = humoco_proto::MigrationCert {
+        anchor_id: u_aid,
+        genesis_manifest: Some(Box::new(u_rev1.clone())),
+        proposal: u_prop,
+        imported_state_hash: u_ish,
+        import_acks: vec![u_ack],
+        commit_sigs: vec![u_cs],
+    };
+    let (u_rev2, _) = u_cert.verify_step(&u_aid, &u_rev1).unwrap();
+
+    let unrel_err = s1
+        .state
+        .db
+        .process_lock_commit(
+            &s1.state.config,
+            humoco_sync_server::lock_rotation::LockCommitRequest::Finalize {
+                anchor_id: u_aid,
+                new_manifest: u_rev2,
+            },
+            t0 + 20,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            unrel_err,
+            humoco_sync_server::db::DbError::Http { status: 400, .. }
+        ),
+        "Finalize for unrelated anchor must reject with 400, got {unrel_err:?}"
+    );
+    assert!(s1
+        .state
+        .db
+        .get_static_anchor_manifest(&hex::encode(u_aid))
+        .unwrap()
+        .is_none());
+}
