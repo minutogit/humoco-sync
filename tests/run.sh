@@ -103,6 +103,38 @@ sha256_file_hex() {
   sha256sum "$1" | awk '{print $1}'
 }
 
+verify_slot_ack_json() {
+  local json_file="$1"
+  local expected_pub="$2"
+  local expected_prefix="$3"
+  local expected_channel="$4"
+  local expected_etag="$5"
+  local info_json="$6"
+  local label_msg="$7"
+  if command -v php >/dev/null 2>&1 && php -r 'exit(function_exists("sodium_crypto_sign_verify_detached") ? 0 : 1);' 2>/dev/null; then
+    if ! php -r '
+      $d = json_decode(file_get_contents($argv[1]), true);
+      if (!is_array($d) || !isset($d["slot_ack"]) || !is_array($d["slot_ack"])) { fwrite(STDERR, "missing slot_ack\n"); exit(1); }
+      $ack = $d["slot_ack"];
+      if (($ack["pubkey"] ?? null) !== $argv[2]) { fwrite(STDERR, "pubkey mismatch\n"); exit(1); }
+      if (!array_key_exists("prefix", $ack) || ($argv[3] === "" ? $ack["prefix"] !== null : $ack["prefix"] !== $argv[3])) { fwrite(STDERR, "prefix mismatch\n"); exit(1); }
+      if (($ack["channel"] ?? null) !== $argv[4]) { fwrite(STDERR, "channel mismatch\n"); exit(1); }
+      if (($ack["etag"] ?? null) !== $argv[5]) { fwrite(STDERR, "etag mismatch\n"); exit(1); }
+      $lockPub = (string)($ack["lock_pub"] ?? "");
+      $sig = (string)($ack["sig"] ?? "");
+      $ts = (string)($ack["timestamp"] ?? "");
+      if (!preg_match("/\\A[0-9a-f]{64}\\z/", $lockPub) || !preg_match("/\\A[0-9a-f]{128}\\z/", $sig) || $ts === "") { fwrite(STDERR, "invalid lock_pub/sig/ts\n"); exit(1); }
+      $info = json_decode($argv[6], true);
+      if (is_array($info) && isset($info["lock"]["lock_pub"]) && $info["lock"]["lock_pub"] !== $lockPub) { fwrite(STDERR, "info lock_pub mismatch\n"); exit(1); }
+      $msg = "HUMOCO-SLOT-ACK-V1\n{$lockPub}\n{$argv[2]}\n{$argv[3]}\n{$argv[4]}\n{$argv[5]}\n{$ts}";
+      if (!sodium_crypto_sign_verify_detached(hex2bin($sig), $msg, hex2bin($lockPub))) { fwrite(STDERR, "invalid slot_ack ed25519 signature\n"); exit(1); }
+    ' "$json_file" "$expected_pub" "$expected_prefix" "$expected_channel" "$expected_etag" "$info_json"; then
+      fail "$label_msg"
+    fi
+    ok "$label_msg"
+  fi
+}
+
 run_blackbox_protocol_suite() {
   local label="$1"
   local base_url="$2"
@@ -154,6 +186,16 @@ run_blackbox_protocol_suite() {
     "${endpoint}?members&channel=card")"
   assert_eq "$pm_code" "200" "PUT ?members succeeds"
 
+  local pm_extra_code
+  pm_extra_code="$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+    -H "X-Drop-Pubkey: $admin_pk" \
+    -H "X-Drop-Timestamp: $ts" \
+    -H "X-Drop-Nonce: $(rand_nonce)" \
+    -H "X-Drop-Signature: $sig" \
+    --data-binary "@$TMP_ROOT/members.json" \
+    "${endpoint}?members&channel=card&extra=1")"
+  assert_eq "$pm_extra_code" "405" "PUT ?members with extra query param returns 405"
+
   local auth_headers
   auth_headers="$(curl -sI -H "X-Drop-Pubkey: $friend_pk" -H "X-Channel: card" "$endpoint" | tr -d '\r' | tr '[:upper:]' '[:lower:]')"
   assert_contains "$auth_headers" "x-drop-authorized: true" "HEAD returns authorized=true after PUT ?members"
@@ -170,7 +212,7 @@ run_blackbox_protocol_suite() {
   nonce="$(rand_nonce)"
   sig="$("$helper_bin" sign-test sign-member --sk "$friend_sk" --method PUT --channel card --ts "$ts" --nonce "$nonce" --body-file "$TMP_ROOT/card1.bin")"
   local put1_code
-  put1_code="$(curl -s -o "$TMP_ROOT/put1.json" -w '%{http_code}' -X PUT \
+  put1_code="$(curl -s -D "$TMP_ROOT/put1.hdr" -o "$TMP_ROOT/put1.json" -w '%{http_code}' -X PUT \
     -H "X-Drop-Pubkey: $friend_pk" \
     -H "X-Channel: card" \
     -H "X-Drop-Timestamp: $ts" \
@@ -189,6 +231,8 @@ run_blackbox_protocol_suite() {
   fi
   local etag1
   etag1="$(sha256_file_hex "$TMP_ROOT/card1.bin")"
+  assert_contains "$(tr -d '\r' < "$TMP_ROOT/put1.hdr" | tr '[:upper:]' '[:lower:]')" "etag: \"${etag1}\"" "PUT slot returns matching ETag header"
+  verify_slot_ack_json "$TMP_ROOT/put1.json" "$friend_pk" "" "card" "$etag1" "$info_json" "PUT card slot_ack Ed25519 signature valid"
 
   # Duplicate If-None-Match: * must fail with 412
   ts="$(date +%s)"
@@ -206,12 +250,37 @@ run_blackbox_protocol_suite() {
     "$endpoint")"
   assert_eq "$inm_fail" "412" "If-None-Match: * returns 412 when slot exists"
 
+  # Parity conditional PUT preconditions (If-None-Match ETag/list/W, If-Match none/mismatch/match)
+  nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-member --sk "$friend_sk" --method PUT --channel card --ts "$ts" --nonce "$nonce" --body-file "$TMP_ROOT/card1.bin")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "X-Drop-Pubkey: $friend_pk" -H "X-Channel: card" -H "X-Drop-Timestamp: $ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig" -H "If-None-Match: \"${etag1}\"" --data-binary "@$TMP_ROOT/card1.bin" "$endpoint")" "412" "If-None-Match matching ETag returns 412"
+
+  nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-member --sk "$friend_sk" --method PUT --channel card --ts "$ts" --nonce "$nonce" --body-file "$TMP_ROOT/card1.bin")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "X-Drop-Pubkey: $friend_pk" -H "X-Channel: card" -H "X-Drop-Timestamp: $ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig" -H "If-None-Match: \"0000000000000000000000000000000000000000000000000000000000000000\", W/\"${etag1}\"" --data-binary "@$TMP_ROOT/card1.bin" "$endpoint")" "412" "If-None-Match comma list with weak ETag returns 412"
+
+  nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-member --sk "$friend_sk" --method PUT --channel card --ts "$ts" --nonce "$nonce" --body-file "$TMP_ROOT/card1.bin")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "X-Drop-Pubkey: $friend_pk" -H "X-Channel: card" -H "X-Drop-Timestamp: $ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig" -H 'If-Match: "none"' --data-binary "@$TMP_ROOT/card1.bin" "$endpoint")" "412" "If-Match: none returns 412 when slot exists"
+
+  nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-member --sk "$friend_sk" --method PUT --channel card --ts "$ts" --nonce "$nonce" --body-file "$TMP_ROOT/card1.bin")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "X-Drop-Pubkey: $friend_pk" -H "X-Channel: card" -H "X-Drop-Timestamp: $ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig" -H 'If-Match: "0000000000000000000000000000000000000000000000000000000000000000"' --data-binary "@$TMP_ROOT/card1.bin" "$endpoint")" "412" "If-Match mismatch returns 412"
+
+  printf 'ciphertext-v2' > "$TMP_ROOT/card2.bin"
+  local etag2
+  etag2="$(sha256_file_hex "$TMP_ROOT/card2.bin")"
+  nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-member --sk "$friend_sk" --method PUT --channel card --ts "$ts" --nonce "$nonce" --body-file "$TMP_ROOT/card2.bin")"
+  assert_eq "$(curl -s -o "$TMP_ROOT/put2.json" -w '%{http_code}' -X PUT -H "X-Drop-Pubkey: $friend_pk" -H "X-Channel: card" -H "X-Drop-Timestamp: $ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig" -H "If-Match: \"${etag1}\"" --data-binary "@$TMP_ROOT/card2.bin" "$endpoint")" "200" "If-Match matching current ETag updates slot"
+  verify_slot_ack_json "$TMP_ROOT/put2.json" "$friend_pk" "" "card" "$etag2" "$info_json" "Updated card slot_ack Ed25519 signature valid"
+
   # Conditional GET + If-None-Match -> 304
   local get_code
   get_code="$(curl -s -o "$TMP_ROOT/fetched_card.bin" -w '%{http_code}' "${data_url}/${friend_pk}.card.bin")"
   assert_eq "$get_code" "200" "Static GET returns encrypted slot"
   local get_304
-  get_304="$(curl -s -o /dev/null -w '%{http_code}' -H "If-None-Match: \"${etag1}\"" "${data_url}/${friend_pk}.card.bin")"
+  get_304="$(curl -s -o /dev/null -w '%{http_code}' -H "If-None-Match: \"${etag2}\"" "${data_url}/${friend_pk}.card.bin")"
   assert_eq "$get_304" "304" "Static GET with matching ETag returns 304"
 
   # index.json contains friend card
@@ -318,17 +387,39 @@ run_blackbox_protocol_suite() {
   nonce="$(rand_nonce)"
   sig="$("$helper_bin" sign-test sign-member --sk "$friend_sk" --method PUT --channel card --prefix home --ts "$ts" --nonce "$nonce" --body-file "$TMP_ROOT/home.bin")"
   local pfx_code
-  pfx_code="$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+  pfx_code="$(curl -s -o "$TMP_ROOT/put_pfx.json" -w '%{http_code}' -X PUT \
     -H "X-Drop-Pubkey: $friend_pk" \
     -H "X-Channel: card" \
     -H "X-Drop-Prefix: home" \
     -H "X-Drop-Timestamp: $ts" \
     -H "X-Drop-Nonce: $nonce" \
     -H "X-Drop-Signature: $sig" \
+    -H 'If-Match: "none"' \
     --data-binary "@$TMP_ROOT/home.bin" \
     "$endpoint")"
-  assert_eq "$pfx_code" "200" "PUT with valid X-Drop-Prefix succeeds"
+  assert_eq "$pfx_code" "200" "PUT with valid X-Drop-Prefix and If-Match: none on absent slot succeeds"
+  verify_slot_ack_json "$TMP_ROOT/put_pfx.json" "$friend_pk" "home" "card" "$(sha256_file_hex "$TMP_ROOT/home.bin")" "$info_json" "Prefixed slot_ack Ed25519 signature valid"
   assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "${data_url}/${friend_pk}_home.card.bin")" "200" "Prefixed slot readable"
+
+  local del_pfx_ts del_pfx_nonce del_pfx_sig idx_after_del
+  del_pfx_ts="$(date +%s)"
+  del_pfx_nonce="$(rand_nonce)"
+  del_pfx_sig="$("$helper_bin" sign-test sign-member --sk "$friend_sk" --method DELETE --channel card --prefix home --ts "$del_pfx_ts" --nonce "$del_pfx_nonce")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
+    -H "X-Drop-Pubkey: $friend_pk" \
+    -H "X-Channel: card" \
+    -H "X-Drop-Prefix: home" \
+    -H "X-Drop-Timestamp: $del_pfx_ts" \
+    -H "X-Drop-Nonce: $del_pfx_nonce" \
+    -H "X-Drop-Signature: $del_pfx_sig" \
+    "$endpoint")" "200" "DELETE standard prefixed slot succeeds"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "${data_url}/${friend_pk}_home.card.bin")" "404" "Deleted prefixed slot returns 404"
+  idx_after_del="$(curl -sf "${data_url}/index.json")"
+  if [[ "$idx_after_del" == *"${friend_pk}_home.card.bin"* ]]; then
+    fail "Deleted prefixed slot still present in index.json"
+  else
+    ok "Deleted prefixed slot omitted from index.json"
+  fi
 
   local bad_pfx_code
   bad_pfx_code="$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
@@ -372,6 +463,68 @@ run_blackbox_protocol_suite() {
     ok "Media blob excluded from index.json"
   fi
 
+  # PUT media precondition If-None-Match matching ETag -> 412
+  ts="$(date +%s)"
+  nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-member --sk "$friend_sk" --method PUT --channel media --media-id "$media_id" --ts "$ts" --nonce "$nonce" --body-file "$TMP_ROOT/m1.bin")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+    -H "X-Drop-Pubkey: $friend_pk" \
+    -H "X-Channel: media" \
+    -H "X-Media-Id: $media_id" \
+    -H "X-Drop-Timestamp: $ts" \
+    -H "X-Drop-Nonce: $nonce" \
+    -H "X-Drop-Signature: $sig" \
+    -H "If-None-Match: \"${media_id}\"" \
+    --data-binary "@$TMP_ROOT/m1.bin" \
+    "$endpoint")" "412" "PUT media with matching If-None-Match returns 412"
+
+  # Cross-user media ownership isolation (403 on overwrite & delete)
+  local media_other_sk media_other_pk
+  read -r media_other_sk media_other_pk <<< "$("$helper_bin" sign-test keygen)"
+  printf '{"pubkeys":["%s","%s"]}' "$friend_pk" "$media_other_pk" > "$TMP_ROOT/members_two.json"
+  nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-admin --sk "$admin_sk" --action PUT_MEMBERS --channel card --ts "$ts" --nonce "$nonce" --body-file "$TMP_ROOT/members_two.json")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+    -H "X-Drop-Pubkey: $admin_pk" \
+    -H "X-Drop-Timestamp: $ts" \
+    -H "X-Drop-Nonce: $nonce" \
+    -H "X-Drop-Signature: $sig" \
+    --data-binary "@$TMP_ROOT/members_two.json" \
+    "${endpoint}?members&channel=card")" "200" "Temporarily authorize second member on card channel"
+
+  nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-member --sk "$media_other_sk" --method PUT --channel media --media-id "$media_id" --ts "$ts" --nonce "$nonce" --body-file "$TMP_ROOT/m1.bin")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+    -H "X-Drop-Pubkey: $media_other_pk" \
+    -H "X-Channel: media" \
+    -H "X-Media-Id: $media_id" \
+    -H "X-Drop-Timestamp: $ts" \
+    -H "X-Drop-Nonce: $nonce" \
+    -H "X-Drop-Signature: $sig" \
+    --data-binary "@$TMP_ROOT/m1.bin" \
+    "$endpoint")" "403" "Cross-user PUT media overwrite returns 403"
+
+  nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-member --sk "$media_other_sk" --method DELETE --channel media --media-id "$media_id" --ts "$ts" --nonce "$nonce")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
+    -H "X-Drop-Pubkey: $media_other_pk" \
+    -H "X-Channel: media" \
+    -H "X-Media-Id: $media_id" \
+    -H "X-Drop-Timestamp: $ts" \
+    -H "X-Drop-Nonce: $nonce" \
+    -H "X-Drop-Signature: $sig" \
+    "$endpoint")" "403" "Cross-user DELETE media returns 403"
+
+  nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-admin --sk "$admin_sk" --action PUT_MEMBERS --channel card --ts "$ts" --nonce "$nonce" --body-file "$TMP_ROOT/members.json")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+    -H "X-Drop-Pubkey: $admin_pk" \
+    -H "X-Drop-Timestamp: $ts" \
+    -H "X-Drop-Nonce: $nonce" \
+    -H "X-Drop-Signature: $sig" \
+    --data-binary "@$TMP_ROOT/members.json" \
+    "${endpoint}?members&channel=card")" "200" "Restore card channel members to single friend"
+
   # Single media delete
   ts="$(date +%s)"
   nonce="$(rand_nonce)"
@@ -385,6 +538,33 @@ run_blackbox_protocol_suite() {
     -H "X-Drop-Signature: $sig" \
     "$endpoint")" "200" "DELETE single media blob succeeds"
   assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "${data_url}/${media_id}.media.bin")" "404" "Deleted media returns 404"
+
+  # Bulk media delete (omitting X-Media-Id)
+  printf 'media-webp-blob-2' > "$TMP_ROOT/m2.bin"
+  local media_id2
+  media_id2="$(sha256_file_hex "$TMP_ROOT/m2.bin")"
+  ts="$(date +%s)"
+  nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-member --sk "$friend_sk" --method PUT --channel media --media-id "$media_id2" --ts "$ts" --nonce "$nonce" --body-file "$TMP_ROOT/m2.bin")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+    -H "X-Drop-Pubkey: $friend_pk" \
+    -H "X-Channel: media" \
+    -H "X-Media-Id: $media_id2" \
+    -H "X-Drop-Timestamp: $ts" \
+    -H "X-Drop-Nonce: $nonce" \
+    -H "X-Drop-Signature: $sig" \
+    --data-binary "@$TMP_ROOT/m2.bin" \
+    "$endpoint")" "200" "PUT second media blob succeeds"
+  nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-member --sk "$friend_sk" --method DELETE --channel media --ts "$ts" --nonce "$nonce")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
+    -H "X-Drop-Pubkey: $friend_pk" \
+    -H "X-Channel: media" \
+    -H "X-Drop-Timestamp: $ts" \
+    -H "X-Drop-Nonce: $nonce" \
+    -H "X-Drop-Signature: $sig" \
+    "$endpoint")" "200" "Bulk DELETE media (omitting X-Media-Id) succeeds"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "${data_url}/${media_id2}.media.bin")" "404" "Bulk-deleted media blob returns 404"
 
   echo "=== Group 8 ($label): Revocation (?revoke -> 410 Gone -> Clear) ==="
   ts="$(date +%s)"
@@ -402,6 +582,21 @@ run_blackbox_protocol_suite() {
   assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -I -H "X-Drop-Pubkey: $friend_pk" "$endpoint")" "410" "Revoked server returns 410 Gone on HEAD"
   assert_contains "$(curl -sf "${data_url}/revocation.json")" "Server moving" "revocation.json published"
 
+  local rev_ts rev_nonce rev_sig rev_acc_sk rev_acc_pk
+  rev_ts="$(date +%s)"
+  rev_nonce="$(rand_nonce)"
+  rev_sig="$("$helper_bin" sign-test sign-member --sk "$friend_sk" --method PUT --channel card --ts "$rev_ts" --nonce "$rev_nonce" --body-file "$TMP_ROOT/card1.bin")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "X-Drop-Pubkey: $friend_pk" -H "X-Channel: card" -H "X-Drop-Timestamp: $rev_ts" -H "X-Drop-Nonce: $rev_nonce" -H "X-Drop-Signature: $rev_sig" --data-binary "@$TMP_ROOT/card1.bin" "$endpoint")" "410" "Revoked server returns 410 Gone on PUT"
+
+  rev_nonce="$(rand_nonce)"
+  rev_sig="$("$helper_bin" sign-test sign-member --sk "$friend_sk" --method DELETE --channel card --ts "$rev_ts" --nonce "$rev_nonce")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -H "X-Drop-Pubkey: $friend_pk" -H "X-Channel: card" -H "X-Drop-Timestamp: $rev_ts" -H "X-Drop-Nonce: $rev_nonce" -H "X-Drop-Signature: $rev_sig" "$endpoint")" "410" "Revoked server returns 410 Gone on DELETE"
+
+  read -r rev_acc_sk rev_acc_pk <<< "$("$helper_bin" sign-test keygen)"
+  rev_nonce="$(rand_nonce)"
+  rev_sig="$("$helper_bin" sign-test sign-member --sk "$rev_acc_sk" --method DELETE_ACCOUNT --ts "$rev_ts" --nonce "$rev_nonce")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -H "X-Drop-Pubkey: $rev_acc_pk" -H "X-Drop-Timestamp: $rev_ts" -H "X-Drop-Nonce: $rev_nonce" -H "X-Drop-Signature: $rev_sig" "${endpoint}?account")" "200" "DELETE ?account remains available (200) during 410 revocation"
+
   printf '{"issued_at":%s,"effective_at":null}' "$ts" > "$TMP_ROOT/clear_revoke.json"
   nonce="$(rand_nonce)"
   sig="$("$helper_bin" sign-test sign-admin --sk "$admin_sk" --action PUT_REVOKE --ts "$ts" --nonce "$nonce" --body-file "$TMP_ROOT/clear_revoke.json")"
@@ -412,6 +607,8 @@ run_blackbox_protocol_suite() {
     -H "X-Drop-Signature: $sig" \
     --data-binary "@$TMP_ROOT/clear_revoke.json" \
     "${endpoint}?revoke")" "200" "PUT ?revoke clear restores server"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -I -H "X-Drop-Pubkey: $friend_pk" "$endpoint")" "200" "HEAD returns 200 after revocation cleared"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "${data_url}/revocation.json")" "404" "revocation.json removed (404) after revocation cleared"
 
   if [[ "$test_hybrid" == "true" ]]; then
     echo "=== Group 9 ($label): Hybrid Isolation & DELETE ?account ==="
@@ -538,6 +735,11 @@ run_blackbox_protocol_suite() {
   assert_contains "$lock_head_headers" "x-drop-authorized: true" "HEAD with X-Channel: lock returns authorized=true"
   assert_contains "$lock_head_headers" "x-drop-channels: " "HEAD includes X-Drop-Channels"
   assert_contains "$lock_head_headers" "lock" "HEAD X-Drop-Channels includes lock channel"
+  if [[ "$lock_head_headers" == *"x-slot-occupied:"* ]]; then
+    fail "HEAD with X-Channel: lock must omit X-Slot-Occupied"
+  else
+    ok "HEAD with X-Channel: lock omits X-Slot-Occupied"
+  fi
 
   local bb_quarter=8125 anchor_bb
   anchor_bb="$("$helper_bin" sign-test make-lock-sample --lock-pub "$lock_pub_bb" --admin-pub "$admin_pk" --quarter "$bb_quarter" --variant anchor_id)"
@@ -917,6 +1119,13 @@ EOF
   sig="$("$helper_bin" sign-test sign-member --sk "$s_mem2_sk" --method PUT --channel backup --prefix p2 --ts "$ts" --nonce "$nonce" --body-file "$s06_dir/c2_b2.bin")"
   assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "X-Drop-Pubkey: $s_mem2_pk" -H "X-Channel: backup" -H "X-Drop-Prefix: p2" -H "X-Drop-Timestamp: $ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig" --data-binary "@$s06_dir/c2_b2.bin" "${c2_ep}")" "507" "SYNC-S06-03: impossible 600KB upload returns 507"
   assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "${c2_data}/${c2_mid}.media.bin")" "200" "SYNC-S06-03: 507 failure preserves mem1 media blob atomically"
+
+  dd if=/dev/zero bs=1024 count=250 of="$s06_dir/c2_b3.bin" 2>/dev/null
+  ts="$(date +%s)"; nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-member --sk "$s_mem2_sk" --method PUT --channel backup --prefix p3 --ts "$ts" --nonce "$nonce" --body-file "$s06_dir/c2_b3.bin")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "X-Drop-Pubkey: $s_mem2_pk" -H "X-Channel: backup" -H "X-Drop-Prefix: p3" -H "X-Drop-Timestamp: $ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig" --data-binary "@$s06_dir/c2_b3.bin" "${c2_ep}")" "200" "SYNC-S09-F1: feasible 250KB upload succeeds via Priority-3 LRU eviction"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "${c2_data}/${c2_mid}.media.bin")" "404" "SYNC-S09-F1: PHP Priority-3 LRU evicted mem1 media blob (404)"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "${c2_data}/${s_mem2_pk}_p3.backup.bin")" "200" "SYNC-S09-F1: 250KB backup persisted after Priority-3 eviction"
 
   # 5) Anti-amnesia lock_key failure before slot commit
   mkdir -p "$c2_dir/humoco_sync_data/locks/2031-Q2/0000"

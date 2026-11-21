@@ -95,7 +95,11 @@ async fn handle_sync_endpoint(
             handle_head(&state, &headers).await
         }
         Method::PUT => {
-            if query_params.contains_key("members") {
+            if query_params.contains_key("members")
+                && query_params
+                    .keys()
+                    .all(|k| k == "members" || k == "channel")
+            {
                 let channel = query_params
                     .get("channel")
                     .map(|s| s.as_str())
@@ -616,11 +620,10 @@ async fn handle_put_slot(state: &AppState, headers: &HeaderMap, body: Body) -> R
         Err(e) => return db_err_to_response(e),
     }
 
-    let if_match = headers.get(header::IF_MATCH).and_then(|v| v.to_str().ok());
-    let if_none_match = headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|v| v.to_str().ok());
-    let precondition = ConditionalPrecondition::from_headers(if_match, if_none_match);
+    let if_match = join_header_values(headers, header::IF_MATCH);
+    let if_none_match = join_header_values(headers, header::IF_NONE_MATCH);
+    let precondition =
+        ConditionalPrecondition::from_headers(if_match.as_deref(), if_none_match.as_deref());
 
     let outcome = if let Some(ref mid) = media_id_opt {
         state
@@ -1462,6 +1465,19 @@ fn gone_revoked_response(state: &AppState, is_head: bool) -> Response {
         })),
     )
         .into_response()
+}
+
+fn join_header_values(headers: &HeaderMap, name: header::HeaderName) -> Option<String> {
+    let parts: Vec<&str> = headers
+        .get_all(name)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(","))
+    }
 }
 
 fn optional_header_str<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a str>, ()> {

@@ -254,28 +254,87 @@ pub struct PutOutcome {
 pub enum ConditionalPrecondition {
     None,
     IfMatch(String),
+    IfMatchAbsent,
     IfNoneMatchStar,
+    IfNoneMatch(Vec<String>),
+    All(Vec<ConditionalPrecondition>),
 }
 
 impl ConditionalPrecondition {
     pub fn from_headers(if_match: Option<&str>, if_none_match: Option<&str>) -> Self {
-        if let Some(m) = if_match {
-            let clean = normalize_etag(m);
-            return Self::IfMatch(clean);
-        }
+        let mut checks = Vec::new();
         if let Some(nm) = if_none_match {
-            if nm.trim() == "*" {
-                return Self::IfNoneMatchStar;
+            let mut has_star = false;
+            let mut tags = Vec::new();
+            for part in nm.split(',') {
+                let cand = part.trim();
+                if cand.is_empty() {
+                    continue;
+                }
+                if cand == "*" {
+                    has_star = true;
+                    break;
+                }
+                let norm = normalize_etag(cand);
+                if !norm.is_empty() {
+                    tags.push(norm);
+                }
+            }
+            if has_star {
+                checks.push(Self::IfNoneMatchStar);
+            } else if !tags.is_empty() {
+                checks.push(Self::IfNoneMatch(tags));
             }
         }
-        Self::None
+        if let Some(m) = if_match {
+            let clean = normalize_etag(m);
+            if clean.is_empty() || clean == "none" {
+                checks.push(Self::IfMatchAbsent);
+            } else {
+                checks.push(Self::IfMatch(clean));
+            }
+        }
+        match checks.len() {
+            0 => Self::None,
+            1 => checks.into_iter().next().unwrap_or(Self::None),
+            _ => Self::All(checks),
+        }
+    }
+
+    pub fn evaluate(&self, live_etag: Option<&str>) -> Result<(), DbError> {
+        match self {
+            Self::None => Ok(()),
+            Self::IfMatch(expected) => match live_etag {
+                Some(cur) if cur == expected => Ok(()),
+                Some(cur) => Err(DbError::http(412, format!("ETAG_MISMATCH:{}", cur))),
+                None => Err(DbError::http(412, "ETAG_MISMATCH:")),
+            },
+            Self::IfMatchAbsent | Self::IfNoneMatchStar => match live_etag {
+                Some(cur) => Err(DbError::http(412, format!("ETAG_MISMATCH:{}", cur))),
+                None => Ok(()),
+            },
+            Self::IfNoneMatch(tags) => match live_etag {
+                Some(cur) if tags.iter().any(|t| t == cur) => {
+                    Err(DbError::http(412, format!("ETAG_MISMATCH:{}", cur)))
+                }
+                _ => Ok(()),
+            },
+            Self::All(list) => {
+                for item in list {
+                    item.evaluate(live_etag)?;
+                }
+                Ok(())
+            }
+        }
     }
 }
 
 pub fn normalize_etag(raw: &str) -> String {
     let trimmed = raw.trim();
     let no_weak = trimmed.strip_prefix("W/").unwrap_or(trimmed);
-    no_weak.trim_matches('"').to_string()
+    no_weak
+        .trim_matches(|c| matches!(c, '"' | ' ' | '\t' | '\n' | '\r' | '\0' | '\x0B'))
+        .to_string()
 }
 
 pub struct SyncDb {
@@ -732,15 +791,21 @@ impl SyncDb {
 
         let access =
             Self::resolve_member_access_in_txn(&admin_table, &reg_table, cfg, pubkey, now_secs)?;
+        let caller_media_ttl = access
+            .as_ref()
+            .and_then(|a| a.profile.channels.get("media").map(|q| q.ttl_days))
+            .unwrap_or(cfg.media.ttl_days);
 
         let mut media_used_count = 0usize;
         let mut media_used_bytes = 0u64;
         for entry in media_meta.iter()? {
             let (_, val) = entry?;
             let meta: MediaMetaRecord = serde_json::from_slice(val.value())?;
-            if meta.owner_pubkey == pubkey {
+            if meta.owner_pubkey == pubkey
+                && !is_ttl_expired(meta.created_at, caller_media_ttl, now_secs)
+            {
                 media_used_count += 1;
-                media_used_bytes += meta.size as u64;
+                media_used_bytes = media_used_bytes.saturating_add(meta.size as u64);
             }
         }
 
@@ -837,7 +902,7 @@ impl SyncDb {
                     (None, None)
                 }
             }
-            Some(ch) => {
+            Some(ch) if ch != "lock" => {
                 let slot_id = crate::crypto::format_slot_id(pubkey, prefix);
                 let skey = slot_key(ch, &slot_id);
                 if let Some(g) = slot_meta.get(skey.as_str())? {
@@ -857,7 +922,7 @@ impl SyncDb {
                     (Some(false), None)
                 }
             }
-            None => (None, None),
+            None | Some(_) => (None, None),
         };
 
         Ok(HeadCapability {
@@ -945,21 +1010,7 @@ impl SyncDb {
                 .as_ref()
                 .filter(|em| !is_ttl_expired(em.mtime, ch_ttl_days, now_secs));
 
-            match precondition {
-                ConditionalPrecondition::None => {}
-                ConditionalPrecondition::IfMatch(expected) => match live_meta {
-                    Some(em) if &em.etag == expected => {}
-                    Some(em) => {
-                        return Err(DbError::http(412, format!("ETAG_MISMATCH:{}", em.etag)));
-                    }
-                    None => return Err(DbError::http(412, "ETAG_MISMATCH:")),
-                },
-                ConditionalPrecondition::IfNoneMatchStar => {
-                    if let Some(em) = live_meta {
-                        return Err(DbError::http(412, format!("ETAG_MISMATCH:{}", em.etag)));
-                    }
-                }
-            }
+            precondition.evaluate(live_meta.map(|em| em.etag.as_str()))?;
 
             let old_size = existing_meta.as_ref().map(|m| m.size).unwrap_or(0);
             let mut evicted_media = 0usize;
@@ -1068,21 +1119,7 @@ impl SyncDb {
                 .as_ref()
                 .filter(|em| !is_ttl_expired(em.created_at, media_ttl_days, now_secs));
 
-            match precondition {
-                ConditionalPrecondition::None => {}
-                ConditionalPrecondition::IfMatch(expected) => match live_existing {
-                    Some(em) if &em.etag == expected => {}
-                    Some(em) => {
-                        return Err(DbError::http(412, format!("ETAG_MISMATCH:{}", em.etag)));
-                    }
-                    None => return Err(DbError::http(412, "ETAG_MISMATCH:")),
-                },
-                ConditionalPrecondition::IfNoneMatchStar => {
-                    if let Some(em) = live_existing {
-                        return Err(DbError::http(412, format!("ETAG_MISMATCH:{}", em.etag)));
-                    }
-                }
-            }
+            precondition.evaluate(live_existing.map(|em| em.etag.as_str()))?;
 
             let mut evicted = 0usize;
             // Evict user's own oldest media if per-user count or bytes exceeded
@@ -1402,13 +1439,13 @@ impl SyncDb {
         if !cfg.mode.enable_admin_app {
             return Err(DbError::http(403, "Admin app member management disabled"));
         }
-        if pubkeys.len() > cfg.mode.max_admin_members {
+        let target_set: BTreeSet<String> = pubkeys.iter().cloned().collect();
+        if target_set.len() > cfg.mode.max_admin_members {
             return Err(DbError::http(
                 507,
                 "Insufficient Storage: Exceeds max_members limit",
             ));
         }
-        let target_set: BTreeSet<String> = pubkeys.iter().cloned().collect();
 
         let write_txn = self.db.begin_write()?;
         {
@@ -1518,12 +1555,15 @@ impl SyncDb {
         &self,
         cfg: &Config,
     ) -> Result<(Vec<SyncIndexEntry>, String), DbError> {
+        let now_secs = crate::crypto::unix_now();
         let read_txn = self.db.begin_read()?;
         let admin_table = read_txn.open_table(ADMIN_MEMBERS)?;
+        let reg_table = read_txn.open_table(REGISTERED_USERS)?;
         let slot_meta = read_txn.open_table(SLOT_META)?;
 
         let mut entries = Vec::new();
         if cfg.mode.enable_admin_app {
+            let mut owner_access_cache: BTreeMap<String, Option<EffectiveAccess>> = BTreeMap::new();
             for entry in slot_meta.iter()? {
                 let (_, v) = entry?;
                 let meta: SlotMetaRecord = serde_json::from_slice(v.value())?;
@@ -1533,6 +1573,24 @@ impl SyncDb {
                 // Hybrid invariant: ONLY admin_app member slots appear in index.json!
                 let key = admin_member_key(&meta.channel, &meta.owner_pubkey);
                 if admin_table.get(key.as_str())?.is_some() {
+                    if !owner_access_cache.contains_key(&meta.owner_pubkey) {
+                        let resolved = Self::resolve_member_access_in_txn(
+                            &admin_table,
+                            &reg_table,
+                            cfg,
+                            &meta.owner_pubkey,
+                            now_secs,
+                        )?;
+                        owner_access_cache.insert(meta.owner_pubkey.clone(), resolved);
+                    }
+                    let ttl_days = owner_access_cache
+                        .get(&meta.owner_pubkey)
+                        .and_then(|opt| opt.as_ref())
+                        .and_then(|a| a.profile.channels.get(&meta.channel).map(|q| q.ttl_days))
+                        .unwrap_or(0);
+                    if is_ttl_expired(meta.mtime, ttl_days, now_secs) {
+                        continue;
+                    }
                     entries.push(SyncIndexEntry {
                         id: meta.owner_pubkey,
                         prefix: meta.prefix,

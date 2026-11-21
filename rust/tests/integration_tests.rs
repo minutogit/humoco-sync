@@ -7377,3 +7377,674 @@ async fn test_s05_admin_api_rate_limit_preauth_and_cache_control() {
         "Admin API must enforce IP rate limiting before Argon2id verification"
     );
 }
+
+#[tokio::test]
+async fn test_s09_f1_conditional_preconditions_parity() {
+    let (_admin_sk, admin_pk) = gen_keypair();
+    let (friend_sk, friend_pk) = gen_keypair();
+
+    let srv = TestServer::start(base_hybrid_config(&admin_pk)).await;
+    let now_u = unix_now();
+    let now = now_u as i64;
+    srv.state
+        .db
+        .put_admin_members(
+            &srv.state.config,
+            "card",
+            std::slice::from_ref(&friend_pk),
+            now_u,
+        )
+        .unwrap();
+
+    // 1. Standard slot: If-Match: "none" and If-Match: "" MUST succeed (200) on absent slots
+    let v1 = b"slot-cond-v1".to_vec();
+    let v1_etag = sha256_hex(&v1);
+    let mut r_none_create = srv
+        .client
+        .put(format!("{}/sync.php", srv.base_url))
+        .header("If-Match", "\"none\"");
+    for (k, v) in sign_member_headers(&friend_sk, "PUT", "card", "", "", now, &v1) {
+        r_none_create = r_none_create.header(k, v);
+    }
+    assert_eq!(
+        r_none_create
+            .body(v1.clone())
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        200,
+        "If-Match: \"none\" must succeed when slot is absent"
+    );
+
+    let mut r_empty_create = srv
+        .client
+        .put(format!("{}/sync.php", srv.base_url))
+        .header("If-Match", "\"\"");
+    for (k, v) in sign_member_headers(&friend_sk, "PUT", "card", "alt", "", now, &v1) {
+        r_empty_create = r_empty_create.header(k, v);
+    }
+    assert_eq!(
+        r_empty_create
+            .body(v1.clone())
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        200,
+        "If-Match: \"\" must succeed when prefixed slot is absent"
+    );
+
+    // 2. If-Match: "none" and "" MUST fail (412) when slot is occupied
+    let v2 = b"slot-cond-v2".to_vec();
+    let v2_etag = sha256_hex(&v2);
+    for hdr_val in ["\"none\"", "none", "\"\"", ""] {
+        let mut r_occ = srv
+            .client
+            .put(format!("{}/sync.php", srv.base_url))
+            .header("If-Match", hdr_val);
+        for (k, v) in sign_member_headers(&friend_sk, "PUT", "card", "", "", now, &v2) {
+            r_occ = r_occ.header(k, v);
+        }
+        let resp = r_occ.body(v2.clone()).send().await.unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            412,
+            "If-Match: {hdr_val} must reject occupied slot with 412"
+        );
+        assert_eq!(
+            resp.headers().get("etag").and_then(|v| v.to_str().ok()),
+            Some(format!("\"{v1_etag}\"").as_str())
+        );
+    }
+
+    // 3. If-None-Match: "<current_etag>", weak list, and multiple headers MUST fail (412)
+    for inm in [
+        format!("\"{v1_etag}\""),
+        format!("\"deadbeef\", W/\"{v1_etag}\""),
+        "\"deadbeef\", *".to_string(),
+    ] {
+        let mut r_inm = srv
+            .client
+            .put(format!("{}/sync.php", srv.base_url))
+            .header("If-None-Match", &inm);
+        for (k, v) in sign_member_headers(&friend_sk, "PUT", "card", "", "", now, &v2) {
+            r_inm = r_inm.header(k, v);
+        }
+        let resp = r_inm.body(v2.clone()).send().await.unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            412,
+            "If-None-Match: {inm} must reject matching occupied slot with 412"
+        );
+    }
+
+    let mut r_multi_inm = srv
+        .client
+        .put(format!("{}/sync.php", srv.base_url))
+        .header("If-None-Match", "\"deadbeef\"")
+        .header("If-None-Match", format!("\"{v1_etag}\""));
+    for (k, v) in sign_member_headers(&friend_sk, "PUT", "card", "", "", now, &v2) {
+        r_multi_inm = r_multi_inm.header(k, v);
+    }
+    assert_eq!(
+        r_multi_inm
+            .body(v2.clone())
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        412,
+        "Multiple If-None-Match headers matching current ETag must return 412"
+    );
+
+    // 4. Non-matching If-None-Match allows update to v2
+    let mut r_inm_miss = srv
+        .client
+        .put(format!("{}/sync.php", srv.base_url))
+        .header("If-None-Match", "\"deadbeef\"");
+    for (k, v) in sign_member_headers(&friend_sk, "PUT", "card", "", "", now, &v2) {
+        r_inm_miss = r_inm_miss.header(k, v);
+    }
+    assert_eq!(
+        r_inm_miss
+            .body(v2.clone())
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        200
+    );
+
+    // 5. Combined If-None-Match + If-Match evaluates BOTH (If-None-Match match -> 412)
+    let v3 = b"slot-cond-v3".to_vec();
+    let mut r_both = srv
+        .client
+        .put(format!("{}/sync.php", srv.base_url))
+        .header("If-None-Match", format!("\"{v2_etag}\""))
+        .header("If-Match", format!("\"{v2_etag}\""));
+    for (k, v) in sign_member_headers(&friend_sk, "PUT", "card", "", "", now, &v3) {
+        r_both = r_both.header(k, v);
+    }
+    assert_eq!(
+        r_both
+            .body(v3.clone())
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        412,
+        "Matching If-None-Match must fail 412 even when If-Match also matches"
+    );
+
+    // 6. Quoted ETag with inner whitespace normalizes identically to PHP
+    let mut r_ws_im = srv
+        .client
+        .put(format!("{}/sync.php", srv.base_url))
+        .header("If-Match", format!("W/\"  {v2_etag}  \""));
+    for (k, v) in sign_member_headers(&friend_sk, "PUT", "card", "", "", now, &v3) {
+        r_ws_im = r_ws_im.header(k, v);
+    }
+    assert_eq!(
+        r_ws_im.body(v3).send().await.unwrap().status().as_u16(),
+        200
+    );
+
+    // 7. Media channel precondition parity (If-Match: "none" & If-None-Match: "<etag>")
+    let m1 = b"media-cond-v1".to_vec();
+    let m1_id = sha256_hex(&m1);
+    let m1_etag = sha256_hex(&m1);
+    let mut r_m_create = srv
+        .client
+        .put(format!("{}/sync.php", srv.base_url))
+        .header("If-Match", "none");
+    for (k, v) in sign_member_headers(&friend_sk, "PUT", "media", "", &m1_id, now, &m1) {
+        r_m_create = r_m_create.header(k, v);
+    }
+    assert_eq!(
+        r_m_create.body(m1).send().await.unwrap().status().as_u16(),
+        200,
+        "PUT media with If-Match: none must succeed on absent media"
+    );
+
+    let m2 = b"media-cond-v2".to_vec();
+    let mut r_m_inm = srv
+        .client
+        .put(format!("{}/sync.php", srv.base_url))
+        .header("If-None-Match", format!("\"{m1_etag}\""));
+    for (k, v) in sign_member_headers(&friend_sk, "PUT", "media", "", &m1_id, now, &m2) {
+        r_m_inm = r_m_inm.header(k, v);
+    }
+    assert_eq!(
+        r_m_inm
+            .body(m2.clone())
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        412,
+        "PUT media with matching If-None-Match ETag must return 412"
+    );
+
+    let mut r_m_both_ok = srv
+        .client
+        .put(format!("{}/sync.php", srv.base_url))
+        .header("If-None-Match", "\"deadbeef\"")
+        .header("If-Match", format!("\"{m1_etag}\""));
+    for (k, v) in sign_member_headers(&friend_sk, "PUT", "media", "", &m1_id, now, &m2) {
+        r_m_both_ok = r_m_both_ok.header(k, v);
+    }
+    assert_eq!(
+        r_m_both_ok.body(m2).send().await.unwrap().status().as_u16(),
+        200
+    );
+}
+
+#[tokio::test]
+async fn test_s09_f1_head_index_members_and_delete_parity() {
+    let (admin_sk, admin_pk) = gen_keypair();
+    let (friend_sk, friend_pk) = gen_keypair();
+    let (friend2_sk, friend2_pk) = gen_keypair();
+    let (_, extra_pk) = gen_keypair();
+
+    let mut cfg = base_hybrid_config(&admin_pk);
+    cfg.mode.max_admin_members = 2;
+    cfg.profiles.insert(
+        "friends_tight".to_string(),
+        ProfileConfig {
+            display_name: "Friends Tight".to_string(),
+            max_total_bytes: 200_000,
+            is_free_pool: false,
+            store_contact_email: false,
+            channels: BTreeMap::from([
+                (
+                    "card".to_string(),
+                    ChannelQuotaConfig {
+                        max_bytes: 100_000,
+                        ttl_days: 0,
+                        max_user_count: None,
+                        max_user_bytes: None,
+                    },
+                ),
+                (
+                    "backup".to_string(),
+                    ChannelQuotaConfig {
+                        max_bytes: 150_000,
+                        ttl_days: 0,
+                        max_user_count: None,
+                        max_user_bytes: None,
+                    },
+                ),
+                (
+                    "post".to_string(),
+                    ChannelQuotaConfig {
+                        max_bytes: 50_000,
+                        ttl_days: 30,
+                        max_user_count: None,
+                        max_user_bytes: None,
+                    },
+                ),
+                (
+                    "media".to_string(),
+                    ChannelQuotaConfig {
+                        max_bytes: 100_000,
+                        ttl_days: 30,
+                        max_user_count: Some(4),
+                        max_user_bytes: Some(200_000),
+                    },
+                ),
+            ]),
+        },
+    );
+    cfg.mode.admin_app_profile = "friends_tight".to_string();
+    let srv = TestServer::start(cfg).await;
+    let now_u = unix_now();
+    let now = now_u as i64;
+
+    // 1. PUT ?members with extra query parameter MUST return 405 Method Not Allowed
+    let dup_members_body = serde_json::to_vec(
+        &serde_json::json!({ "pubkeys": [&friend_pk, &friend_pk, &friend2_pk] }),
+    )
+    .unwrap();
+    let extra_nonce = random_hex(16);
+    let extra_sig = hex::encode(
+        admin_sk
+            .sign(
+                format_admin_put_members_message(
+                    "card",
+                    now,
+                    &extra_nonce,
+                    &sha256_hex(&dup_members_body),
+                )
+                .as_bytes(),
+            )
+            .to_bytes(),
+    );
+    let extra_resp = srv
+        .client
+        .put(format!(
+            "{}/sync.php?members&channel=card&extra=1",
+            srv.base_url
+        ))
+        .header("X-Drop-Pubkey", &admin_pk)
+        .header("X-Drop-Timestamp", now.to_string())
+        .header("X-Drop-Nonce", &extra_nonce)
+        .header("X-Drop-Signature", &extra_sig)
+        .body(dup_members_body.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        extra_resp.status().as_u16(),
+        405,
+        "PUT ?members with extra query param must return 405"
+    );
+
+    // 2. PUT ?members deduplicates before checking max_admin_members=2
+    let m_nonce = random_hex(16);
+    let m_sig = hex::encode(
+        admin_sk
+            .sign(
+                format_admin_put_members_message(
+                    "card",
+                    now,
+                    &m_nonce,
+                    &sha256_hex(&dup_members_body),
+                )
+                .as_bytes(),
+            )
+            .to_bytes(),
+    );
+    let dedup_ok = srv
+        .client
+        .put(format!("{}/sync.php?members&channel=card", srv.base_url))
+        .header("X-Drop-Pubkey", &admin_pk)
+        .header("X-Drop-Timestamp", now.to_string())
+        .header("X-Drop-Nonce", &m_nonce)
+        .header("X-Drop-Signature", &m_sig)
+        .body(dup_members_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        dedup_ok.status().as_u16(),
+        200,
+        "PUT ?members must deduplicate pubkeys before checking max_admin_members"
+    );
+
+    let too_many_body =
+        serde_json::to_vec(&serde_json::json!({ "pubkeys": [&friend_pk, &friend2_pk, &extra_pk] }))
+            .unwrap();
+    let m2_nonce = random_hex(16);
+    let m2_sig = hex::encode(
+        admin_sk
+            .sign(
+                format_admin_put_members_message(
+                    "card",
+                    now,
+                    &m2_nonce,
+                    &sha256_hex(&too_many_body),
+                )
+                .as_bytes(),
+            )
+            .to_bytes(),
+    );
+    assert_eq!(
+        srv.client
+            .put(format!("{}/sync.php?members&channel=card", srv.base_url))
+            .header("X-Drop-Pubkey", &admin_pk)
+            .header("X-Drop-Timestamp", now.to_string())
+            .header("X-Drop-Nonce", &m2_nonce)
+            .header("X-Drop-Signature", &m2_sig)
+            .body(too_many_body)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        507
+    );
+
+    for ch in ["backup", "post", "lock"] {
+        srv.state
+            .db
+            .put_admin_members(
+                &srv.state.config,
+                ch,
+                &[friend_pk.clone(), friend2_pk.clone()],
+                now_u,
+            )
+            .unwrap();
+    }
+
+    // 3. HEAD with X-Channel: lock must omit X-Slot-Occupied (matching PHP & SPEC.md §2)
+    let lock_head = srv
+        .client
+        .head(format!("{}/sync.php", srv.base_url))
+        .header("X-Drop-Pubkey", &friend_pk)
+        .header("X-Channel", "lock")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(lock_head.status().as_u16(), 200);
+    assert_eq!(
+        lock_head
+            .headers()
+            .get("x-drop-authorized")
+            .and_then(|v| v.to_str().ok()),
+        Some("true")
+    );
+    assert!(
+        !lock_head.headers().contains_key("x-slot-occupied"),
+        "HEAD with X-Channel: lock must NOT emit X-Slot-Occupied"
+    );
+
+    // 4. Upload card, expired post (ttl=30d), and expired media (ttl=30d); check TTL expiry in HEAD & HTTP index.json
+    let expired_upload_ts = now_u.saturating_sub(31 * 86_400);
+    srv.state
+        .db
+        .put_slot(
+            &srv.state.config,
+            &friend_pk,
+            "card",
+            None,
+            b"card-keep",
+            &ConditionalPrecondition::None,
+            now_u,
+        )
+        .unwrap();
+    srv.state
+        .db
+        .put_slot(
+            &srv.state.config,
+            &friend_pk,
+            "post",
+            None,
+            b"post-expiring",
+            &ConditionalPrecondition::None,
+            expired_upload_ts,
+        )
+        .unwrap();
+    let exp_mid = sha256_hex(b"exp-media");
+    srv.state
+        .db
+        .put_media(
+            &srv.state.config,
+            &friend_pk,
+            &exp_mid,
+            b"exp-media-bytes",
+            &ConditionalPrecondition::None,
+            expired_upload_ts,
+        )
+        .unwrap();
+
+    let head_exp = srv
+        .client
+        .head(format!("{}/sync.php", srv.base_url))
+        .header("X-Drop-Pubkey", &friend_pk)
+        .header("X-Channel", "media")
+        .header("X-Media-Id", &exp_mid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head_exp.status().as_u16(), 200);
+    assert_eq!(
+        head_exp
+            .headers()
+            .get("x-media-count")
+            .and_then(|v| v.to_str().ok()),
+        Some("0"),
+        "HEAD must exclude TTL-expired media from X-Media-Count"
+    );
+    assert_eq!(
+        head_exp
+            .headers()
+            .get("x-media-bytes")
+            .and_then(|v| v.to_str().ok()),
+        Some("0"),
+        "HEAD must exclude TTL-expired media from X-Media-Bytes"
+    );
+
+    let idx_exp: Vec<serde_json::Value> = srv
+        .client
+        .get(format!("{}/humoco_sync_data/index.json", srv.base_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        idx_exp.len(),
+        1,
+        "index.json must omit TTL-expired post slot and retain non-expiring card"
+    );
+    assert_eq!(idx_exp[0]["channel"], "card");
+
+    // 5. Authorized DELETE standard slot (prefixed) + single & bulk DELETE media + cross-user 403
+    let mut r_put_pfx = srv.client.put(format!("{}/sync.php", srv.base_url));
+    for (k, v) in sign_member_headers(&friend_sk, "PUT", "card", "dev1", "", now, b"pfx-card") {
+        r_put_pfx = r_put_pfx.header(k, v);
+    }
+    assert_eq!(
+        r_put_pfx
+            .body(b"pfx-card".to_vec())
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        200
+    );
+
+    let mut r_del_pfx = srv.client.delete(format!("{}/sync.php", srv.base_url));
+    for (k, v) in sign_member_headers(&friend_sk, "DELETE", "card", "dev1", "", now, b"") {
+        r_del_pfx = r_del_pfx.header(k, v);
+    }
+    assert_eq!(r_del_pfx.send().await.unwrap().status().as_u16(), 200);
+    assert_eq!(
+        srv.client
+            .get(format!(
+                "{}/humoco_sync_data/{}_dev1.card.bin",
+                srv.base_url, friend_pk
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        404
+    );
+
+    // Media blobs for friend & friend2
+    let f2_blob = b"friend2-media".to_vec();
+    let f2_mid = sha256_hex(&f2_blob);
+    let mut r_f2m = srv.client.put(format!("{}/sync.php", srv.base_url));
+    for (k, v) in sign_member_headers(&friend2_sk, "PUT", "media", "", &f2_mid, now, &f2_blob) {
+        r_f2m = r_f2m.header(k, v);
+    }
+    assert_eq!(
+        r_f2m.body(f2_blob).send().await.unwrap().status().as_u16(),
+        200
+    );
+
+    // Cross-user DELETE media -> 403
+    let mut r_cross_del = srv.client.delete(format!("{}/sync.php", srv.base_url));
+    for (k, v) in sign_member_headers(&friend_sk, "DELETE", "media", "", &f2_mid, now, b"") {
+        r_cross_del = r_cross_del.header(k, v);
+    }
+    assert_eq!(r_cross_del.send().await.unwrap().status().as_u16(), 403);
+
+    // Friend uploads two more media blobs, deletes one by id, then deletes remaining via bulk DELETE (no X-Media-Id)
+    let fm_a = b"friend-media-a".to_vec();
+    let fm_a_id = sha256_hex(&fm_a);
+    let fm_b = b"friend-media-b".to_vec();
+    let fm_b_id = sha256_hex(&fm_b);
+    for (mid, body) in [(&fm_a_id, &fm_a), (&fm_b_id, &fm_b)] {
+        let mut r = srv.client.put(format!("{}/sync.php", srv.base_url));
+        for (k, v) in sign_member_headers(&friend_sk, "PUT", "media", "", mid, now, body) {
+            r = r.header(k, v);
+        }
+        assert_eq!(
+            r.body(body.clone()).send().await.unwrap().status().as_u16(),
+            200
+        );
+    }
+
+    let mut r_del_single = srv.client.delete(format!("{}/sync.php", srv.base_url));
+    for (k, v) in sign_member_headers(&friend_sk, "DELETE", "media", "", &fm_a_id, now, b"") {
+        r_del_single = r_del_single.header(k, v);
+    }
+    assert_eq!(r_del_single.send().await.unwrap().status().as_u16(), 200);
+    assert_eq!(
+        srv.client
+            .get(format!(
+                "{}/humoco_sync_data/{}.media.bin",
+                srv.base_url, fm_a_id
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        404
+    );
+
+    // Bulk DELETE media (X-Media-Id omitted) removes exp_mid + fm_b_id, preserves friend2's f2_mid
+    let mut r_del_all = srv.client.delete(format!("{}/sync.php", srv.base_url));
+    for (k, v) in sign_member_headers(&friend_sk, "DELETE", "media", "", "", now, b"") {
+        r_del_all = r_del_all.header(k, v);
+    }
+    let del_all_resp = r_del_all.send().await.unwrap();
+    assert_eq!(del_all_resp.status().as_u16(), 200);
+    let del_all_json: serde_json::Value = del_all_resp.json().await.unwrap();
+    assert_eq!(del_all_json["deleted"], 2);
+    assert_eq!(
+        srv.client
+            .get(format!(
+                "{}/humoco_sync_data/{}.media.bin",
+                srv.base_url, fm_b_id
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        404
+    );
+    assert_eq!(
+        srv.client
+            .get(format!(
+                "{}/humoco_sync_data/{}.media.bin",
+                srv.base_url, f2_mid
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        200
+    );
+
+    // 6. HTTP Prio-3 media LRU eviction triggered by Prio-1 backup upload
+    let m_old = vec![0x11u8; 70_000];
+    let m_old_id = sha256_hex(&m_old);
+    let m_new = vec![0x22u8; 70_000];
+    let m_new_id = sha256_hex(&m_new);
+    let mut r_mo = srv.client.put(format!("{}/sync.php", srv.base_url));
+    for (k, v) in sign_member_headers(&friend_sk, "PUT", "media", "", &m_old_id, now, &m_old) {
+        r_mo = r_mo.header(k, v);
+    }
+    assert_eq!(
+        r_mo.body(m_old).send().await.unwrap().status().as_u16(),
+        200
+    );
+
+    let mut r_mn = srv.client.put(format!("{}/sync.php", srv.base_url));
+    for (k, v) in sign_member_headers(&friend_sk, "PUT", "media", "", &m_new_id, now, &m_new) {
+        r_mn = r_mn.header(k, v);
+    }
+    assert_eq!(
+        r_mn.body(m_new).send().await.unwrap().status().as_u16(),
+        200
+    );
+
+    // Touch m_old at now+120? No, deterministic creation/last_access_at via media_id tiebreak or sequential:
+    // Actually m_old and m_new have same `now` (unless >=1s passed), so tiebreak would be media_id!
+    // Let's upload backup 100KB (total 140KB media + 100KB backup > 200KB max_total_bytes -> evicts 1 media blob).
+    let bkp = vec![0x33u8; 100_000];
+    let mut r_bkp = srv.client.put(format!("{}/sync.php", srv.base_url));
+    for (k, v) in sign_member_headers(&friend_sk, "PUT", "backup", "", "", now, &bkp) {
+        r_bkp = r_bkp.header(k, v);
+    }
+    let bkp_resp = r_bkp.body(bkp).send().await.unwrap();
+    assert_eq!(bkp_resp.status().as_u16(), 200);
+    let bkp_json: serde_json::Value = bkp_resp.json().await.unwrap();
+    assert!(bkp_json["evicted_media"].as_u64().unwrap() >= 1);
+}
