@@ -30,7 +30,7 @@ const LOCK_DELEGATION_META: &str = "lock_delegation";
 const LOCK_SELFTEST_META: &str = "lock_selftest";
 pub(crate) const LOCK_USED_INODES_META: &str = "lock_used_inodes";
 const LOCK_SELFTEST_PROBE_META: &str = "lock_selftest_probe";
-const TICKET_POW_WINDOW_SECS: i64 = 300;
+const TICKET_POW_WINDOW_SECS: u64 = 300;
 const TICKET_POW_REPLAY_TTL_SECS: u64 = 600;
 const MAX_LOCK_BATCH_ENTRIES: usize = 64;
 
@@ -624,11 +624,14 @@ impl SyncDb {
 
                     // Consume request nonce
                     if let Some(exp) = nonces.get(nonce)?.map(|g| g.value()) {
-                        if exp > now_secs {
+                        if exp >= now_secs {
                             return Err(DbError::http(409, "Nonce already used"));
                         }
                     }
-                    nonces.insert(nonce, now_secs + crate::crypto::NONCE_TTL_SECS)?;
+                    nonces.insert(
+                        nonce,
+                        now_secs.saturating_add(crate::crypto::NONCE_TTL_SECS),
+                    )?;
 
                     let is_server_admin = !cfg.server.admin_pubkey.is_empty()
                         && pubkey_hex == cfg.server.admin_pubkey;
@@ -672,8 +675,7 @@ impl SyncDb {
                     let pow_nonce = req
                         .pow_nonce
                         .ok_or_else(|| DbError::http(400, "Missing pow_nonce"))?;
-                    let drift = (now_secs as i64 - pow_ts as i64).abs();
-                    if drift > TICKET_POW_WINDOW_SECS {
+                    if now_secs.abs_diff(pow_ts) > TICKET_POW_WINDOW_SECS {
                         return Err(DbError::http(
                             401,
                             "Ticket PoW timestamp outside allowed 300s window",
@@ -696,11 +698,14 @@ impl SyncDb {
                         pow_nonce
                     );
                     if let Some(exp) = nonces.get(tuple_key.as_str())?.map(|g| g.value()) {
-                        if exp > now_secs {
+                        if exp >= now_secs {
                             return Err(DbError::http(409, "Ticket PoW replay rejected"));
                         }
                     }
-                    nonces.insert(tuple_key.as_str(), now_secs + TICKET_POW_REPLAY_TTL_SECS)?;
+                    nonces.insert(
+                        tuple_key.as_str(),
+                        now_secs.saturating_add(TICKET_POW_REPLAY_TTL_SECS),
+                    )?;
                 }
             }
 
@@ -809,26 +814,33 @@ impl SyncDb {
             &bucket_hex,
             now_secs,
         )?;
-        write_txn.commit()?;
 
         match outcome {
-            LockBatchTxOutcome::Frozen { status_code, body } => Ok((status_code, body)),
+            LockBatchTxOutcome::Frozen { status_code, body } => {
+                write_txn.commit()?;
+                Ok((status_code, body))
+            }
             LockBatchTxOutcome::OutputBranchClaimed {
                 parent_slot,
                 output_branch,
-            } => Ok((
-                409,
-                serde_json::json!({
-                    "error": "output_branch_already_claimed",
-                    "parent_slot": parent_slot,
-                    "output_branch": output_branch,
-                }),
-            )),
+            } => {
+                drop(write_txn);
+                Ok((
+                    409,
+                    serde_json::json!({
+                        "error": "output_branch_already_claimed",
+                        "parent_slot": parent_slot,
+                        "output_branch": output_branch,
+                    }),
+                ))
+            }
             LockBatchTxOutcome::Committed {
                 retain_until_quarter,
                 pending_receipts,
                 conflict,
             } => {
+                // Commit before signing receipts, and NEVER commit on OutputBranchClaimed abort.
+                write_txn.commit()?;
                 // Sign receipts ONLY AFTER write_txn.commit() succeeded!
                 let read_txn = self.raw_db().begin_read()?;
                 let meta = read_txn.open_table(SERVER_META)?;
@@ -1506,5 +1518,35 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.to_string().contains("Anti-amnesia halt"));
+    }
+
+    #[test]
+    fn test_s01_ticket_pow_extreme_timestamp_no_panic_or_bypass() {
+        let dir = TempDir::new().unwrap();
+        let db = SyncDb::open(&dir.path().join("sync.redb"), "").unwrap();
+        let mut cfg = Config::default();
+        cfg.lock.allow_pow_tickets = true;
+        cfg.lock.ticket_pow_bits = 8;
+
+        let anchor_id = [0x44; 32];
+        let quarter = humoco_proto::encode_quarter(2031, 2).unwrap();
+        let now = 1_795_000_000u64;
+
+        for extreme_ts in [1u64 << 63, now.wrapping_add(1u64 << 63), u64::MAX] {
+            let err = db
+                .issue_genesis_ticket(
+                    &cfg,
+                    TicketCallerAuth::UnauthenticatedPow,
+                    LockTicketRequest {
+                        anchor_id,
+                        retain_until_quarter: quarter,
+                        pow_timestamp: Some(extreme_ts),
+                        pow_nonce: Some(0),
+                    },
+                    now,
+                )
+                .unwrap_err();
+            assert!(matches!(err, DbError::Http { status: 401, .. }));
+        }
     }
 }

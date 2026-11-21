@@ -7,7 +7,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use hmac::{Hmac, Mac};
 use parking_lot::Mutex;
 use rand::rngs::OsRng;
@@ -283,27 +283,24 @@ pub fn verify_revocation_notice(
 ) -> Result<(), String> {
     let expected = normalize_pubkey_hex(expected_drop_pub)
         .ok_or_else(|| "Invalid admin pubkey".to_string())?;
-    if notice.drop_pub.trim().to_ascii_lowercase() != expected {
+    let drop_pub_lower = notice.drop_pub.to_ascii_lowercase();
+    if !is_hex_exact(&drop_pub_lower, 64) || drop_pub_lower != expected {
         return Err("Revocation drop_pub mismatch".to_string());
     }
     if notice.issued_at == 0 || notice.effective_at == 0 {
         return Err("Missing revocation timestamps".to_string());
     }
     if let Some(ref reason) = notice.reason {
-        if reason.len() > 200
-            || reason.contains('\n')
-            || reason.contains('\r')
-            || reason.contains('\0')
-        {
+        if reason.len() > 200 || reason.chars().any(|c| c.is_control()) {
             return Err("Invalid revocation reason".to_string());
         }
     }
     if let Some(ref rep) = notice.replacement {
-        if normalize_pubkey_hex(&rep.drop_pub).is_none() {
+        if !is_hex_exact(&rep.drop_pub.to_ascii_lowercase(), 64) {
             return Err("Invalid replacement drop_pub".to_string());
         }
-        if !(rep.write_url.starts_with("http://") || rep.write_url.starts_with("https://"))
-            || !(rep.read_url.starts_with("http://") || rep.read_url.starts_with("https://"))
+        if !is_valid_lock_delegation_url(&rep.write_url)
+            || !is_valid_lock_delegation_url(&rep.read_url)
         {
             return Err("Invalid replacement URLs".to_string());
         }
@@ -333,12 +330,11 @@ pub fn verify_ed25519_hex(pubkey_hex: &str, sig_hex: &str, message: &[u8]) -> bo
         Err(_) => return false,
     };
     let sig = Signature::from_bytes(&sig_arr);
-    vk.verify(message, &sig).is_ok()
+    vk.verify_strict(message, &sig).is_ok()
 }
 
 pub fn check_timestamp_window(timestamp: i64, now_secs: u64) -> bool {
-    let now = now_secs as i64;
-    (now - timestamp).abs() <= TIMESTAMP_WINDOW_SECS
+    (now_secs as i128).abs_diff(timestamp as i128) <= TIMESTAMP_WINDOW_SECS as u128
 }
 
 /// Canonicalizes email addresses so Gmail dot/plus tricks and case variants map consistently,
@@ -349,16 +345,52 @@ pub fn canonicalize_email(raw: &str) -> Option<String> {
         return None;
     }
     let (local, domain) = trimmed.split_once('@')?;
-    if local.is_empty() || domain.is_empty() || !domain.contains('.') || domain.contains('@') {
-        return None;
-    }
-    if !domain
-        .bytes()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
+    if local.is_empty()
+        || local.len() > 64
+        || local.starts_with('.')
+        || local.ends_with('.')
+        || local.contains("..")
+        || !local.bytes().all(|b| {
+            b.is_ascii_lowercase()
+                || b.is_ascii_digit()
+                || matches!(
+                    b,
+                    b'.' | b'!'
+                        | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'/'
+                        | b'='
+                        | b'?'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'{'
+                        | b'|'
+                        | b'}'
+                        | b'~'
+                )
+        })
     {
         return None;
     }
-    if domain.starts_with('.') || domain.ends_with('.') || domain.contains("..") {
+    if domain.is_empty() || domain.len() > 253 || !domain.contains('.') || domain.contains('@') {
+        return None;
+    }
+    if !domain.split('.').all(|lbl| {
+        !lbl.is_empty()
+            && lbl.len() <= 63
+            && !lbl.starts_with('-')
+            && !lbl.ends_with('-')
+            && lbl
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    }) {
         return None;
     }
     let base_local = local.split('+').next().unwrap_or(local);
@@ -619,4 +651,176 @@ pub fn generate_session_csrf_pair(pepper: &[u8; 32], session_id: &str) -> String
 
 pub fn constant_time_eq_str(a: &str, b: &str) -> bool {
     a.len() == b.len() && bool::from(a.as_bytes().ct_eq(b.as_bytes()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_s01_check_timestamp_window_extreme_values_no_overflow_or_bypass() {
+        let now = 1_795_000_000u64;
+        assert!(!check_timestamp_window(i64::MIN, now));
+        assert!(!check_timestamp_window(i64::MAX, now));
+        assert!(!check_timestamp_window(
+            (now as i64).wrapping_sub(i64::MIN),
+            now
+        ));
+        assert!(!check_timestamp_window(0, u64::MAX));
+        assert!(check_timestamp_window((now - 60) as i64, now));
+        assert!(check_timestamp_window((now + 60) as i64, now));
+        assert!(!check_timestamp_window((now - 61) as i64, now));
+        assert!(!check_timestamp_window((now + 61) as i64, now));
+    }
+
+    #[test]
+    fn test_s01_verify_ed25519_hex_rejects_small_order_identity_forgery() {
+        let mut id_pk = [0u8; 32];
+        id_pk[0] = 1; // Edwards identity point (0, 1)
+        let mut forged_sig = [0u8; 64];
+        forged_sig[0] = 1; // R = identity, S = 0
+        assert!(!verify_ed25519_hex(
+            &hex::encode(id_pk),
+            &hex::encode(forged_sig),
+            b"arbitrary-admin-request",
+        ));
+    }
+
+    #[test]
+    fn test_s01_canonicalize_email_rejects_control_and_smtp_delimiters() {
+        let too_long_local = format!("{}@example.com", "a".repeat(65));
+        let too_long_label = format!("alice@{}.com", "a".repeat(64));
+        for bad in [
+            "alice,victim@example.com",
+            "alice>NOTIFY=FAILURE@example.com",
+            "alice<x>@example.com",
+            "alice;bob@example.com",
+            "alice\0@example.com",
+            "alice\x07@example.com",
+            ".alice@example.com",
+            "alice.@example.com",
+            "a..b@example.com",
+            too_long_local.as_str(),
+            "alice@-bad.example.com",
+            "alice@bad-.example.com",
+            too_long_label.as_str(),
+        ] {
+            assert!(
+                canonicalize_email(bad).is_none(),
+                "expected email {:?} to be rejected",
+                bad
+            );
+        }
+
+        assert_eq!(
+            canonicalize_email("Alice.Smith+tag@GoogleMail.com").as_deref(),
+            Some("alicesmith@gmail.com")
+        );
+        assert_eq!(
+            canonicalize_email("o'brien+1_test@sub.example.org").as_deref(),
+            Some("o'brien@sub.example.org")
+        );
+    }
+
+    #[test]
+    fn test_s01_verify_revocation_notice_rejects_delimiter_injection_and_bad_urls() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let sk = SigningKey::from_bytes(&[77u8; 32]);
+        let pk_hex = hex::encode(sk.verifying_key().as_bytes());
+        let rep_sk = SigningKey::from_bytes(&[78u8; 32]);
+        let rep_pk_hex = hex::encode(rep_sk.verifying_key().as_bytes());
+
+        let sign_notice = |mut n: RevocationNotice| -> RevocationNotice {
+            let msg = canonical_revocation_message(&n);
+            n.signature = hex::encode(sk.sign(msg.as_bytes()).to_bytes());
+            n
+        };
+
+        // Case A: newline delimiter injection in replacement.write_url
+        let case_a = sign_notice(RevocationNotice {
+            drop_pub: pk_hex.clone(),
+            issued_at: 100,
+            effective_at: 200,
+            reason: Some("ok".to_string()),
+            replacement: Some(RevocationReplacementTarget {
+                write_url: "https://new.example/sync.php\nhttps://injected".to_string(),
+                read_url: "https://new.example/data".to_string(),
+                drop_pub: rep_pk_hex.clone(),
+            }),
+            signature: String::new(),
+        });
+        assert!(verify_revocation_notice(&case_a, &pk_hex).is_err());
+
+        // Case B: whitespace in replacement.read_url
+        let case_b = sign_notice(RevocationNotice {
+            drop_pub: pk_hex.clone(),
+            issued_at: 100,
+            effective_at: 200,
+            reason: None,
+            replacement: Some(RevocationReplacementTarget {
+                write_url: "https://new.example/sync.php".to_string(),
+                read_url: "https://new.example/data with space".to_string(),
+                drop_pub: rep_pk_hex.clone(),
+            }),
+            signature: String::new(),
+        });
+        assert!(verify_revocation_notice(&case_b, &pk_hex).is_err());
+
+        // Case C: trailing newline in replacement.drop_pub
+        let case_c = sign_notice(RevocationNotice {
+            drop_pub: pk_hex.clone(),
+            issued_at: 100,
+            effective_at: 200,
+            reason: None,
+            replacement: Some(RevocationReplacementTarget {
+                write_url: "https://new.example/sync.php".to_string(),
+                read_url: "https://new.example/data".to_string(),
+                drop_pub: format!("{}\n", rep_pk_hex),
+            }),
+            signature: String::new(),
+        });
+        assert!(verify_revocation_notice(&case_c, &pk_hex).is_err());
+
+        // Case D: trailing newline in notice.drop_pub
+        let case_d = sign_notice(RevocationNotice {
+            drop_pub: format!("{}\n", pk_hex),
+            issued_at: 100,
+            effective_at: 200,
+            reason: None,
+            replacement: None,
+            signature: String::new(),
+        });
+        assert!(verify_revocation_notice(&case_d, &pk_hex).is_err());
+
+        // Case E: oversized replacement URL > 2048 bytes
+        let case_e = sign_notice(RevocationNotice {
+            drop_pub: pk_hex.clone(),
+            issued_at: 100,
+            effective_at: 200,
+            reason: None,
+            replacement: Some(RevocationReplacementTarget {
+                write_url: format!("https://example.org/{}", "a".repeat(2050)),
+                read_url: "https://new.example/data".to_string(),
+                drop_pub: rep_pk_hex.clone(),
+            }),
+            signature: String::new(),
+        });
+        assert!(verify_revocation_notice(&case_e, &pk_hex).is_err());
+
+        // Case F: valid replacement notice succeeds
+        let case_f = sign_notice(RevocationNotice {
+            drop_pub: pk_hex.clone(),
+            issued_at: 100,
+            effective_at: 200,
+            reason: Some("Migrating server".to_string()),
+            replacement: Some(RevocationReplacementTarget {
+                write_url: "https://new.example/sync.php".to_string(),
+                read_url: "https://new.example/data".to_string(),
+                drop_pub: rep_pk_hex,
+            }),
+            signature: String::new(),
+        });
+        assert!(verify_revocation_notice(&case_f, &pk_hex).is_ok());
+    }
 }

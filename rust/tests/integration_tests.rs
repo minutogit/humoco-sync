@@ -4373,3 +4373,223 @@ async fn test_k4_creator_non_growth_keeps_timelock_and_rejects_collapse_to_singl
         t1 + s1.state.config.lock.proposal_timelock_secs
     );
 }
+
+#[tokio::test]
+async fn test_s01_output_branch_claimed_aborts_partial_batch_atomically() {
+    let (admin_sk, _, srv) = start_lock_test_server(true, None).await;
+    let lock_pub = srv.state.db.lock_pubkey_bytes().unwrap();
+    let admin_pub = admin_sk.verifying_key().to_bytes();
+    let creator_mig_sk = SigningKey::from_bytes(&[121u8; 32]);
+    let creator_mig_pub = creator_mig_sk.verifying_key().to_bytes();
+    let quarter = humoco_proto::encode_quarter(2031, 3).unwrap();
+    let manifest = build_single_server_manifest(admin_pub, lock_pub, creator_mig_pub, quarter);
+    let anchor_id = manifest.rev1_anchor_id().unwrap();
+    let bucket = humoco_proto::derive_bucket(&anchor_id, &lock_pub);
+    let bucket_hex = hex::encode(bucket);
+    let ticket = issue_pow_ticket_http(&srv, anchor_id, quarter).await;
+
+    let g_sk = SigningKey::from_bytes(&[122u8; 32]);
+    let r1_sk = SigningKey::from_bytes(&[123u8; 32]);
+    let r1_hash = humoco_proto::hash_pubkey_sha3(&r1_sk.verifying_key().to_bytes());
+    let e0 = sign_lock_entry_helper(
+        anchor_id,
+        [0x01; 32],
+        [0u8; 32],
+        0,
+        0,
+        [0x10; 32],
+        &g_sk,
+        r1_hash,
+        None,
+        Some(&creator_mig_sk),
+        8,
+    );
+    let e1_a = sign_lock_entry_helper(
+        anchor_id, [0x11; 32], e0.slot, 0, 1, [0x21; 32], &r1_sk, [0x71; 32], None, None, 8,
+    );
+    let e1_b = sign_lock_entry_helper(
+        anchor_id, [0x22; 32], e0.slot, 0, 1, [0x22; 32], &r1_sk, [0x72; 32], None, None, 8,
+    );
+
+    // 1. Brand-new bucket batch [e0, e1_a, e1_b] hits output_branch_already_claimed on e1_b ->
+    //    must abort atomically without creating bucket or orphan entries.
+    let resp = srv
+        .client
+        .post(format!("{}/sync.php?lock", srv.base_url))
+        .json(&serde_json::json!({
+            "anchor_id": hex::encode(anchor_id),
+            "bucket": bucket_hex,
+            "recipient_nonce": hex::encode([0xD1; 32]),
+            "entries": [
+                e0.to_wire_hex().unwrap(),
+                e1_a.to_wire_hex().unwrap(),
+                e1_b.to_wire_hex().unwrap(),
+            ],
+            "manifest": manifest,
+            "genesis_ticket": ticket,
+            "known_head_receipt": serde_json::Value::Null,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 409);
+    let err_json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(err_json["error"], "output_branch_already_claimed");
+    assert_eq!(srv.state.db.lock_bucket_count_and_inodes().unwrap(), (0, 0));
+    assert!(srv
+        .state
+        .db
+        .lock_entries_in_bucket(&bucket_hex)
+        .unwrap()
+        .is_empty());
+
+    // 2. Commit [e0] first, then submit [e1_a, e1_b] -> must abort cleanly leaving ONLY e0.
+    let ok_resp = srv
+        .client
+        .post(format!("{}/sync.php?lock", srv.base_url))
+        .json(&serde_json::json!({
+            "anchor_id": hex::encode(anchor_id),
+            "bucket": bucket_hex,
+            "recipient_nonce": hex::encode([0xD2; 32]),
+            "entries": [e0.to_wire_hex().unwrap()],
+            "manifest": manifest,
+            "genesis_ticket": ticket,
+            "known_head_receipt": serde_json::Value::Null,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok_resp.status().as_u16(), 200);
+    assert_eq!(srv.state.db.lock_bucket_count_and_inodes().unwrap(), (1, 1));
+
+    let resp2 = srv
+        .client
+        .post(format!("{}/sync.php?lock", srv.base_url))
+        .json(&serde_json::json!({
+            "anchor_id": hex::encode(anchor_id),
+            "bucket": bucket_hex,
+            "recipient_nonce": hex::encode([0xD3; 32]),
+            "entries": [e1_a.to_wire_hex().unwrap(), e1_b.to_wire_hex().unwrap()],
+            "manifest": serde_json::Value::Null,
+            "genesis_ticket": serde_json::Value::Null,
+            "known_head_receipt": serde_json::Value::Null,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp2.status().as_u16(), 409);
+    let err_json2: serde_json::Value = resp2.json().await.unwrap();
+    assert_eq!(err_json2["error"], "output_branch_already_claimed");
+    assert_eq!(srv.state.db.lock_bucket_count_and_inodes().unwrap(), (1, 1));
+    let entries_after = srv.state.db.lock_entries_in_bucket(&bucket_hex).unwrap();
+    assert_eq!(entries_after.len(), 1);
+    assert!(entries_after.contains_key(&hex::encode(e0.slot)));
+}
+
+#[test]
+fn test_s01_ticket_replay_rejected_at_exact_expiry_boundary() {
+    let (admin_sk, admin_pk) = gen_keypair();
+    let mut cfg = base_hybrid_config(&admin_pk);
+    cfg.lock.allow_pow_tickets = true;
+    cfg.lock.ticket_pow_bits = 8;
+
+    let dir = TempDir::new().unwrap();
+    let db = humoco_sync_server::db::SyncDb::open(&dir.path().join("sync.redb"), "").unwrap();
+
+    let anchor_id = [0x61; 32];
+    let quarter = humoco_proto::encode_quarter(2031, 3).unwrap();
+    let t0 = 1_795_000_000u64;
+
+    // 1. SignedMember exact-boundary replay: ts = t0 + 60, first call at t0 -> exp = t0 + 120.
+    //    Replaying at now_secs = t0 + 120 keeps |now - ts| == 60 <= 60 while now_secs == exp.
+    let raw_body = serde_json::to_vec(&serde_json::json!({
+        "anchor_id": hex::encode(anchor_id),
+        "retain_until_quarter": quarter,
+    }))
+    .unwrap();
+    let ts_signed = (t0 + 60) as i64;
+    let nonce = random_hex(16);
+    let msg = parse_member_message(
+        "POST",
+        "lock_ticket",
+        "",
+        ts_signed,
+        &nonce,
+        &sha256_hex(&raw_body),
+    );
+    let sig = hex::encode(admin_sk.sign(msg.as_bytes()).to_bytes());
+    let req = humoco_sync_server::locks::LockTicketRequest {
+        anchor_id,
+        retain_until_quarter: quarter,
+        pow_timestamp: None,
+        pow_nonce: None,
+    };
+
+    assert!(db
+        .issue_genesis_ticket(
+            &cfg,
+            humoco_sync_server::locks::TicketCallerAuth::SignedMember {
+                pubkey_hex: &admin_pk,
+                timestamp: ts_signed,
+                nonce: &nonce,
+                sig: &sig,
+                raw_body: &raw_body,
+            },
+            req.clone(),
+            t0,
+        )
+        .is_ok());
+
+    let err_member = db
+        .issue_genesis_ticket(
+            &cfg,
+            humoco_sync_server::locks::TicketCallerAuth::SignedMember {
+                pubkey_hex: &admin_pk,
+                timestamp: ts_signed,
+                nonce: &nonce,
+                sig: &sig,
+                raw_body: &raw_body,
+            },
+            req,
+            t0 + 120,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err_member,
+        humoco_sync_server::db::DbError::Http { status: 409, .. }
+    ));
+
+    // 2. UnauthenticatedPow exact-boundary replay: pow_ts = t0 + 300, first call at t0 -> exp = t0 + 600.
+    //    Replaying at now_secs = t0 + 600 keeps |now - pow_ts| == 300 <= 300 while now_secs == exp.
+    let pow_ts = t0 + 300;
+    let pow_nonce =
+        humoco_proto::solve_ticket_pow(&anchor_id, quarter, pow_ts, 8, 0, 200_000).unwrap();
+    let pow_req = humoco_sync_server::locks::LockTicketRequest {
+        anchor_id,
+        retain_until_quarter: quarter,
+        pow_timestamp: Some(pow_ts),
+        pow_nonce: Some(pow_nonce),
+    };
+
+    assert!(db
+        .issue_genesis_ticket(
+            &cfg,
+            humoco_sync_server::locks::TicketCallerAuth::UnauthenticatedPow,
+            pow_req.clone(),
+            t0,
+        )
+        .is_ok());
+
+    let err_pow = db
+        .issue_genesis_ticket(
+            &cfg,
+            humoco_sync_server::locks::TicketCallerAuth::UnauthenticatedPow,
+            pow_req,
+            t0 + 600,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err_pow,
+        humoco_sync_server::db::DbError::Http { status: 409, .. }
+    ));
+}
