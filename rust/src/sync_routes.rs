@@ -1302,7 +1302,7 @@ async fn handle_static_lock(
     if !state.rate_limiter.allow_ip(client_ip) {
         return json_error(StatusCode::TOO_MANY_REQUESTS, "IP rate limit exceeded");
     }
-    if !state.config.lock.enabled {
+    if !state.config.lock.enabled || !quarter.is_ascii() {
         return StatusCode::NOT_FOUND.into_response();
     }
     let Some(file_hex) = filename.strip_suffix(".lock") else {

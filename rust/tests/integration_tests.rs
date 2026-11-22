@@ -10785,3 +10785,34 @@ async fn test_s03_admin_config_overrides_applied_across_all_db_paths() {
         "delete_slot must honor admin_config overrides where starter_backup (15 MiB > 10 MiB friends) grants backup channel"
     );
 }
+
+#[tokio::test]
+async fn test_s04_static_lock_non_ascii_quarter_no_panic() {
+    let (_admin_sk, admin_pk) = gen_keypair();
+    let cfg = base_hybrid_config(&admin_pk);
+    let srv = TestServer::start(cfg).await;
+
+    let dummy_hex = "00".repeat(32);
+    // "aäää" has byte length 7 (1 + 2 + 2 + 2), placing byte offsets 4 and 6 inside multi-byte UTF-8 chars.
+    let get_res = srv
+        .client
+        .get(format!(
+            "{}/humoco_sync_data/locks/a%C3%A4%C3%A4%C3%A4/{}/{}.lock",
+            srv.base_url, dummy_hex, dummy_hex
+        ))
+        .send()
+        .await
+        .expect("GET with non-ASCII 7-byte quarter must return HTTP 404 without panicking");
+    assert_eq!(get_res.status().as_u16(), 404);
+
+    let head_res = srv
+        .client
+        .head(format!(
+            "{}/humoco_sync_data/locks/%C3%A4%C3%A4%C3%A4a/{}/1.lock",
+            srv.base_url, dummy_hex
+        ))
+        .send()
+        .await
+        .expect("HEAD with non-ASCII 7-byte quarter must return HTTP 404 without panicking");
+    assert_eq!(head_res.status().as_u16(), 404);
+}
