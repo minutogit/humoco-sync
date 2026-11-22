@@ -293,10 +293,57 @@ function is_sync_url_valid($url) {
         return false;
     }
     if (str_starts_with($url, 'https://')) {
-        $host = parse_url($url, PHP_URL_HOST);
-        return is_string($host) && $host !== '';
+        $isHttps = true;
+        $rest = substr($url, 8);
+    } elseif (str_starts_with($url, 'http://')) {
+        $isHttps = false;
+        $rest = substr($url, 7);
+    } else {
+        return false;
     }
-    return preg_match('/\Ahttp:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::[0-9]{1,5})?(?:\/|\z)/i', $url) === 1;
+
+    $authority = substr($rest, 0, strcspn($rest, '/?#'));
+    if ($authority === '' || strpos($authority, '@') !== false) {
+        return false;
+    }
+
+    $portPart = null;
+    if ($authority[0] === '[') {
+        $end = strpos($authority, ']');
+        if ($end === false || $end <= 1) {
+            return false;
+        }
+        $host = substr($authority, 0, $end + 1);
+        $tail = substr($authority, $end + 1);
+        if ($tail !== '') {
+            if ($tail[0] !== ':') {
+                return false;
+            }
+            $portPart = substr($tail, 1);
+        }
+    } else {
+        $colon = strpos($authority, ':');
+        if ($colon !== false) {
+            $host = substr($authority, 0, $colon);
+            $portPart = substr($authority, $colon + 1);
+        } else {
+            $host = $authority;
+        }
+    }
+
+    if ($host === '') {
+        return false;
+    }
+    if ($portPart !== null) {
+        if ($portPart === '' || strlen($portPart) > 5 || !ctype_digit($portPart) || (int)$portPart > 65535) {
+            return false;
+        }
+    }
+
+    if ($isHttps) {
+        return true;
+    }
+    return in_array(strtolower($host), ['127.0.0.1', 'localhost', '[::1]'], true);
 }
 
 function build_revocation_canonical_message(array $notice) {
@@ -524,6 +571,22 @@ if ($stateNeedsSave) {
     save_state($stateFile, $state);
 }
 
+function sync_rate_limit_ip_key(string $rawIp): string {
+    $packed = @inet_pton($rawIp);
+    if ($packed === false || strlen($packed) !== 16) {
+        return $rawIp;
+    }
+    if (substr($packed, 0, 12) === "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff") {
+        $v4 = @inet_ntop(substr($packed, 12, 4));
+        return $v4 !== false ? $v4 : $rawIp;
+    }
+    if ($packed === "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01") {
+        return '::1';
+    }
+    $masked = @inet_ntop(substr($packed, 0, 8) . str_repeat("\0", 8));
+    return $masked !== false ? $masked : $rawIp;
+}
+
 // 1-Inode IP rate limiter file
 $rlFp = null;
 $ipBucketIdx = 0;
@@ -542,7 +605,8 @@ if (!$disableRateLimit) {
         fflush($rlFp);
     }
 
-    $clientIp = isset($_SERVER['REMOTE_ADDR']) ? (string)$_SERVER['REMOTE_ADDR'] : '127.0.0.1';
+    $rawClientIp = isset($_SERVER['REMOTE_ADDR']) ? (string)$_SERVER['REMOTE_ADDR'] : '127.0.0.1';
+    $clientIp = sync_rate_limit_ip_key($rawClientIp);
     $ipHash = hash_hmac('sha256', $clientIp, gmdate('Y-m-d') . '|' . $state['pepper'], true);
     $ipBucketIdx = unpack('V', substr($ipHash, 0, 4))[1] & 4095;
     $ipBucketTag = unpack('V', substr($ipHash, 4, 4))[1];
@@ -1164,18 +1228,20 @@ if ($method === 'PUT' && isset($_GET['members']) && empty(array_diff(array_keys(
 
     // Prune slots for this channel if pubkey is no longer a member (lock channel never prunes lock files)
     if ($channel !== 'lock') {
-        $memberSet = array_flip($newMemberPubkeys);
-        $existingSlots = glob($dataDir . DIRECTORY_SEPARATOR . '*.' . $channel . '.bin');
-        if ($existingSlots !== false) {
-            foreach ($existingSlots as $sFile) {
-                $bName = basename($sFile);
-                $parsed = parse_slot_filename($bName);
-                if ($parsed !== null && $parsed['channel'] === $channel) {
-                    if (!isset($memberSet[$parsed['id']])) {
-                        $sz = filesize($sFile);
-                        @unlink($sFile);
-                        if ($sz !== false) {
-                            $state['used_bytes'] = max(0, $state['used_bytes'] - $sz);
+        if ($channel !== 'media') {
+            $memberSet = array_flip($newMemberPubkeys);
+            $existingSlots = glob($dataDir . DIRECTORY_SEPARATOR . '*.' . $channel . '.bin');
+            if ($existingSlots !== false) {
+                foreach ($existingSlots as $sFile) {
+                    $bName = basename($sFile);
+                    $parsed = parse_slot_filename($bName);
+                    if ($parsed !== null && $parsed['channel'] === $channel) {
+                        if (!isset($memberSet[$parsed['id']])) {
+                            $sz = filesize($sFile);
+                            @unlink($sFile);
+                            if ($sz !== false) {
+                                $state['used_bytes'] = max(0, $state['used_bytes'] - $sz);
+                            }
                         }
                     }
                 }
@@ -1255,14 +1321,17 @@ if ($method === 'PUT' && isset($_GET['revoke']) && count($_GET) === 1) {
     if ($bodyData === null && trim($rawInput) !== 'null') {
         sync_save_and_respond(400, $lockFp, $stateFile, $state, 'Bad Request: Invalid revocation JSON', $commonHeaders);
     }
+    if ($bodyData !== null && (!is_array($bodyData) || ($bodyData !== [] && array_is_list($bodyData)))) {
+        sync_save_and_respond(400, $lockFp, $stateFile, $state, 'Bad Request: Invalid revocation payload', $commonHeaders);
+    }
 
     $revocationFile = $dataDir . DIRECTORY_SEPARATOR . 'revocation.json';
 
     // Clear revocation when payload is null or effective_at is null/0 or clear=true or revoked=false
     $shouldClear = ($bodyData === null)
-        || (is_array($bodyData) && !empty($bodyData['clear']))
-        || (is_array($bodyData) && array_key_exists('revoked', $bodyData) && $bodyData['revoked'] === false)
-        || (is_array($bodyData) && (!isset($bodyData['effective_at']) || $bodyData['effective_at'] === null || $bodyData['effective_at'] === 0));
+        || (isset($bodyData['clear']) && $bodyData['clear'] === true)
+        || (array_key_exists('revoked', $bodyData) && $bodyData['revoked'] === false)
+        || (!isset($bodyData['effective_at']) || $bodyData['effective_at'] === null || $bodyData['effective_at'] === 0);
     if ($shouldClear) {
         $state['revocation'] = null;
         if (file_exists($revocationFile)) {
@@ -1325,9 +1394,15 @@ if ($method === 'PUT' && isset($_GET['revoke']) && count($_GET) === 1) {
         list($ownWriteUrl, $ownReadUrl) = resolve_own_sync_urls($config, $dataDirSetting);
         $normOwnWrite = strtolower(rtrim($ownWriteUrl, '/'));
         $normOwnRead = strtolower(rtrim($ownReadUrl, '/'));
+        $ownTargets = [$normOwnWrite, $normOwnRead];
+        if (str_ends_with($normOwnWrite, '/sync.php')) {
+            $ownTargets[] = substr($normOwnWrite, 0, -4);
+        } elseif (str_ends_with($normOwnWrite, '/sync')) {
+            $ownTargets[] = $normOwnWrite . '.php';
+        }
         $normRepWrite = strtolower(rtrim($repWrite, '/'));
         $normRepRead = strtolower(rtrim($repRead, '/'));
-        if ($normRepWrite === $normOwnWrite || $normRepRead === $normOwnRead || $normRepWrite === $normOwnRead || $normRepRead === $normOwnWrite) {
+        if (in_array($normRepWrite, $ownTargets, true) || in_array($normRepRead, $ownTargets, true)) {
             sync_save_and_respond(400, $lockFp, $stateFile, $state, 'Bad Request: Self-redirect replacement is not allowed', $commonHeaders);
         }
         $replacement = [
@@ -1435,7 +1510,7 @@ if ($method === 'PUT' && isset($_GET['admin_config']) && count($_GET) === 1) {
     ];
     $maxTotalStorageMb = $reqTotalMb;
     $maxTotalBytes     = $maxTotalStorageMb * 1024 * 1024;
-    $softLimitBytes    = (int)floor($maxTotalBytes * 0.8);
+    $softLimitBytes    = (int)floor($maxTotalBytes * ($softWarningPct / 100.0));
     $maxMembers        = $reqMembers;
     $maxUserStorageMb  = $reqUserMb;
     $maxUserBytesLimit = $maxUserStorageMb * 1024 * 1024;
@@ -1956,16 +2031,19 @@ if ($method === 'DELETE' && empty($_GET)) {
         }
 
         if (!$isMember) {
-            $ownsAny = false;
-            if (isset($state['media_blobs']) && is_array($state['media_blobs'])) {
+            $ownsRequested = false;
+            if ($mediaId !== '') {
+                $ownsRequested = isset($state['media_blobs'][$mediaId]['owner'])
+                    && $state['media_blobs'][$mediaId]['owner'] === $pubkey;
+            } elseif (isset($state['media_blobs']) && is_array($state['media_blobs'])) {
                 foreach ($state['media_blobs'] as $mInfo) {
                     if (isset($mInfo['owner']) && $mInfo['owner'] === $pubkey) {
-                        $ownsAny = true;
+                        $ownsRequested = true;
                         break;
                     }
                 }
             }
-            if (!$ownsAny) {
+            if (!$ownsRequested) {
                 sync_fail_ip_and_respond(403, $lockFp, 'Forbidden', $commonHeaders);
             }
         }

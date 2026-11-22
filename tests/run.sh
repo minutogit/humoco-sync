@@ -1351,6 +1351,175 @@ EOF
   assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${dd_port}/sync.php?info")" "500" "SYNC-S06-06: data_dir='.' rejected with 500"
   kill "$dd_pid" 2>/dev/null || true
   wait "$dd_pid" 2>/dev/null || true
+
+  # 9) S06 ReCheck Cluster 1: PUT ?members&channel=media preservation (SYNC-S06-08) & single DELETE media 403 (SYNC-S06-09)
+  local c4_dir="$s06_dir/c4"
+  mkdir -p "$c4_dir"
+  cp "${ROOT_DIR}/php/sync.php" "${ROOT_DIR}/php/lock_handler.php" "${ROOT_DIR}/php/lock_rotation.php" "${ROOT_DIR}/php/index.html" "${ROOT_DIR}/php/robots.txt" "$c4_dir/"
+  cat > "$c4_dir/config.php" <<EOF
+<?php
+return [
+    'admin_pubkey' => '${s_admin_pk}',
+    'data_dir' => 'humoco_sync_data',
+    'max_members' => 300,
+    'max_total_storage_mb' => 64,
+    'max_user_storage_mb' => 25,
+    'soft_warning_percent' => 50,
+    'disable_rate_limit' => true,
+    'channels' => [
+        'card'   => ['max_bytes' => 524288, 'ttl_days' => 30],
+        'media'  => ['max_bytes' => 524288, 'max_user_count' => 12, 'max_user_bytes' => 6291456, 'max_channel_mb' => 32, 'ttl_days' => 90],
+    ],
+    'lock' => ['enabled' => true],
+];
+EOF
+  local c4_port
+  c4_port="$(pick_free_port 18970)"
+  PHP_CLI_SERVER_WORKERS=2 php -d opcache.enable=0 -S "127.0.0.1:${c4_port}" -t "$c4_dir" "$c4_dir/sync.php" > "$s06_dir/c4.log" 2>&1 &
+  local c4_pid=$!
+  for _ in $(seq 1 40); do
+    if curl -sf "http://127.0.0.1:${c4_port}/sync.php?info" >/dev/null 2>&1; then break; fi
+    sleep 0.1
+  done
+  local c4_ep="http://127.0.0.1:${c4_port}/sync.php"
+  local c4_data="http://127.0.0.1:${c4_port}/humoco_sync_data"
+
+  printf '{"pubkeys":["%s","%s"]}' "$s_mem_pk" "$s_mem2_pk" > "$s06_dir/c4_mem2.json"
+  ts="$(date +%s)"; nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-admin --sk "$s_admin_sk" --action PUT_MEMBERS --channel media --ts "$ts" --nonce "$nonce" --body-file "$s06_dir/c4_mem2.json")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "X-Drop-Pubkey: $s_admin_pk" -H "X-Drop-Timestamp: $ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig" --data-binary "@$s06_dir/c4_mem2.json" "${c4_ep}?members&channel=media")" "200" "SYNC-S06-08: authorize two media members"
+
+  printf 'keep-member-media' > "$s06_dir/c4_keep.bin"
+  printf 'drop-member-media' > "$s06_dir/c4_drop.bin"
+  local c4_keep_id c4_drop_id
+  c4_keep_id="$(sha256_file_hex "$s06_dir/c4_keep.bin")"
+  c4_drop_id="$(sha256_file_hex "$s06_dir/c4_drop.bin")"
+
+  ts="$(date +%s)"; nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-member --sk "$s_mem_sk" --method PUT --channel media --media-id "$c4_keep_id" --ts "$ts" --nonce "$nonce" --body-file "$s06_dir/c4_keep.bin")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "X-Drop-Pubkey: $s_mem_pk" -H "X-Channel: media" -H "X-Media-Id: $c4_keep_id" -H "X-Drop-Timestamp: $ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig" --data-binary "@$s06_dir/c4_keep.bin" "${c4_ep}")" "200" "SYNC-S06-08: mem1 uploads media"
+
+  ts="$(date +%s)"; nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-member --sk "$s_mem2_sk" --method PUT --channel media --media-id "$c4_drop_id" --ts "$ts" --nonce "$nonce" --body-file "$s06_dir/c4_drop.bin")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "X-Drop-Pubkey: $s_mem2_pk" -H "X-Channel: media" -H "X-Media-Id: $c4_drop_id" -H "X-Drop-Timestamp: $ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig" --data-binary "@$s06_dir/c4_drop.bin" "${c4_ep}")" "200" "SYNC-S06-08: mem2 uploads media"
+
+  # Retain mem1 and drop mem2 via PUT ?members&channel=media -> mem1 media MUST survive, mem2 pruned!
+  printf '{"pubkeys":["%s"]}' "$s_mem_pk" > "$s06_dir/c4_mem1.json"
+  ts="$(date +%s)"; nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-admin --sk "$s_admin_sk" --action PUT_MEMBERS --channel media --ts "$ts" --nonce "$nonce" --body-file "$s06_dir/c4_mem1.json")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "X-Drop-Pubkey: $s_admin_pk" -H "X-Drop-Timestamp: $ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig" --data-binary "@$s06_dir/c4_mem1.json" "${c4_ep}?members&channel=media")" "200" "SYNC-S06-08: update media members retaining mem1"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "${c4_data}/${c4_keep_id}.media.bin")" "200" "SYNC-S06-08: retained media member keeps media blob after PUT ?members&channel=media"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "${c4_data}/${c4_drop_id}.media.bin")" "404" "SYNC-S06-08: removed media member blob pruned (404)"
+
+  # SYNC-S06-09: Unauthorized caller owning leftover blob M1 gets 403 on DELETE single non-existent M2 (200 on M1)
+  local c4_missing_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  php -r '
+    $mf = $argv[1] . "/members.media.php";
+    file_put_contents($mf, "<?php __halt_compiler(); ?>\n" . json_encode(["pubkeys" => []]));
+  ' "$c4_dir"
+  ts="$(date +%s)"; nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-member --sk "$s_mem_sk" --method DELETE --channel media --media-id "$c4_missing_id" --ts "$ts" --nonce "$nonce")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -H "X-Drop-Pubkey: $s_mem_pk" -H "X-Channel: media" -H "X-Media-Id: $c4_missing_id" -H "X-Drop-Timestamp: $ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig" "${c4_ep}")" "403" "SYNC-S06-09: unauthorized DELETE single non-existent media returns 403 even when caller owns another blob"
+
+  ts="$(date +%s)"; nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-member --sk "$s_mem_sk" --method DELETE --channel media --media-id "$c4_keep_id" --ts "$ts" --nonce "$nonce")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -H "X-Drop-Pubkey: $s_mem_pk" -H "X-Channel: media" -H "X-Media-Id: $c4_keep_id" -H "X-Drop-Timestamp: $ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig" "${c4_ep}")" "200" "SYNC-S06-09: unauthorized owner can still delete own leftover media blob"
+
+  # SYNC-S06-10: PUT ?revoke URL credential, bracket/port, /sync self-redirect & clear type safety
+  php -r '
+    $adminSkHex = $argv[1]; $adminPkHex = $argv[2]; $outDir = $argv[3]; $c4Port = $argv[4];
+    $sk = hex2bin($adminSkHex) . hex2bin($adminPkHex);
+    $ts = time();
+    $mk = function($rw, $rr) use ($sk, $adminPkHex, $ts) {
+      $msg = "HUMOCO-DROP-REVOKE-V1\n" . strtolower($adminPkHex) . "\n{$ts}\n" . ($ts + 60) . "\n{$rw}\n{$rr}\n" . strtolower($adminPkHex) . "\nmove";
+      $sig = bin2hex(sodium_crypto_sign_detached($msg, $sk));
+      return json_encode(["drop_pub" => $adminPkHex, "issued_at" => $ts, "effective_at" => $ts + 60, "reason" => "move", "replacement" => ["write_url" => $rw, "read_url" => $rr, "drop_pub" => $adminPkHex], "signature" => $sig], JSON_UNESCAPED_SLASHES);
+    };
+    file_put_contents("$outDir/c4_rev_creds.json", $mk("https://user:pass@evil.example/sync.php", "https://new.example/data"));
+    file_put_contents("$outDir/c4_rev_at.json", $mk("https://@evil.example/sync.php", "https://new.example/data"));
+    file_put_contents("$outDir/c4_rev_v6bad.json", $mk("https://[::1/sync.php", "https://new.example/data"));
+    file_put_contents("$outDir/c4_rev_portbad.json", $mk("http://localhost:99999/sync.php", "https://new.example/data"));
+    file_put_contents("$outDir/c4_rev_selfclean.json", $mk("http://127.0.0.1:{$c4Port}/sync", "https://new.example/data"));
+    file_put_contents("$outDir/c4_rev_ok_at_path.json", $mk("https://new.example/sync.php?tag=a@b", "https://new.example/data"));
+  ' "$s_admin_sk" "$s_admin_pk" "$s06_dir" "$c4_port"
+
+  for bad_rev in c4_rev_creds.json c4_rev_at.json c4_rev_v6bad.json c4_rev_portbad.json c4_rev_selfclean.json; do
+    ts="$(date +%s)"; nonce="$(rand_nonce)"
+    sig="$("$helper_bin" sign-test sign-admin --sk "$s_admin_sk" --action PUT_REVOKE --ts "$ts" --nonce "$nonce" --body-file "$s06_dir/$bad_rev")"
+    assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "X-Drop-Pubkey: $s_admin_pk" -H "X-Drop-Timestamp: $ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig" --data-binary "@$s06_dir/$bad_rev" "${c4_ep}?revoke")" "400" "SYNC-S06-10: PUT ?revoke rejects $bad_rev with 400"
+  done
+
+  # Non-object sequential list [1,2] and string clear="false" must be rejected (400), not clear revocation
+  printf '[1,2]' > "$s06_dir/c4_rev_list.json"
+  ts="$(date +%s)"; nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-admin --sk "$s_admin_sk" --action PUT_REVOKE --ts "$ts" --nonce "$nonce" --body-file "$s06_dir/c4_rev_list.json")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "X-Drop-Pubkey: $s_admin_pk" -H "X-Drop-Timestamp: $ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig" --data-binary "@$s06_dir/c4_rev_list.json" "${c4_ep}?revoke")" "400" "SYNC-S06-10: PUT ?revoke rejects sequential array [1,2] with 400"
+
+  printf '{"clear":"false","effective_at":123}' > "$s06_dir/c4_rev_strclear.json"
+  ts="$(date +%s)"; nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-admin --sk "$s_admin_sk" --action PUT_REVOKE --ts "$ts" --nonce "$nonce" --body-file "$s06_dir/c4_rev_strclear.json")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "X-Drop-Pubkey: $s_admin_pk" -H "X-Drop-Timestamp: $ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig" --data-binary "@$s06_dir/c4_rev_strclear.json" "${c4_ep}?revoke")" "400" "SYNC-S06-10: PUT ?revoke rejects non-bool clear=\"false\" with 400"
+
+  ts="$(date +%s)"; nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-admin --sk "$s_admin_sk" --action PUT_REVOKE --ts "$ts" --nonce "$nonce" --body-file "$s06_dir/c4_rev_ok_at_path.json")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "X-Drop-Pubkey: $s_admin_pk" -H "X-Drop-Timestamp: $ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig" --data-binary "@$s06_dir/c4_rev_ok_at_path.json" "${c4_ep}?revoke")" "200" "SYNC-S06-10: PUT ?revoke allows @ in query/path while rejecting authority credentials"
+
+  # SYNC-S06-11: PUT ?admin_config must honor configured soft_warning_percent (50%)
+  printf '{"max_total_storage_mb":100,"max_members":10,"max_user_storage_mb":10}' > "$s06_dir/c4_admin_cfg.json"
+  ts="$(date +%s)"; nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-admin --sk "$s_admin_sk" --action PUT_ADMIN_CONFIG --ts "$ts" --nonce "$nonce" --body-file "$s06_dir/c4_admin_cfg.json")"
+  local c4_adm_resp
+  c4_adm_resp="$(curl -sf -X PUT -H "X-Drop-Pubkey: $s_admin_pk" -H "X-Drop-Timestamp: $ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig" --data-binary "@$s06_dir/c4_admin_cfg.json" "${c4_ep}?admin_config")"
+  assert_contains "$c4_adm_resp" '"soft_limit_bytes":52428800' "SYNC-S06-11: PUT ?admin_config honors soft_warning_percent=50 (50 MiB)"
+
+  kill "$c4_pid" 2>/dev/null || true
+  wait "$c4_pid" 2>/dev/null || true
+
+  # SYNC-S06-12: IPv6 /64 rate-limit grouping & IPv4-mapped IPv6 normalization
+  local rl6_dir="$s06_dir/rl6"
+  mkdir -p "$rl6_dir"
+  cp "${ROOT_DIR}/php/sync.php" "${ROOT_DIR}/php/lock_handler.php" "${ROOT_DIR}/php/lock_rotation.php" "${ROOT_DIR}/php/index.html" "${ROOT_DIR}/php/robots.txt" "$rl6_dir/"
+  cat > "$rl6_dir/config.php" <<EOF
+<?php
+return [
+    'admin_pubkey' => '${s_admin_pk}',
+    'data_dir' => 'humoco_sync_data',
+    'max_members' => 300,
+    'max_total_storage_mb' => 64,
+    'disable_rate_limit' => false,
+    'channels' => ['card' => ['max_bytes' => 524288, 'ttl_days' => 30]],
+    'lock' => ['enabled' => true],
+];
+EOF
+  cat > "$rl6_dir/test_router.php" <<'EOF'
+<?php
+if (isset($_SERVER['HTTP_X_TEST_REMOTE_ADDR'])) {
+    $_SERVER['REMOTE_ADDR'] = (string)$_SERVER['HTTP_X_TEST_REMOTE_ADDR'];
+}
+require __DIR__ . '/sync.php';
+EOF
+  local rl6_port
+  rl6_port="$(pick_free_port 18980)"
+  PHP_CLI_SERVER_WORKERS=1 php -d opcache.enable=0 -S "127.0.0.1:${rl6_port}" -t "$rl6_dir" "$rl6_dir/test_router.php" > "$s06_dir/rl6.log" 2>&1 &
+  local rl6_pid=$!
+  for _ in $(seq 1 40); do
+    if curl -sf -H "X-Test-Remote-Addr: 127.0.0.1" "http://127.0.0.1:${rl6_port}/sync.php?info" >/dev/null 2>&1; then break; fi
+    sleep 0.1
+  done
+
+  for _ in $(seq 1 30); do
+    curl -s -o /dev/null -H "X-Test-Remote-Addr: 2001:db8:abcd:1234::1" "http://127.0.0.1:${rl6_port}/sync.php?info"
+  done
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -H "X-Test-Remote-Addr: 2001:db8:abcd:1234:dead:beef::99" "http://127.0.0.1:${rl6_port}/sync.php?info")" "429" "SYNC-S06-12: IPv6 /64 shares rate-limit bucket across interface IDs"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -H "X-Test-Remote-Addr: ::1" "http://127.0.0.1:${rl6_port}/sync.php?info")" "200" "SYNC-S06-12: ::1 loopback stays isolated from non-loopback IPv6"
+
+  for _ in $(seq 1 30); do
+    curl -s -o /dev/null -H "X-Test-Remote-Addr: 203.0.113.7" "http://127.0.0.1:${rl6_port}/sync.php?info"
+  done
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -H "X-Test-Remote-Addr: ::ffff:203.0.113.7" "http://127.0.0.1:${rl6_port}/sync.php?info")" "429" "SYNC-S06-12: IPv4-mapped IPv6 shares rate-limit bucket with IPv4"
+
+  kill "$rl6_pid" 2>/dev/null || true
+  wait "$rl6_pid" 2>/dev/null || true
 }
 
 echo "Building humoco-sync-server binary (offline)..."
