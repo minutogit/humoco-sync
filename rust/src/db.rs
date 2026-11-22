@@ -910,10 +910,23 @@ impl SyncDb {
             }
         }
 
+        let is_lock_server_admin = cfg.lock.enabled
+            && !cfg.server.admin_pubkey.is_empty()
+            && pubkey == cfg.server.admin_pubkey;
+
         let Some(access) = access else {
+            let allowed_channels = if is_lock_server_admin {
+                vec!["lock".to_string()]
+            } else {
+                Vec::new()
+            };
+            let authorized = match channel {
+                Some(ch) => allowed_channels.iter().any(|allowed| allowed == ch),
+                None => !allowed_channels.is_empty(),
+            };
             return Ok(HeadCapability {
-                authorized: false,
-                allowed_channels: Vec::new(),
+                authorized,
+                allowed_channels,
                 channel_max_bytes: None,
                 channel_ttl_days: None,
                 slot_etag: None,
@@ -927,12 +940,14 @@ impl SyncDb {
 
         let allowed_channels: Vec<String> = ADMIN_MEMBER_CHANNELS
             .iter()
-            .filter(|ch| access.allowed_channels.contains(**ch))
+            .filter(|ch| {
+                access.allowed_channels.contains(**ch) || (**ch == "lock" && is_lock_server_admin)
+            })
             .map(|s| s.to_string())
             .collect();
 
         let requested_authorized = match channel {
-            Some(ch) => access.allowed_channels.contains(ch),
+            Some(ch) => allowed_channels.iter().any(|allowed| allowed == ch),
             None => !allowed_channels.is_empty(),
         };
 

@@ -400,7 +400,7 @@ IFS=$'\t' read -r _ G_P50 _ G_P99 <<< "$GET_STATS"
 IFS=$'\t' read -r _ C_P50 _ C_P99 <<< "$RACE_STATS"
 
 OVERALL="PASS"
-if [[ "$ALL_PASSED" != "true" || "$KEY_LEAK_SAFE" != PASS* || "$RACE_OK" -ne 1 || "$RACE_ERR" -ne 0 || "$WRITE_OK" -ne "$SAMPLES" || "$GET_OK" -ne "$SAMPLES" ]]; then
+if [[ "$ALL_PASSED" != "true" || "$KEY_LEAK_SAFE" != PASS* || "$HEAD_CODE" != "200" || "$DELEGATE_RESULT" == FAIL* || "$PROBE_PASS" -ne "$SAMPLES" || "$RACE_OK" -ne 1 || "$RACE_ERR" -ne 0 || "$WRITE_OK" -ne "$SAMPLES" || "$RETRY_OK" -ne "$SAMPLES" || "$GET_OK" -ne "$SAMPLES" ]]; then
   OVERALL="FAIL"
 fi
 

@@ -11931,3 +11931,1725 @@ async fn test_s09_f3_cold_self_frozen_pre_freeze_no_leak_and_schema_400_parity()
         .unwrap();
     assert_eq!(r_fin_map.status().as_u16(), 400);
 }
+
+#[tokio::test]
+async fn test_s09_f4_hybrid_head_pool_grace_suspended_and_codes_parity() {
+    use humoco_sync_server::db::AccountStatus;
+
+    let (admin_sk, admin_pk) = gen_keypair();
+    let (friend_sk, friend_pk) = gen_keypair();
+    let (free_sk, free_pk) = gen_keypair();
+    let (_pro_sk, pro_pk) = gen_keypair();
+    let (grace_sk, grace_pk) = gen_keypair();
+    let (post_grace_sk, post_grace_pk) = gen_keypair();
+    let (susp_sk, susp_pk) = gen_keypair();
+    let (_outsider_sk, outsider_pk) = gen_keypair();
+
+    let mut cfg = base_hybrid_config(&admin_pk);
+    cfg.lock.enabled = true;
+    cfg.storage.downgrade_grace_days = 7;
+    cfg.storage.max_total_storage_mb = 32;
+    cfg.storage.max_free_pool_mb = 16;
+    let srv = TestServer::start(cfg).await;
+    let now = unix_now();
+    let ts = now as i64;
+
+    // 1. SYNC-S09-13: configured server admin_pubkey (not in ADMIN_MEMBERS) MUST receive
+    //    X-Drop-Authorized: true and X-Drop-Channels: lock on HEAD with X-Channel: lock or omitted X-Channel.
+    let head_admin_lock = srv
+        .client
+        .head(format!("{}/sync.php", srv.base_url))
+        .header("X-Drop-Pubkey", &admin_pk)
+        .header("X-Channel", "lock")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head_admin_lock.status().as_u16(), 200);
+    assert_eq!(
+        head_admin_lock
+            .headers()
+            .get("x-drop-authorized")
+            .and_then(|v| v.to_str().ok()),
+        Some("true"),
+        "admin_pubkey must be authorized for lock channel on HEAD"
+    );
+    assert_eq!(
+        head_admin_lock
+            .headers()
+            .get("x-drop-channels")
+            .and_then(|v| v.to_str().ok()),
+        Some("lock")
+    );
+    assert!(head_admin_lock.headers().get("x-slot-occupied").is_none());
+    assert!(head_admin_lock
+        .headers()
+        .get("x-channel-max-bytes")
+        .is_none());
+
+    let head_admin_any = srv
+        .client
+        .head(format!("{}/sync.php", srv.base_url))
+        .header("X-Drop-Pubkey", &admin_pk)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head_admin_any.status().as_u16(), 200);
+    assert_eq!(
+        head_admin_any
+            .headers()
+            .get("x-drop-authorized")
+            .and_then(|v| v.to_str().ok()),
+        Some("true")
+    );
+    assert_eq!(
+        head_admin_any
+            .headers()
+            .get("x-drop-channels")
+            .and_then(|v| v.to_str().ok()),
+        Some("lock")
+    );
+
+    let head_admin_card = srv
+        .client
+        .head(format!("{}/sync.php", srv.base_url))
+        .header("X-Drop-Pubkey", &admin_pk)
+        .header("X-Channel", "card")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head_admin_card.status().as_u16(), 200);
+    assert_eq!(
+        head_admin_card
+            .headers()
+            .get("x-drop-authorized")
+            .and_then(|v| v.to_str().ok()),
+        Some("false")
+    );
+    assert_eq!(
+        head_admin_card
+            .headers()
+            .get("x-drop-channels")
+            .and_then(|v| v.to_str().ok()),
+        Some("lock")
+    );
+
+    // 2. Hybrid admin_app vs registered isolation + PUT ?members&channel=media + index.json exclusion
+    let members_card = serde_json::to_vec(&serde_json::json!({ "pubkeys": [friend_pk] })).unwrap();
+    let nonce_m1 = random_hex(16);
+    let sig_m1 = hex::encode(
+        admin_sk
+            .sign(
+                format_admin_put_members_message("card", ts, &nonce_m1, &sha256_hex(&members_card))
+                    .as_bytes(),
+            )
+            .to_bytes(),
+    );
+    assert_eq!(
+        srv.client
+            .put(format!("{}/sync.php?members&channel=card", srv.base_url))
+            .header("X-Drop-Pubkey", &admin_pk)
+            .header("X-Drop-Timestamp", ts.to_string())
+            .header("X-Drop-Nonce", nonce_m1)
+            .header("X-Drop-Signature", sig_m1)
+            .body(members_card)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        200
+    );
+
+    // Friend uploads card slot + media (before explicit media list -> inherits card fallback)
+    let card_blob = b"friend-hybrid-card-blob".to_vec();
+    let mut req = srv
+        .client
+        .put(format!("{}/sync.php", srv.base_url))
+        .body(card_blob.clone());
+    for (k, v) in sign_member_headers(&friend_sk, "PUT", "card", "", "", ts, &card_blob) {
+        req = req.header(k, v);
+    }
+    assert_eq!(req.send().await.unwrap().status().as_u16(), 200);
+
+    // Unauthorized outsider HEAD must return 200 X-Drop-Authorized: false without oracle leaks
+    let head_unauth = srv
+        .client
+        .head(format!("{}/sync.php", srv.base_url))
+        .header("X-Drop-Pubkey", &outsider_pk)
+        .header("X-Channel", "card")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head_unauth.status().as_u16(), 200);
+    assert_eq!(
+        head_unauth
+            .headers()
+            .get("x-drop-authorized")
+            .and_then(|v| v.to_str().ok()),
+        Some("false")
+    );
+    assert!(head_unauth.headers().get("x-drop-channels").is_none());
+    assert!(head_unauth.headers().get("x-slot-occupied").is_none());
+    assert!(head_unauth.headers().get("etag").is_none());
+    assert!(head_unauth.headers().get("x-channel-max-bytes").is_none());
+
+    let friend_media_id = sha256_hex(b"friend-media-item");
+    let friend_media_blob = b"friend-media-payload".to_vec();
+    let mut req = srv
+        .client
+        .put(format!("{}/sync.php", srv.base_url))
+        .body(friend_media_blob.clone());
+    for (k, v) in sign_member_headers(
+        &friend_sk,
+        "PUT",
+        "media",
+        "",
+        &friend_media_id,
+        ts,
+        &friend_media_blob,
+    ) {
+        req = req.header(k, v);
+    }
+    assert_eq!(req.send().await.unwrap().status().as_u16(), 200);
+
+    // Public registered free user uploads wot slot + media blob
+    srv.state
+        .db
+        .register_or_upgrade_user(&srv.state.config, &free_pk, "free", None, None, "open", now)
+        .unwrap();
+    let free_wot_blob = b"registered-free-wot".to_vec();
+    let mut req = srv
+        .client
+        .put(format!("{}/sync.php", srv.base_url))
+        .body(free_wot_blob.clone());
+    for (k, v) in sign_member_headers(&free_sk, "PUT", "wot", "", "", ts, &free_wot_blob) {
+        req = req.header(k, v);
+    }
+    assert_eq!(req.send().await.unwrap().status().as_u16(), 200);
+
+    let free_media_id = sha256_hex(b"free-media-item");
+    let free_media_blob = b"free-media-payload".to_vec();
+    let mut req = srv
+        .client
+        .put(format!("{}/sync.php", srv.base_url))
+        .body(free_media_blob.clone());
+    for (k, v) in sign_member_headers(
+        &free_sk,
+        "PUT",
+        "media",
+        "",
+        &free_media_id,
+        ts,
+        &free_media_blob,
+    ) {
+        req = req.header(k, v);
+    }
+    assert_eq!(req.send().await.unwrap().status().as_u16(), 200);
+
+    // PUT ?members&channel=media with [] revokes admin_app media access & prunes friend media,
+    // while keeping friend card slot AND registered free user's media untouched.
+    assert_eq!(
+        srv.client
+            .get(format!(
+                "{}/humoco_sync_data/{}.media.bin",
+                srv.base_url, friend_media_id
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        200,
+        "friend media must be downloadable before pruning"
+    );
+    let empty_media = br#"{"pubkeys":[]}"#.to_vec();
+    let nonce_m2 = random_hex(16);
+    let sig_m2 = hex::encode(
+        admin_sk
+            .sign(
+                format_admin_put_members_message("media", ts, &nonce_m2, &sha256_hex(&empty_media))
+                    .as_bytes(),
+            )
+            .to_bytes(),
+    );
+    assert_eq!(
+        srv.client
+            .put(format!("{}/sync.php?members&channel=media", srv.base_url))
+            .header("X-Drop-Pubkey", &admin_pk)
+            .header("X-Drop-Timestamp", ts.to_string())
+            .header("X-Drop-Nonce", nonce_m2)
+            .header("X-Drop-Signature", sig_m2)
+            .body(empty_media)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        200
+    );
+    assert_eq!(
+        srv.client
+            .get(format!(
+                "{}/humoco_sync_data/{}.media.bin",
+                srv.base_url, friend_media_id
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        404,
+        "friend media must be pruned when explicit media admin list removes them"
+    );
+    assert_eq!(
+        srv.client
+            .get(format!(
+                "{}/humoco_sync_data/{}.card.bin",
+                srv.base_url, friend_pk
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        200,
+        "friend card slot must survive media list pruning"
+    );
+    let mut req = srv
+        .client
+        .put(format!("{}/sync.php", srv.base_url))
+        .body(friend_media_blob.clone());
+    for (k, v) in sign_member_headers(
+        &friend_sk,
+        "PUT",
+        "media",
+        "",
+        &friend_media_id,
+        ts,
+        &friend_media_blob,
+    ) {
+        req = req.header(k, v);
+    }
+    assert_eq!(req.send().await.unwrap().status().as_u16(), 403);
+
+    // Registered public user keeps media access and existing blob
+    assert_eq!(
+        srv.client
+            .get(format!(
+                "{}/humoco_sync_data/{}.media.bin",
+                srv.base_url, free_media_id
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        200
+    );
+
+    // index.json must include friend's card slot and exclude registered wot slot & all media blobs
+    let idx_resp = srv
+        .client
+        .get(format!("{}/humoco_sync_data/index.json", srv.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(idx_resp.status().as_u16(), 200);
+    let idx_json: serde_json::Value = idx_resp.json().await.unwrap();
+    let entries = idx_json.as_array().unwrap();
+    assert!(entries
+        .iter()
+        .any(|e| e["id"].as_str() == Some(friend_pk.as_str()) && e["channel"] == "card"));
+    assert!(
+        !entries
+            .iter()
+            .any(|e| e["id"].as_str() == Some(free_pk.as_str()) || e["channel"] == "media"),
+        "index.json must exclude registered users and media blobs: {idx_json}"
+    );
+
+    // 3. Grace period (valid_until + downgrade_grace_days) and post-grace downgrade
+    // grace_sk registered as pro 2 days ago for 1 day -> valid_until = now - 1d (inside 7d grace)
+    srv.state
+        .db
+        .register_or_upgrade_user(
+            &srv.state.config,
+            &grace_pk,
+            "pro",
+            Some("grace@example.org"),
+            Some(1),
+            "admin",
+            now.saturating_sub(2 * 86_400),
+        )
+        .unwrap();
+    let head_grace = srv
+        .client
+        .head(format!("{}/sync.php", srv.base_url))
+        .header("X-Drop-Pubkey", &grace_pk)
+        .header("X-Channel", "card")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        head_grace
+            .headers()
+            .get("x-channel-max-bytes")
+            .and_then(|v| v.to_str().ok()),
+        Some("2097152"),
+        "User inside grace period keeps pro quota on HEAD"
+    );
+    let big_card = vec![0x5Au8; 600 * 1024]; // > free 512 KiB, <= pro 2 MiB
+    let mut req = srv
+        .client
+        .put(format!("{}/sync.php", srv.base_url))
+        .body(big_card.clone());
+    for (k, v) in sign_member_headers(&grace_sk, "PUT", "card", "", "", ts, &big_card) {
+        req = req.header(k, v);
+    }
+    assert_eq!(req.send().await.unwrap().status().as_u16(), 200);
+    let q_ok = humoco_proto::encode_quarter(2030, 4).unwrap();
+    let (grace_tkt_code, _) = fetch_ticket_signed(&srv, &grace_sk, [0x42; 32], q_ok).await;
+    assert_eq!(
+        grace_tkt_code, 403,
+        "Expired user inside grace period must NOT receive new lock tickets"
+    );
+
+    // post_grace_sk registered as pro 9 days ago for 1 day -> valid_until = now - 8d (> 7d grace)
+    srv.state
+        .db
+        .register_or_upgrade_user(
+            &srv.state.config,
+            &post_grace_pk,
+            "pro",
+            Some("Post.Grace+Tag@example.org"),
+            Some(1),
+            "admin",
+            now.saturating_sub(9 * 86_400),
+        )
+        .unwrap();
+    let head_post_grace = srv
+        .client
+        .head(format!("{}/sync.php", srv.base_url))
+        .header("X-Drop-Pubkey", &post_grace_pk)
+        .header("X-Channel", "card")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        head_post_grace
+            .headers()
+            .get("x-channel-max-bytes")
+            .and_then(|v| v.to_str().ok()),
+        Some("524288"),
+        "User past grace period drops immediately to free quota on HEAD"
+    );
+    let mut req = srv
+        .client
+        .put(format!("{}/sync.php", srv.base_url))
+        .body(big_card.clone());
+    for (k, v) in sign_member_headers(&post_grace_sk, "PUT", "card", "", "", ts, &big_card) {
+        req = req.header(k, v);
+    }
+    assert_eq!(req.send().await.unwrap().status().as_u16(), 413);
+    assert_eq!(
+        fetch_ticket_signed(&srv, &post_grace_sk, [0x43; 32], q_ok)
+            .await
+            .0,
+        403
+    );
+
+    // Maintenance finalizes downgrade to free, wipes encrypted_contact_email, preserves email_hmac
+    srv.state
+        .db
+        .run_maintenance(&srv.state.config, now)
+        .unwrap();
+    let post_rec = srv
+        .state
+        .db
+        .get_registered_user(&post_grace_pk)
+        .unwrap()
+        .unwrap();
+    assert_eq!(post_rec.profile, "free");
+    assert!(post_rec.valid_until.is_none());
+    assert!(post_rec.encrypted_contact_email.is_none());
+    assert!(post_rec.email_hmac.is_some());
+
+    // 4. Suspended HTTP matrix (PUT/DELETE/lock_ticket -> 403, HEAD -> authorized=false, DELETE ?account -> 200)
+    srv.state
+        .db
+        .register_or_upgrade_user(&srv.state.config, &susp_pk, "pro", None, None, "admin", now)
+        .unwrap();
+    let susp_slot = b"susp-slot-before-suspend".to_vec();
+    let mut req = srv
+        .client
+        .put(format!("{}/sync.php", srv.base_url))
+        .body(susp_slot.clone());
+    for (k, v) in sign_member_headers(&susp_sk, "PUT", "card", "", "", ts, &susp_slot) {
+        req = req.header(k, v);
+    }
+    assert_eq!(req.send().await.unwrap().status().as_u16(), 200);
+    let susp_media_id = sha256_hex(b"susp-media-before-suspend");
+    let susp_media_blob = b"susp-media-payload".to_vec();
+    let mut req = srv
+        .client
+        .put(format!("{}/sync.php", srv.base_url))
+        .body(susp_media_blob.clone());
+    for (k, v) in sign_member_headers(
+        &susp_sk,
+        "PUT",
+        "media",
+        "",
+        &susp_media_id,
+        ts,
+        &susp_media_blob,
+    ) {
+        req = req.header(k, v);
+    }
+    assert_eq!(req.send().await.unwrap().status().as_u16(), 200);
+
+    srv.state
+        .db
+        .set_user_status(&susp_pk, AccountStatus::Suspended, now)
+        .unwrap();
+
+    let head_susp = srv
+        .client
+        .head(format!("{}/sync.php", srv.base_url))
+        .header("X-Drop-Pubkey", &susp_pk)
+        .header("X-Channel", "card")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head_susp.status().as_u16(), 200);
+    assert_eq!(
+        head_susp
+            .headers()
+            .get("x-drop-authorized")
+            .and_then(|v| v.to_str().ok()),
+        Some("false")
+    );
+    assert!(head_susp.headers().get("x-drop-channels").is_none());
+    assert!(head_susp.headers().get("x-slot-occupied").is_none());
+
+    let mut req = srv
+        .client
+        .put(format!("{}/sync.php", srv.base_url))
+        .body(susp_slot.clone());
+    for (k, v) in sign_member_headers(&susp_sk, "PUT", "card", "", "", ts, &susp_slot) {
+        req = req.header(k, v);
+    }
+    assert_eq!(req.send().await.unwrap().status().as_u16(), 403);
+
+    // Suspended user cannot delete absent/unowned slot (403), CAN delete own leftover slot (200),
+    // and then second DELETE returns 403.
+    let mut req = srv.client.delete(format!("{}/sync.php", srv.base_url));
+    for (k, v) in sign_member_headers(&susp_sk, "DELETE", "wot", "", "", ts, b"") {
+        req = req.header(k, v);
+    }
+    assert_eq!(req.send().await.unwrap().status().as_u16(), 403);
+
+    let mut req = srv.client.delete(format!("{}/sync.php", srv.base_url));
+    for (k, v) in sign_member_headers(&susp_sk, "DELETE", "card", "", "", ts, b"") {
+        req = req.header(k, v);
+    }
+    assert_eq!(req.send().await.unwrap().status().as_u16(), 200);
+
+    let mut req = srv.client.delete(format!("{}/sync.php", srv.base_url));
+    for (k, v) in sign_member_headers(&susp_sk, "DELETE", "card", "", "", ts, b"") {
+        req = req.header(k, v);
+    }
+    assert_eq!(req.send().await.unwrap().status().as_u16(), 403);
+    assert_eq!(
+        fetch_ticket_signed(&srv, &susp_sk, [0x44; 32], q_ok)
+            .await
+            .0,
+        403
+    );
+
+    // Suspended user may still self-delete account via DELETE ?account (wiping remaining media too)
+    let del_nonce = random_hex(16);
+    let del_sig = hex::encode(
+        susp_sk
+            .sign(format_delete_account_message(ts, &del_nonce).as_bytes())
+            .to_bytes(),
+    );
+    let del_resp = srv
+        .client
+        .delete(format!("{}/sync.php?account", srv.base_url))
+        .header("X-Drop-Pubkey", &susp_pk)
+        .header("X-Drop-Timestamp", ts.to_string())
+        .header("X-Drop-Nonce", del_nonce)
+        .header("X-Drop-Signature", del_sig)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del_resp.status().as_u16(), 200);
+    assert_eq!(
+        srv.client
+            .get(format!(
+                "{}/humoco_sync_data/{}.card.bin",
+                srv.base_url, susp_pk
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        404
+    );
+    assert_eq!(
+        srv.client
+            .get(format!(
+                "{}/humoco_sync_data/{}.media.bin",
+                srv.base_url, susp_media_id
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        404
+    );
+
+    // 5. Redeem code expiry (410), max_uses exhaustion (409), 404, 400, and HTTP error handling
+    let past_codes = srv
+        .state
+        .db
+        .create_redeem_codes(
+            &srv.state.config,
+            1,
+            "pro",
+            Some(30),
+            1,
+            Some(1),
+            None,
+            Some("EXP"),
+            now.saturating_sub(2 * 86_400),
+        )
+        .unwrap();
+    let exp_err = srv
+        .state
+        .db
+        .redeem_code_for_pubkey(&srv.state.config, &free_pk, &past_codes[0].code, now)
+        .unwrap_err();
+    assert!(matches!(
+        exp_err,
+        humoco_sync_server::db::DbError::Http { status: 410, .. }
+    ));
+
+    let one_use = srv
+        .state
+        .db
+        .create_redeem_codes(
+            &srv.state.config,
+            1,
+            "pro",
+            Some(30),
+            1,
+            Some(5),
+            None,
+            Some("ONCE"),
+            now,
+        )
+        .unwrap();
+    assert!(srv
+        .state
+        .db
+        .redeem_code_for_pubkey(&srv.state.config, &free_pk, &one_use[0].code, now)
+        .is_ok());
+    let conflict_err = srv
+        .state
+        .db
+        .redeem_code_for_pubkey(&srv.state.config, &pro_pk, &one_use[0].code, now)
+        .unwrap_err();
+    assert!(matches!(
+        conflict_err,
+        humoco_sync_server::db::DbError::Http { status: 409, .. }
+    ));
+    assert!(matches!(
+        srv.state
+            .db
+            .redeem_code_for_pubkey(&srv.state.config, &pro_pk, "NO-SUCH-CODE", now)
+            .unwrap_err(),
+        humoco_sync_server::db::DbError::Http { status: 404, .. }
+    ));
+    assert!(matches!(
+        srv.state
+            .db
+            .redeem_code_for_pubkey(&srv.state.config, &pro_pk, "   ", now)
+            .unwrap_err(),
+        humoco_sync_server::db::DbError::Http { status: 400, .. }
+    ));
+
+    let bad_redeem_http = srv
+        .client
+        .post(format!("{}/register/redeem", srv.base_url))
+        .form(&[
+            ("pubkey", pro_pk.as_str()),
+            ("code", one_use[0].code.as_str()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_redeem_http.status().as_u16(), 303);
+    assert!(bad_redeem_http
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("err="));
+    assert!(srv.state.db.get_registered_user(&pro_pk).unwrap().is_none());
+
+    // 6. Tight Global Storage + Free-Pool Prio-3 eviction matrix
+    let mut cfg_pool = base_hybrid_config(&admin_pk);
+    cfg_pool.storage.max_total_storage_mb = 1; // 1 MiB
+    cfg_pool.storage.max_free_pool_mb = 1; // 1 MiB
+    let srv_pool = TestServer::start(cfg_pool).await;
+    let (pool_free_sk, pool_free_pk) = gen_keypair();
+    let (pool_pro_sk, pool_pro_pk) = gen_keypair();
+    srv_pool
+        .state
+        .db
+        .register_or_upgrade_user(
+            &srv_pool.state.config,
+            &pool_free_pk,
+            "free",
+            None,
+            None,
+            "open",
+            now,
+        )
+        .unwrap();
+    srv_pool
+        .state
+        .db
+        .register_or_upgrade_user(
+            &srv_pool.state.config,
+            &pool_pro_pk,
+            "pro",
+            None,
+            None,
+            "admin",
+            now,
+        )
+        .unwrap();
+
+    let pro_blob1 = vec![0x11u8; 450 * 1024];
+    let pro_id1 = sha256_hex(&pro_blob1);
+    let mut req = srv_pool
+        .client
+        .put(format!("{}/sync.php", srv_pool.base_url))
+        .body(pro_blob1.clone());
+    for (k, v) in sign_member_headers(&pool_pro_sk, "PUT", "media", "", &pro_id1, ts, &pro_blob1) {
+        req = req.header(k, v);
+    }
+    assert_eq!(req.send().await.unwrap().status().as_u16(), 200);
+
+    let free_blob1 = vec![0x22u8; 400 * 1024];
+    let free_id1 = sha256_hex(&free_blob1);
+    let mut req = srv_pool
+        .client
+        .put(format!("{}/sync.php", srv_pool.base_url))
+        .body(free_blob1.clone());
+    for (k, v) in sign_member_headers(
+        &pool_free_sk,
+        "PUT",
+        "media",
+        "",
+        &free_id1,
+        ts,
+        &free_blob1,
+    ) {
+        req = req.header(k, v);
+    }
+    assert_eq!(req.send().await.unwrap().status().as_u16(), 200);
+
+    assert_eq!(
+        srv_pool
+            .client
+            .get(format!(
+                "{}/humoco_sync_data/{}.media.bin",
+                srv_pool.base_url, free_id1
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        200
+    );
+
+    // Pro upload pushes total (450 + 400 + 300 = 1150 KiB) > 1024 KiB -> MUST evict free_blob1 first!
+    let pro_blob2 = vec![0x33u8; 300 * 1024];
+    let pro_id2 = sha256_hex(&pro_blob2);
+    let mut req = srv_pool
+        .client
+        .put(format!("{}/sync.php", srv_pool.base_url))
+        .body(pro_blob2.clone());
+    for (k, v) in sign_member_headers(&pool_pro_sk, "PUT", "media", "", &pro_id2, ts, &pro_blob2) {
+        req = req.header(k, v);
+    }
+    assert_eq!(req.send().await.unwrap().status().as_u16(), 200);
+    assert_eq!(
+        srv_pool
+            .client
+            .get(format!(
+                "{}/humoco_sync_data/{}.media.bin",
+                srv_pool.base_url, free_id1
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        404,
+        "Global Prio-3 eviction must evict free-pool media before paid pro media"
+    );
+    assert_eq!(
+        srv_pool
+            .client
+            .get(format!(
+                "{}/humoco_sync_data/{}.media.bin",
+                srv_pool.base_url, pro_id1
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        200
+    );
+
+    // Free user trying to exceed remaining global space (750 + 350 > 1024 KiB) MUST fail 507
+    // and NEVER evict pro media!
+    let free_blob2 = vec![0x44u8; 350 * 1024];
+    let free_id2 = sha256_hex(&free_blob2);
+    let mut req = srv_pool
+        .client
+        .put(format!("{}/sync.php", srv_pool.base_url))
+        .body(free_blob2.clone());
+    for (k, v) in sign_member_headers(
+        &pool_free_sk,
+        "PUT",
+        "media",
+        "",
+        &free_id2,
+        ts,
+        &free_blob2,
+    ) {
+        req = req.header(k, v);
+    }
+    assert_eq!(req.send().await.unwrap().status().as_u16(), 507);
+    assert_eq!(
+        srv_pool
+            .client
+            .get(format!(
+                "{}/humoco_sync_data/{}.media.bin",
+                srv_pool.base_url, pro_id1
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        200
+    );
+    assert_eq!(
+        srv_pool
+            .client
+            .get(format!(
+                "{}/humoco_sync_data/{}.media.bin",
+                srv_pool.base_url, pro_id2
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        200
+    );
+}
+
+#[tokio::test]
+async fn test_s09_f4_web_register_admin_ui_and_admin_api_hardening() {
+    use humoco_sync_server::crypto::{
+        create_pow_challenge, hash_admin_token, hmac_email, leading_zero_bits,
+        sign_stateless_token, SignedActionToken,
+    };
+    use humoco_sync_server::db::{AccountStatus, AdminUserSummary};
+
+    let (admin_sk, admin_pk) = gen_keypair();
+    let admin_secret = "f4-admin-ui-secret";
+    let bearer_secret = "f4-api-bearer-secret";
+
+    // 1. Disabled public registration & unconfigured admin tokens -> fail closed (403 / 503)
+    let mut cfg_closed = base_hybrid_config(&admin_pk);
+    cfg_closed.mode.enable_public_registration = false;
+    let srv_closed = TestServer::start(cfg_closed).await;
+    assert_eq!(
+        srv_closed
+            .client
+            .get(format!("{}/register", srv_closed.base_url))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        403
+    );
+    let r_confirm_closed = srv_closed
+        .client
+        .get(format!(
+            "{}/register/confirm?token=abc",
+            srv_closed.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_confirm_closed.status().as_u16(), 303);
+    assert_eq!(
+        r_confirm_closed
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok()),
+        Some("/")
+    );
+    assert_eq!(
+        srv_closed
+            .client
+            .get(format!("{}/admin", srv_closed.base_url))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        503
+    );
+    assert_eq!(
+        srv_closed
+            .client
+            .get(format!("{}/api/v1/admin/stats", srv_closed.base_url))
+            .header("Authorization", "Bearer anything")
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        503
+    );
+
+    // 2. Active server with separate admin UI + API bearer tokens, PoW, email log transport, trusted proxy
+    let mut cfg = base_hybrid_config(&admin_pk);
+    cfg.mode.registration_gates = vec![
+        "email".to_string(),
+        "code".to_string(),
+        "pow".to_string(),
+        "open".to_string(),
+    ];
+    cfg.security.pow_difficulty_bits = 8;
+    cfg.security.max_registrations_per_ipv6_48_per_day = 1;
+    cfg.security.max_registrations_per_ipv4_24_per_day = 2;
+    cfg.security.admin_token_hash = hash_admin_token(admin_secret).unwrap();
+    cfg.security.api_bearer_token_hash = hash_admin_token(bearer_secret).unwrap();
+    cfg.server.trusted_proxy_hops = 1;
+    cfg.email.enabled = true;
+    cfg.email.transport = "log".to_string();
+    let srv = TestServer::start(cfg).await;
+    let now = unix_now();
+
+    // 2a. Zero-PII confirm_register ignores embedded contact_email on store_contact_email=false,
+    //     rejects delete_account token on /register/confirm and confirm_register on /register/delete-confirm.
+    let (_e_sk, e_pk) = gen_keypair();
+    let e_hmac = hmac_email(srv.state.db.pepper(), "zero.pii@example.org");
+    let del_tok = sign_stateless_token(
+        srv.state.db.pepper(),
+        &SignedActionToken {
+            action: "delete_account".to_string(),
+            pubkey: e_pk.clone(),
+            email_hmac: e_hmac.clone(),
+            contact_email: None,
+            profile: "free".to_string(),
+            exp: now + 600,
+            jti: random_hex(16),
+        },
+    );
+    let wrong_confirm = srv
+        .client
+        .get(format!(
+            "{}/register/confirm?token={}",
+            srv.base_url, del_tok
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong_confirm.status().as_u16(), 303);
+    assert!(srv.state.db.get_registered_user(&e_pk).unwrap().is_none());
+
+    let reg_tok = sign_stateless_token(
+        srv.state.db.pepper(),
+        &SignedActionToken {
+            action: "confirm_register".to_string(),
+            pubkey: e_pk.clone(),
+            email_hmac: e_hmac.clone(),
+            contact_email: None,
+            profile: "free".to_string(),
+            exp: now + 600,
+            jti: random_hex(16),
+        },
+    );
+    let wrong_del = srv
+        .client
+        .get(format!(
+            "{}/register/delete-confirm?token={}",
+            srv.base_url, reg_tok
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong_del.status().as_u16(), 303);
+
+    let ok_confirm = srv
+        .client
+        .get(format!(
+            "{}/register/confirm?token={}",
+            srv.base_url, reg_tok
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok_confirm.status().as_u16(), 303);
+    assert!(ok_confirm
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("msg="));
+    let e_rec = srv.state.db.get_registered_user(&e_pk).unwrap().unwrap();
+    assert_eq!(e_rec.email_hmac.as_deref(), Some(e_hmac.as_str()));
+    assert!(e_rec.encrypted_contact_email.is_none());
+
+    // Valid delete-confirm permanently removes account via verified token
+    let ok_del = srv
+        .client
+        .get(format!(
+            "{}/register/delete-confirm?token={}",
+            srv.base_url, del_tok
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok_del.status().as_u16(), 303);
+    assert!(srv.state.db.get_registered_user(&e_pk).unwrap().is_none());
+
+    // 2b. store_contact_email=true profile ("pro") persists encrypted email visible only in admin summary
+    let (_pro_mail_sk, pro_mail_pk) = gen_keypair();
+    let pro_hmac = hmac_email(srv.state.db.pepper(), "supporter@example.org");
+    let pro_tok = sign_stateless_token(
+        srv.state.db.pepper(),
+        &SignedActionToken {
+            action: "confirm_register".to_string(),
+            pubkey: pro_mail_pk.clone(),
+            email_hmac: pro_hmac,
+            contact_email: Some("supporter@example.org".to_string()),
+            profile: "pro".to_string(),
+            exp: now + 600,
+            jti: random_hex(16),
+        },
+    );
+    assert_eq!(
+        srv.client
+            .get(format!(
+                "{}/register/confirm?token={}",
+                srv.base_url, pro_tok
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        303
+    );
+    let pro_rec = srv
+        .state
+        .db
+        .get_registered_user(&pro_mail_pk)
+        .unwrap()
+        .unwrap();
+    assert!(pro_rec.encrypted_contact_email.is_some());
+
+    // 2c. PoW registration (/register/pow): bad nonce rejected, wrong pubkey rejected, valid solved nonce accepted
+    let (_pow_sk, pow_pk) = gen_keypair();
+    let (_other_pow_sk, other_pow_pk) = gen_keypair();
+    let chal = create_pow_challenge(srv.state.db.pepper(), &pow_pk, 8, now);
+    let mut solved_nonce = 0u64;
+    loop {
+        let digest =
+            hex::decode(sha256_hex(format!("{}:{}", chal, solved_nonce).as_bytes())).unwrap();
+        if leading_zero_bits(&digest) >= 8 {
+            break;
+        }
+        solved_nonce += 1;
+    }
+    let _ = srv
+        .client
+        .post(format!("{}/register/pow", srv.base_url))
+        .form(&[
+            ("pubkey", pow_pk.as_str()),
+            ("challenge", chal.as_str()),
+            ("nonce", "999999999"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    let _ = srv
+        .client
+        .post(format!("{}/register/pow", srv.base_url))
+        .form(&[
+            ("pubkey", other_pow_pk.as_str()),
+            ("challenge", chal.as_str()),
+            ("nonce", &solved_nonce.to_string()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert!(srv.state.db.get_registered_user(&pow_pk).unwrap().is_none());
+    assert!(srv
+        .state
+        .db
+        .get_registered_user(&other_pow_pk)
+        .unwrap()
+        .is_none());
+
+    let ok_pow = srv
+        .client
+        .post(format!("{}/register/pow", srv.base_url))
+        .form(&[
+            ("pubkey", pow_pk.as_str()),
+            ("challenge", chal.as_str()),
+            ("nonce", &solved_nonce.to_string()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok_pow.status().as_u16(), 303);
+    assert!(srv.state.db.get_registered_user(&pow_pk).unwrap().is_some());
+
+    // 2d. IPv6 /48 & IPv4-mapped /24 open registration caps via X-Forwarded-For
+    let (_v6_a_sk, v6_a_pk) = gen_keypair();
+    let (_v6_b_sk, v6_b_pk) = gen_keypair();
+    let (_v6_c_sk, v6_c_pk) = gen_keypair();
+    srv.client
+        .post(format!("{}/register/open", srv.base_url))
+        .header("X-Forwarded-For", "2001:db8:1234:1::10")
+        .form(&[("pubkey", v6_a_pk.as_str())])
+        .send()
+        .await
+        .unwrap();
+    srv.client
+        .post(format!("{}/register/open", srv.base_url))
+        .header("X-Forwarded-For", "2001:db8:1234:ffff::99")
+        .form(&[("pubkey", v6_b_pk.as_str())])
+        .send()
+        .await
+        .unwrap();
+    srv.client
+        .post(format!("{}/register/open", srv.base_url))
+        .header("X-Forwarded-For", "2001:db8:5678:1::1")
+        .form(&[("pubkey", v6_c_pk.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert!(srv
+        .state
+        .db
+        .get_registered_user(&v6_a_pk)
+        .unwrap()
+        .is_some());
+    assert!(
+        srv.state
+            .db
+            .get_registered_user(&v6_b_pk)
+            .unwrap()
+            .is_none(),
+        "Second IPv6 registration inside same /48 must be blocked"
+    );
+    assert!(srv
+        .state
+        .db
+        .get_registered_user(&v6_c_pk)
+        .unwrap()
+        .is_some());
+
+    let (_v4m_1_sk, v4m_1_pk) = gen_keypair();
+    let (_v4m_2_sk, v4m_2_pk) = gen_keypair();
+    let (_v4m_3_sk, v4m_3_pk) = gen_keypair();
+    for (pk, xff) in [
+        (&v4m_1_pk, "::ffff:198.51.100.10"),
+        (&v4m_2_pk, "::ffff:198.51.100.20"),
+        (&v4m_3_pk, "198.51.100.30"),
+    ] {
+        srv.client
+            .post(format!("{}/register/open", srv.base_url))
+            .header("X-Forwarded-For", xff)
+            .form(&[("pubkey", pk.as_str())])
+            .send()
+            .await
+            .unwrap();
+    }
+    assert!(srv
+        .state
+        .db
+        .get_registered_user(&v4m_1_pk)
+        .unwrap()
+        .is_some());
+    assert!(srv
+        .state
+        .db
+        .get_registered_user(&v4m_2_pk)
+        .unwrap()
+        .is_some());
+    assert!(
+        srv.state
+            .db
+            .get_registered_user(&v4m_3_pk)
+            .unwrap()
+            .is_none(),
+        "IPv4-mapped ::ffff: and raw IPv4 must share /24 daily cap"
+    );
+
+    // 3. /admin UI headers, XSS escaping, CSRF enforcement on all 4 POST forms, logout, rate limit
+    let unauth_admin = srv
+        .client
+        .get(format!(
+            "{}/admin?err=%3Cscript%3Ealert(1)%3C%2Fscript%3E",
+            srv.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauth_admin.status().as_u16(), 200);
+    assert_eq!(
+        unauth_admin
+            .headers()
+            .get("x-frame-options")
+            .and_then(|v| v.to_str().ok()),
+        Some("DENY")
+    );
+    assert_eq!(
+        unauth_admin
+            .headers()
+            .get("x-content-type-options")
+            .and_then(|v| v.to_str().ok()),
+        Some("nosniff")
+    );
+    assert_eq!(
+        unauth_admin
+            .headers()
+            .get("referrer-policy")
+            .and_then(|v| v.to_str().ok()),
+        Some("no-referrer")
+    );
+    assert_eq!(
+        unauth_admin
+            .headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+    assert!(unauth_admin
+        .headers()
+        .get("content-security-policy")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("form-action 'self'")));
+    let unauth_html = unauth_admin.text().await.unwrap();
+    assert!(unauth_html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+    assert!(!unauth_html.contains("<script>alert(1)</script>"));
+
+    // Wrong admin token must NOT set cookie
+    let bad_login = srv
+        .client
+        .post(format!("{}/admin/login", srv.base_url))
+        .form(&[("token", "wrong-secret")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_login.status().as_u16(), 303);
+    assert!(bad_login
+        .headers()
+        .get(reqwest::header::SET_COOKIE)
+        .is_none());
+
+    // Valid login sets HttpOnly; SameSite=Strict cookie (and omits Secure over http://)
+    let ok_login = srv
+        .client
+        .post(format!("{}/admin/login", srv.base_url))
+        .form(&[("token", admin_secret)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok_login.status().as_u16(), 303);
+    let set_cookie = ok_login
+        .headers()
+        .get(reqwest::header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(set_cookie.contains("HttpOnly"));
+    assert!(set_cookie.contains("SameSite=Strict"));
+    assert!(!set_cookie.contains("; Secure"));
+    let sess_cookie = set_cookie.split(';').next().unwrap().to_string();
+
+    // Seed XSS-payload code note via API and confirm escaped in /admin HTML
+    let xss_code_resp = srv
+        .client
+        .post(format!("{}/api/v1/admin/codes", srv.base_url))
+        .header("Authorization", format!("Bearer {}", bearer_secret))
+        .json(&serde_json::json!({
+            "count": 1,
+            "profile": "pro",
+            "duration_days": 30,
+            "note": "<img src=x onerror=alert(2)>"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(xss_code_resp.status().as_u16(), 201);
+
+    let dash_html = srv
+        .client
+        .get(format!("{}/admin", srv.base_url))
+        .header(reqwest::header::COOKIE, &sess_cookie)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(dash_html.contains("&lt;img src=x onerror=alert(2)&gt;"));
+    assert!(!dash_html.contains("<img src=x onerror=alert(2)>"));
+    let csrf = dash_html
+        .split("name=\"csrf\" value=\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .unwrap()
+        .to_string();
+
+    // Forged CSRF across ALL 4 mutating /admin routes MUST fail without altering state
+    for (path, body_vec) in [
+        (
+            "/admin/users/profile",
+            vec![
+                ("csrf", "forged-csrf"),
+                ("pubkey", v6_a_pk.as_str()),
+                ("profile", "pro"),
+                ("duration_days", "30"),
+            ],
+        ),
+        (
+            "/admin/users/status",
+            vec![
+                ("csrf", "forged-csrf"),
+                ("pubkey", v6_a_pk.as_str()),
+                ("status", "suspended"),
+            ],
+        ),
+        (
+            "/admin/users/delete",
+            vec![("csrf", "forged-csrf"), ("pubkey", v6_a_pk.as_str())],
+        ),
+        (
+            "/admin/codes",
+            vec![("csrf", "forged-csrf"), ("profile", "pro"), ("count", "1")],
+        ),
+    ] {
+        let r = srv
+            .client
+            .post(format!("{}{}", srv.base_url, path))
+            .header(reqwest::header::COOKIE, &sess_cookie)
+            .form(&body_vec)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 303);
+        assert!(r
+            .headers()
+            .get("location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("err=Session+expired"));
+    }
+    assert_eq!(
+        srv.state
+            .db
+            .get_registered_user(&v6_a_pk)
+            .unwrap()
+            .unwrap()
+            .status,
+        AccountStatus::Active
+    );
+
+    // Valid CSRF mutations on status & delete & create codes
+    let r_stat = srv
+        .client
+        .post(format!("{}/admin/users/status", srv.base_url))
+        .header(reqwest::header::COOKIE, &sess_cookie)
+        .form(&[
+            ("csrf", csrf.as_str()),
+            ("pubkey", v6_a_pk.as_str()),
+            ("status", "suspended"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert!(r_stat
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("msg="));
+    assert_eq!(
+        srv.state
+            .db
+            .get_registered_user(&v6_a_pk)
+            .unwrap()
+            .unwrap()
+            .status,
+        AccountStatus::Suspended
+    );
+
+    let r_code = srv
+        .client
+        .post(format!("{}/admin/codes", srv.base_url))
+        .header(reqwest::header::COOKIE, &sess_cookie)
+        .form(&[
+            ("csrf", csrf.as_str()),
+            ("profile", "pro"),
+            ("count", "1"),
+            ("duration_days", "30"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert!(r_code
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("msg="));
+
+    let r_del = srv
+        .client
+        .post(format!("{}/admin/users/delete", srv.base_url))
+        .header(reqwest::header::COOKIE, &sess_cookie)
+        .form(&[("csrf", csrf.as_str()), ("pubkey", pow_pk.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert!(r_del
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("msg="));
+    assert!(srv.state.db.get_registered_user(&pow_pk).unwrap().is_none());
+
+    // Logout revokes session so reusing cookie falls back to login page
+    let r_logout = srv
+        .client
+        .post(format!("{}/admin/logout", srv.base_url))
+        .header(reqwest::header::COOKIE, &sess_cookie)
+        .form(&[("csrf", csrf.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_logout.status().as_u16(), 303);
+    let reused_dash = srv
+        .client
+        .get(format!("{}/admin", srv.base_url))
+        .header(reqwest::header::COOKIE, &sess_cookie)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(reused_dash.contains("Operator Admin Token"));
+    assert!(!reused_dash.contains("name=\"csrf\""));
+
+    // 4. /api/v1/admin/* token isolation, user management, pro->free email wipe, lock immunity, codes
+    // Distinct api_bearer_token_hash must REJECT admin_secret as Bearer token
+    let reject_admin_tok = srv
+        .client
+        .get(format!("{}/api/v1/admin/stats", srv.base_url))
+        .header("Authorization", format!("Bearer {}", admin_secret))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reject_admin_tok.status().as_u16(), 403);
+
+    let ok_stats = srv
+        .client
+        .get(format!("{}/api/v1/admin/stats", srv.base_url))
+        .header("Authorization", format!("Bearer {}", bearer_secret))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok_stats.status().as_u16(), 200);
+    assert_eq!(
+        ok_stats
+            .headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+
+    assert_eq!(
+        srv.client
+            .get(format!("{}/api/v1/admin/users/bad-hex", srv.base_url))
+            .header("Authorization", format!("Bearer {}", bearer_secret))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        400
+    );
+    let (_unknown_sk, unknown_pk) = gen_keypair();
+    assert_eq!(
+        srv.client
+            .get(format!(
+                "{}/api/v1/admin/users/{}",
+                srv.base_url, unknown_pk
+            ))
+            .header("Authorization", format!("Bearer {}", bearer_secret))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        404
+    );
+
+    let users_list: serde_json::Value = srv
+        .client
+        .get(format!("{}/api/v1/admin/users", srv.base_url))
+        .header("Authorization", format!("Bearer {}", bearer_secret))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(users_list["users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|u| u["pubkey"].as_str() == Some(pro_mail_pk.as_str())));
+
+    let pro_detail: AdminUserSummary = srv
+        .client
+        .get(format!(
+            "{}/api/v1/admin/users/{}",
+            srv.base_url, pro_mail_pk
+        ))
+        .header("Authorization", format!("Bearer {}", bearer_secret))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        pro_detail.contact_email.as_deref(),
+        Some("supporter@example.org")
+    );
+
+    // Downgrading pro -> free (store_contact_email=false) via API must wipe encrypted_contact_email
+    let downgrade_resp: AdminUserSummary = srv
+        .client
+        .post(format!(
+            "{}/api/v1/admin/users/{}/profile",
+            srv.base_url, pro_mail_pk
+        ))
+        .header("Authorization", format!("Bearer {}", bearer_secret))
+        .json(&serde_json::json!({ "profile": "free" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(downgrade_resp.profile, "free");
+    assert!(downgrade_resp.contact_email.is_none());
+    assert!(srv
+        .state
+        .db
+        .get_registered_user(&pro_mail_pk)
+        .unwrap()
+        .unwrap()
+        .encrypted_contact_email
+        .is_none());
+
+    let api_status_resp: AdminUserSummary = srv
+        .client
+        .post(format!(
+            "{}/api/v1/admin/users/{}/status",
+            srv.base_url, v6_c_pk
+        ))
+        .header("Authorization", format!("Bearer {}", bearer_secret))
+        .json(&serde_json::json!({ "status": "suspended" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(api_status_resp.status, AccountStatus::Suspended);
+
+    let codes_json: serde_json::Value = srv
+        .client
+        .get(format!("{}/api/v1/admin/codes", srv.base_url))
+        .header("Authorization", format!("Bearer {}", bearer_secret))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(codes_json["codes"].as_array().unwrap().len() >= 2);
+
+    // Admin DELETE /api/v1/admin/users/:pk wipes user + blobs while preserving existing lock buckets
+    let (lock_owner_sk, lock_owner_pk) = gen_keypair();
+    srv.state
+        .db
+        .register_or_upgrade_user(
+            &srv.state.config,
+            &lock_owner_pk,
+            "free",
+            None,
+            None,
+            "open",
+            now,
+        )
+        .unwrap();
+    let lock_pub = srv.state.db.lock_pubkey_bytes().unwrap();
+    let admin_pub_bytes = admin_sk.verifying_key().to_bytes();
+    let mig_sk = SigningKey::from_bytes(&[77u8; 32]);
+    let quarter = humoco_proto::encode_quarter(2031, 4).unwrap();
+    let manifest = build_single_server_manifest(
+        admin_pub_bytes,
+        lock_pub,
+        mig_sk.verifying_key().to_bytes(),
+        quarter,
+    );
+    let anchor_id = manifest.rev1_anchor_id().unwrap();
+    let bucket = humoco_proto::derive_bucket(&anchor_id, &lock_pub);
+    let (t_code, t_json) = fetch_ticket_signed(&srv, &lock_owner_sk, anchor_id, quarter).await;
+    assert_eq!(t_code, 200);
+    let ticket: humoco_proto::GenesisTicket =
+        serde_json::from_value(t_json["ticket"].clone()).unwrap();
+    let g_sk = SigningKey::from_bytes(&[78u8; 32]);
+    let entry0 = sign_lock_entry_helper(
+        anchor_id,
+        [0x09; 32],
+        [0u8; 32],
+        0,
+        0,
+        [0x19; 32],
+        &g_sk,
+        [0x29; 32],
+        None,
+        Some(&mig_sk),
+        8,
+    );
+    let lock_resp = srv
+        .client
+        .post(format!("{}/sync.php?lock", srv.base_url))
+        .json(&serde_json::json!({
+            "anchor_id": hex::encode(anchor_id),
+            "bucket": hex::encode(bucket),
+            "recipient_nonce": hex::encode([0xBBu8; 32]),
+            "entries": [entry0.to_wire_hex().unwrap()],
+            "manifest": manifest,
+            "genesis_ticket": ticket,
+            "known_head_receipt": serde_json::Value::Null,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(lock_resp.status().as_u16(), 200);
+    assert_eq!(srv.state.db.lock_bucket_count_and_inodes().unwrap(), (1, 1));
+
+    let del_user_resp: serde_json::Value = srv
+        .client
+        .delete(format!(
+            "{}/api/v1/admin/users/{}",
+            srv.base_url, lock_owner_pk
+        ))
+        .header("Authorization", format!("Bearer {}", bearer_secret))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(del_user_resp["deleted_account"], true);
+    assert!(srv
+        .state
+        .db
+        .get_registered_user(&lock_owner_pk)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        srv.state.db.lock_bucket_count_and_inodes().unwrap(),
+        (1, 1),
+        "Admin user deletion MUST NOT delete lock buckets/inodes"
+    );
+
+    // 5. Tight-rate-limit server for /admin/login rate-limiting + admin_token_hash Bearer fallback
+    let mut cfg_rl = base_hybrid_config(&admin_pk);
+    cfg_rl.security.ip_requests_per_minute = 2;
+    cfg_rl.security.admin_token_hash = hash_admin_token(admin_secret).unwrap();
+    let srv_rl = TestServer::start(cfg_rl).await;
+    assert_eq!(
+        srv_rl
+            .client
+            .get(format!("{}/api/v1/admin/stats", srv_rl.base_url))
+            .header("Authorization", format!("Bearer {}", admin_secret))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        200,
+        "When api_bearer_token_hash is unset, API falls back to admin_token_hash"
+    );
+    let _ = srv_rl
+        .client
+        .post(format!("{}/admin/login", srv_rl.base_url))
+        .form(&[("token", admin_secret)])
+        .send()
+        .await
+        .unwrap();
+    let rl_login = srv_rl
+        .client
+        .post(format!("{}/admin/login", srv_rl.base_url))
+        .form(&[("token", admin_secret)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rl_login.status().as_u16(), 303);
+    assert!(rl_login
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("Rate+limit+exceeded"));
+}

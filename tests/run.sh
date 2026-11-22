@@ -322,6 +322,17 @@ run_blackbox_protocol_suite() {
   assert_contains "$(tr -d '\r' < "$TMP_ROOT/put1.hdr" | tr '[:upper:]' '[:lower:]')" "etag: \"${etag1}\"" "PUT slot returns matching ETag header"
   verify_slot_ack_json "$TMP_ROOT/put1.json" "$friend_pk" "" "card" "$etag1" "$info_json" "PUT card slot_ack Ed25519 signature valid"
 
+  # Unauthorized HEAD against an existing slot/server must not leak channels, occupancy, or ETag
+  local unauth_head_pk="000000000000000000000000000000000000000000000000000000000000cafe"
+  local unauth_slot_hdr
+  unauth_slot_hdr="$(curl -sI -H "X-Drop-Pubkey: $unauth_head_pk" -H "X-Channel: card" "$endpoint" | tr -d '\r' | tr '[:upper:]' '[:lower:]')"
+  assert_contains "$unauth_slot_hdr" "x-drop-authorized: false" "Unauthorized HEAD returns X-Drop-Authorized: false"
+  if [[ "$unauth_slot_hdr" == *"x-drop-channels:"* || "$unauth_slot_hdr" == *"x-slot-occupied:"* || "$unauth_slot_hdr" == *"etag:"* || "$unauth_slot_hdr" == *"x-channel-max-bytes:"* ]]; then
+    fail "Unauthorized HEAD leaked channel/occupancy/ETag/quota headers: $unauth_slot_hdr"
+  else
+    ok "Unauthorized HEAD omits channels, occupancy, ETag, and quota headers"
+  fi
+
   # Duplicate If-None-Match: * must fail with 412
   ts="$(date +%s)"
   nonce="$(rand_nonce)"
@@ -678,6 +689,68 @@ run_blackbox_protocol_suite() {
     -H "X-Drop-Signature: $sig" \
     "$endpoint")" "403" "Unauthorized bulk DELETE card returns 403"
 
+  # Media channel vs backup isolation + explicit PUT ?members&channel=media pruning (PHP & Rust parity)
+  printf '{"pubkeys":["%s"]}' "$unauth_pk" > "$TMP_ROOT/backup_members.json"
+  ts="$(date +%s)"; nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-admin --sk "$admin_sk" --action PUT_MEMBERS --channel backup --ts "$ts" --nonce "$nonce" --body-file "$TMP_ROOT/backup_members.json")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+    -H "X-Drop-Pubkey: $admin_pk" -H "X-Drop-Timestamp: $ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig" \
+    --data-binary "@$TMP_ROOT/backup_members.json" \
+    "${endpoint}?members&channel=backup")" "200" "PUT ?members&channel=backup succeeds"
+
+  printf 'backup-only-denied-media' > "$TMP_ROOT/m_backup_denied.bin"
+  local backup_denied_mid
+  backup_denied_mid="$(sha256_file_hex "$TMP_ROOT/m_backup_denied.bin")"
+  nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-member --sk "$unauth_sk" --method PUT --channel media --media-id "$backup_denied_mid" --ts "$ts" --nonce "$nonce" --body-file "$TMP_ROOT/m_backup_denied.bin")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+    -H "X-Drop-Pubkey: $unauth_pk" -H "X-Channel: media" -H "X-Media-Id: $backup_denied_mid" -H "X-Drop-Timestamp: $ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig" \
+    --data-binary "@$TMP_ROOT/m_backup_denied.bin" \
+    "$endpoint")" "403" "backup-only member must NOT inherit media fallback (403)"
+
+  printf '{"pubkeys":[]}' > "$TMP_ROOT/empty_backup.json"
+  nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-admin --sk "$admin_sk" --action PUT_MEMBERS --channel backup --ts "$ts" --nonce "$nonce" --body-file "$TMP_ROOT/empty_backup.json")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+    -H "X-Drop-Pubkey: $admin_pk" -H "X-Drop-Timestamp: $ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig" \
+    --data-binary "@$TMP_ROOT/empty_backup.json" \
+    "${endpoint}?members&channel=backup")" "200" "Clear temporary backup list"
+
+  printf 'friend-media-before-explicit-empty' > "$TMP_ROOT/m_grp7.bin"
+  local m_grp7_id
+  m_grp7_id="$(sha256_file_hex "$TMP_ROOT/m_grp7.bin")"
+  nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-member --sk "$friend_sk" --method PUT --channel media --media-id "$m_grp7_id" --ts "$ts" --nonce "$nonce" --body-file "$TMP_ROOT/m_grp7.bin")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+    -H "X-Drop-Pubkey: $friend_pk" -H "X-Channel: media" -H "X-Media-Id: $m_grp7_id" -H "X-Drop-Timestamp: $ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig" \
+    --data-binary "@$TMP_ROOT/m_grp7.bin" \
+    "$endpoint")" "200" "Friend uploads media via card fallback before explicit media list"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "${data_url}/${m_grp7_id}.media.bin")" "200" "Uploaded media blob reachable before explicit media pruning"
+
+  printf '{"pubkeys":[]}' > "$TMP_ROOT/empty_media_g7.json"
+  nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-admin --sk "$admin_sk" --action PUT_MEMBERS --channel media --ts "$ts" --nonce "$nonce" --body-file "$TMP_ROOT/empty_media_g7.json")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+    -H "X-Drop-Pubkey: $admin_pk" -H "X-Drop-Timestamp: $ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig" \
+    --data-binary "@$TMP_ROOT/empty_media_g7.json" \
+    "${endpoint}?members&channel=media")" "200" "PUT ?members&channel=media [] succeeds"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "${data_url}/${m_grp7_id}.media.bin")" "404" "Explicit empty media list prunes card-fallback media blob"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "${data_url}/${friend_pk}.card.bin")" "200" "PUT ?members&channel=media [] preserves card slot"
+  nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-member --sk "$friend_sk" --method PUT --channel media --media-id "$m_grp7_id" --ts "$ts" --nonce "$nonce" --body-file "$TMP_ROOT/m_grp7.bin")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+    -H "X-Drop-Pubkey: $friend_pk" -H "X-Channel: media" -H "X-Media-Id: $m_grp7_id" -H "X-Drop-Timestamp: $ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig" \
+    --data-binary "@$TMP_ROOT/m_grp7.bin" \
+    "$endpoint")" "403" "Explicit empty media list disables card fallback for media PUT (403)"
+
+  printf '{"pubkeys":["%s"]}' "$friend_pk" > "$TMP_ROOT/media_members_g7.json"
+  nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-admin --sk "$admin_sk" --action PUT_MEMBERS --channel media --ts "$ts" --nonce "$nonce" --body-file "$TMP_ROOT/media_members_g7.json")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+    -H "X-Drop-Pubkey: $admin_pk" -H "X-Drop-Timestamp: $ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig" \
+    --data-binary "@$TMP_ROOT/media_members_g7.json" \
+    "${endpoint}?members&channel=media")" "200" "PUT ?members&channel=media restores friend media access"
+
   echo "=== Group 8 ($label): Revocation (?revoke -> 410 Gone -> Clear) ==="
   ts="$(date +%s)"
   "$helper_bin" sign-test sign-revoke-notice --sk "$admin_sk" --issued "$ts" --effective "$((ts + 60))" --reason "Server moving" > "$TMP_ROOT/revoke.json"
@@ -767,6 +840,45 @@ run_blackbox_protocol_suite() {
       ok "Public registered user omitted from index.json"
     fi
 
+    # Hybrid media isolation: registered user uploads media; PUT ?members&channel=media []
+    # prunes friend media & preserves BOTH friend card slot AND registered user's media!
+    printf 'friend-hybrid-media' > "$TMP_ROOT/hyb_f_media.bin"
+    local hyb_f_mid
+    hyb_f_mid="$(sha256_file_hex "$TMP_ROOT/hyb_f_media.bin")"
+    ts="$(date +%s)"; nonce="$(rand_nonce)"
+    sig="$("$helper_bin" sign-test sign-member --sk "$friend_sk" --method PUT --channel media --media-id "$hyb_f_mid" --ts "$ts" --nonce "$nonce" --body-file "$TMP_ROOT/hyb_f_media.bin")"
+    assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+      -H "X-Drop-Pubkey: $friend_pk" -H "X-Channel: media" -H "X-Media-Id: $hyb_f_mid" -H "X-Drop-Timestamp: $ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig" \
+      --data-binary "@$TMP_ROOT/hyb_f_media.bin" \
+      "$endpoint")" "200" "Hybrid friend uploads media before explicit empty media list"
+
+    printf 'public-registered-media' > "$TMP_ROOT/pub_media.bin"
+    local pub_mid
+    pub_mid="$(sha256_file_hex "$TMP_ROOT/pub_media.bin")"
+    nonce="$(rand_nonce)"
+    sig="$("$helper_bin" sign-test sign-member --sk "$intruder_sk" --method PUT --channel media --media-id "$pub_mid" --ts "$ts" --nonce "$nonce" --body-file "$TMP_ROOT/pub_media.bin")"
+    assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+      -H "X-Drop-Pubkey: $intruder_pk" -H "X-Channel: media" -H "X-Media-Id: $pub_mid" -H "X-Drop-Timestamp: $ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig" \
+      --data-binary "@$TMP_ROOT/pub_media.bin" \
+      "${base_url}/sync")" "200" "Registered user uploads media via /sync alias"
+
+    printf '{"pubkeys":[]}' > "$TMP_ROOT/empty_media_hyb.json"
+    nonce="$(rand_nonce)"
+    sig="$("$helper_bin" sign-test sign-admin --sk "$admin_sk" --action PUT_MEMBERS --channel media --ts "$ts" --nonce "$nonce" --body-file "$TMP_ROOT/empty_media_hyb.json")"
+    assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+      -H "X-Drop-Pubkey: $admin_pk" -H "X-Drop-Timestamp: $ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig" \
+      --data-binary "@$TMP_ROOT/empty_media_hyb.json" \
+      "${endpoint}?members&channel=media")" "200" "Admin clears admin_app media list in hybrid mode"
+    assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "${data_url}/${hyb_f_mid}.media.bin")" "404" "Removed friend media pruned in hybrid mode"
+    assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "${data_url}/${friend_pk}.card.bin")" "200" "Friend card slot survives media list clear"
+    assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "${data_url}/${pub_mid}.media.bin")" "200" "Registered user media survives admin media reset"
+    hybrid_idx="$(curl -sf "${data_url}/index.json")"
+    if [[ "$hybrid_idx" == *"$pub_mid"* || "$hybrid_idx" == *'"media"'* ]]; then
+      fail "index.json leaked media entry!"
+    else
+      ok "Media blobs omitted from index.json"
+    fi
+
     # Admin empties friend list -> public registered user MUST survive!
     printf '{"pubkeys":[]}' > "$TMP_ROOT/empty_members.json"
     ts="$(date +%s)"
@@ -795,8 +907,9 @@ run_blackbox_protocol_suite() {
       "${endpoint}?account")" "200" "DELETE ?account wipes registered user and blobs"
     assert_contains "$(cat "$TMP_ROOT/del_intruder.json")" "\"deleted_account\":\"${intruder_pk}\"" "DELETE ?account returns wiped registered pubkey"
     assert_contains "$(cat "$TMP_ROOT/del_intruder.json")" '"deleted_slots":1' "DELETE ?account returns deleted_slots:1"
-    assert_contains "$(cat "$TMP_ROOT/del_intruder.json")" '"deleted_media":0' "DELETE ?account returns deleted_media:0"
+    assert_contains "$(cat "$TMP_ROOT/del_intruder.json")" '"deleted_media":1' "DELETE ?account returns deleted_media:1"
     assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "${data_url}/${intruder_pk}.card.bin")" "404" "Wiped registered user slot returns 404"
+    assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "${data_url}/${pub_mid}.media.bin")" "404" "Wiped registered user media returns 404"
   fi
 
   echo "=== Group 10 ($label): Lock Channel Blackbox (SYNC-006b) ==="
@@ -905,6 +1018,18 @@ run_blackbox_protocol_suite() {
     -d '{"probe":true,"client_nonce":"0000000000000000000000000000000000000000000000000000000000000000"}' \
     "${endpoint}?lock")" "400" "POST ?lock probe rejects all-zero client_nonce (400)"
   assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "${endpoint}?lock")" "405" "GET ?lock returns 405"
+
+  # SYNC-S09-13 parity: server admin_pubkey (not in lock members) is authorized on HEAD lock channel
+  local admin_lock_head
+  admin_lock_head="$(curl -sI -H "X-Drop-Pubkey: $admin_pk" -H "X-Channel: lock" "$endpoint" | tr -d '\r' | tr '[:upper:]' '[:lower:]')"
+  assert_contains "$admin_lock_head" "x-drop-authorized: true" "HEAD with admin_pubkey and X-Channel: lock returns authorized=true"
+  assert_contains "$admin_lock_head" "x-drop-channels: " "HEAD with admin_pubkey includes X-Drop-Channels"
+  assert_contains "$admin_lock_head" "lock" "HEAD with admin_pubkey includes lock in X-Drop-Channels"
+  if [[ "$admin_lock_head" == *"x-slot-occupied:"* || "$admin_lock_head" == *"x-channel-max-bytes:"* ]]; then
+    fail "HEAD with admin_pubkey and X-Channel: lock must omit X-Slot-Occupied and X-Channel-Max-Bytes"
+  else
+    ok "HEAD with admin_pubkey and X-Channel: lock omits X-Slot-Occupied and X-Channel-Max-Bytes"
+  fi
 
   # Grant friend_pk 'lock' channel membership & request GenesisTicket
   printf '{"pubkeys":["%s"]}' "$friend_pk" > "$TMP_ROOT/lock_members.json"
