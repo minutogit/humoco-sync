@@ -1186,8 +1186,15 @@ EOF
   assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' --data-binary "@$r_dir/fin_req.json" "${u1}/sync.php?lock_commit")" "200" "Phase 3 (?lock_commit finalize) succeeds on S1"
   assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' --data-binary "@$r_dir/fin_req.json" "${u2}/sync.php?lock_commit")" "200" "Phase 3 (?lock_commit finalize) succeeds on S2"
 
-  curl -sf "${u2}/anchors/${anchor_e2e}.bin" > "$r_dir/anchor_root.bin"
+  curl -sf -D "$r_dir/anc_hdrs.txt" "${u2}/anchors/${anchor_e2e}.bin" > "$r_dir/anchor_root.bin"
   assert_eq "$("$helper_bin" sign-test rotation verify-manifest --manifest-json "$r_dir/anchor_root.bin" --expected-anchor-id "$anchor_e2e" --expected-rev 2)" "verified_rev_2" "GET /anchors/<anchor_id>.bin serves valid rev-2 manifest"
+  local anc_hdrs anc_etag
+  anc_hdrs="$(tr -d '\r' < "$r_dir/anc_hdrs.txt" | tr '[:upper:]' '[:lower:]')"
+  assert_contains "$anc_hdrs" "etag:" "Static anchor manifest includes ETag header"
+  assert_contains "$anc_hdrs" "no-cache" "Static anchor manifest includes Cache-Control: no-cache"
+  anc_etag="$(sed -n 's/^etag: *\([^ ].*\)/\1/p' <<<"$anc_hdrs" | head -n 1)"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -H "If-None-Match: $anc_etag" "${u2}/anchors/${anchor_e2e}.bin")" "304" "Static anchor manifest honors If-None-Match -> 304"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X POST "${u2}/anchors/${anchor_e2e}.bin")" "405" "POST to static anchor manifest returns 405"
   curl -sf "${u2}/humoco_sync_data/anchors/${anchor_e2e}.bin" > "$r_dir/anchor_data.bin"
   assert_eq "$("$helper_bin" sign-test rotation verify-manifest --manifest-json "$r_dir/anchor_data.bin" --expected-anchor-id "$anchor_e2e" --expected-rev 2)" "verified_rev_2" "GET /<data_dir>/anchors/<anchor_id>.bin serves valid rev-2 manifest"
 
@@ -1200,6 +1207,31 @@ EOF
   assert_eq "$(curl -sf "${u2}/humoco_sync_data/${r2_rel}" | wc -c | tr -d ' ')" "605" "Imported slot migrated onto S2 static read URL (605B)"
 
   "$helper_bin" sign-test make-lock-sample --lock-pub "$lp2" --admin-pub "$r_pk2" --quarter "$qtr" --ticket-json "$r_dir/tresp.json" --manifest-json "$r_dir/manifest.json" --anchor-tag "${label}-e2e" --variant seq:1 > "$r_dir/b1_s2.json"
+
+  # 410 Gone across all lock & rotation endpoints while static reads stay 200 (SPEC.md §7.1)
+  local rev_ts
+  rev_ts="$(date +%s)"
+  "$helper_bin" sign-test sign-revoke-notice --sk "$r_sk2" --issued "$rev_ts" --effective "$((rev_ts + 60))" --reason "Committee retiring" > "$r_dir/s2_rev.json"
+  nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-admin --sk "$r_sk2" --action PUT_REVOKE --ts "$rev_ts" --nonce "$nonce" --body-file "$r_dir/s2_rev.json")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "X-Drop-Pubkey: $r_pk2" -H "X-Drop-Timestamp: $rev_ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig" --data-binary "@$r_dir/s2_rev.json" "${u2}/sync.php?revoke")" "200" "PUT ?revoke on S2 publishes revocation"
+  assert_eq "$(curl -s -o "$r_dir/g410_tkt.json" -w '%{http_code}' -X POST -H 'Content-Type: application/json' --data-binary "@$r_dir/treq.json" "${u2}/sync.php?lock_ticket")" "410" "Revoked S2 returns 410 Gone on POST ?lock_ticket"
+  assert_contains "$(cat "$r_dir/g410_tkt.json")" '"revocation":{' "410 ?lock_ticket embeds revocation object"
+  assert_eq "$(curl -s -o "$r_dir/g410_lck.json" -w '%{http_code}' -X POST -H 'Content-Type: application/json' --data-binary "@$r_dir/b1_s2.json" "${u2}/sync.php?lock")" "410" "Revoked S2 returns 410 Gone on POST ?lock"
+  assert_contains "$(cat "$r_dir/g410_lck.json")" '"revocation":{' "410 ?lock embeds revocation object"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "${u2}/sync.php?lock_freeze&anchor_id=${anchor_e2e}")" "410" "Revoked S2 returns 410 Gone on GET ?lock_freeze"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' --data-binary "@$r_dir/prop.json" "${u2}/sync.php?lock_freeze")" "410" "Revoked S2 returns 410 Gone on POST ?lock_freeze"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' --data-binary "@$r_dir/import_req.json" "${u2}/sync.php?lock_import")" "410" "Revoked S2 returns 410 Gone on POST ?lock_import"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' --data-binary "@$r_dir/sc_req.json" "${u2}/sync.php?lock_commit")" "410" "Revoked S2 returns 410 Gone on POST ?lock_commit"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "${u2}/anchors/${anchor_e2e}.bin")" "200" "Static /anchors/<id>.bin remains 200 during 410 revocation"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "${u2}/humoco_sync_data/${r2_rel}")" "200" "Static .lock remains 200 during 410 revocation"
+
+  printf '{"issued_at":%s,"effective_at":null}' "$((rev_ts + 1))" > "$r_dir/s2_clear.json"
+  nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-admin --sk "$r_sk2" --action PUT_REVOKE --ts "$((rev_ts + 1))" --nonce "$nonce" --body-file "$r_dir/s2_clear.json")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "X-Drop-Pubkey: $r_pk2" -H "X-Drop-Timestamp: $((rev_ts + 1))" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig" --data-binary "@$r_dir/s2_clear.json" "${u2}/sync.php?revoke")" "200" "PUT ?revoke clear restores S2 lock & rotation endpoints"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "${u2}/sync.php?lock_freeze&anchor_id=${anchor_e2e}")" "200" "GET ?lock_freeze restored to 200 after clearing revocation"
+
   assert_contains "$(curl -sf -X POST -H 'Content-Type: application/json' --data-binary "@$r_dir/b1_s2.json" "${u2}/sync.php?lock")" '"status":"ok"' "Post-rotation spend seq:1 succeeds on new committee S2"
 
   kill "$p1" "$p2" 2>/dev/null || true

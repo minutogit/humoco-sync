@@ -1644,4 +1644,370 @@ assert_contains "$B15_OUT" '"static_304":304' "SYNC-S09-09: PHP static .lock hon
 assert_contains "$B15_OUT" '"static_405":405' "SYNC-S09-09: PHP static .lock rejects POST with 405"
 
 echo ""
+echo "=== Test 16: SYNC-S09-10..12 3-Phase Rotation Parity, Timelock, 30d Takeover, HolderStandby, Union QC/Conflicts & 410 Gone ==="
+read -r B16A_SK B16A_PK <<< "$("$SERVER_BIN" sign-test keygen)"
+read -r B16B_SK B16B_PK <<< "$("$SERVER_BIN" sign-test keygen)"
+read -r B16C_SK B16C_PK <<< "$("$SERVER_BIN" sign-test keygen)"
+read -r B16D_SK B16D_PK <<< "$("$SERVER_BIN" sign-test keygen)"
+B16A_PORT="$(pick_free_port)"
+B16B_PORT=$((B16A_PORT + 1)); while (echo >/dev/tcp/127.0.0.1/"$B16B_PORT") 2>/dev/null; do B16B_PORT=$((B16B_PORT + 1)); done
+B16C_PORT=$((B16B_PORT + 1)); while (echo >/dev/tcp/127.0.0.1/"$B16C_PORT") 2>/dev/null; do B16C_PORT=$((B16C_PORT + 1)); done
+B16D_PORT=$((B16C_PORT + 1)); while (echo >/dev/tcp/127.0.0.1/"$B16D_PORT") 2>/dev/null; do B16D_PORT=$((B16D_PORT + 1)); done
+B16A_DOC="$TMP_DIR/b16a_doc"; B16B_DOC="$TMP_DIR/b16b_doc"; B16C_DOC="$TMP_DIR/b16c_doc"; B16D_DOC="$TMP_DIR/b16d_doc"
+start_php_server "$B16A_DOC" "$B16A_PK" 500 1 "$B16A_PORT" "$TMP_DIR/b16a.log" 259200; B16A_PID="$PHP_PID"; PHP_PID=""
+start_php_server "$B16B_DOC" "$B16B_PK" 500 1 "$B16B_PORT" "$TMP_DIR/b16b.log" 259200; B16B_PID="$PHP_PID"; PHP_PID=""
+start_php_server "$B16C_DOC" "$B16C_PK" 500 1 "$B16C_PORT" "$TMP_DIR/b16c.log" 0;      B16C_PID="$PHP_PID"; PHP_PID=""
+start_php_server "$B16D_DOC" "$B16D_PK" 500 1 "$B16D_PORT" "$TMP_DIR/b16d.log" 0;      B16D_PID="$PHP_PID"; PHP_PID=""
+cleanup_b16() {
+  for xp in "${B16A_PID:-}" "${B16B_PID:-}" "${B16C_PID:-}" "${B16D_PID:-}"; do
+    if [[ -n "$xp" ]] && kill -0 "$xp" 2>/dev/null; then
+      kill "$xp" 2>/dev/null || true
+      wait "$xp" 2>/dev/null || true
+    fi
+  done
+  cleanup_b11
+}
+trap cleanup_b16 EXIT
+
+# Set pre_freeze_ttl_secs = 2 on B16A to verify lazy TTL auto-expiry deterministically
+php -r '
+  $c = file_get_contents($argv[1]);
+  $c = str_replace("'\''proposal_timelock_secs'\'' => 259200,", "'\''pre_freeze_ttl_secs'\'' => 2,\n        '\''proposal_timelock_secs'\'' => 259200,", $c);
+  file_put_contents($argv[1], $c);
+' "$B16A_DOC/config.php"
+
+B16A_URL="http://127.0.0.1:${B16A_PORT}"; B16B_URL="http://127.0.0.1:${B16B_PORT}"
+B16C_URL="http://127.0.0.1:${B16C_PORT}"; B16D_URL="http://127.0.0.1:${B16D_PORT}"
+B16A_LP="$(curl -sf "${B16A_URL}/sync.php?lock_selftest" | sed -n 's/.*"lock_pub":"\([0-9a-f]\{64\}\)".*/\1/p')"
+B16B_LP="$(curl -sf "${B16B_URL}/sync.php?lock_selftest" | sed -n 's/.*"lock_pub":"\([0-9a-f]\{64\}\)".*/\1/p')"
+B16C_LP="$(curl -sf "${B16C_URL}/sync.php?lock_selftest" | sed -n 's/.*"lock_pub":"\([0-9a-f]\{64\}\)".*/\1/p')"
+B16D_LP="$(curl -sf "${B16D_URL}/sync.php?lock_selftest" | sed -n 's/.*"lock_pub":"\([0-9a-f]\{64\}\)".*/\1/p')"
+
+B16_OUT="$(php -r '
+  require $argv[13];
+  $uA = $argv[1]; $skA = $argv[2]; $pkA = $argv[3]; $lpA = $argv[4]; $docA = $argv[5];
+  $uB = $argv[6]; $pkB = $argv[7]; $lpB = $argv[8];
+  $uC = $argv[9]; $skC = $argv[10]; $pkC = $argv[11]; $lpC = $argv[12];
+  $uD = $argv[14]; $skD = $argv[15]; $pkD = $argv[16]; $lpD = $argv[17]; $docD = $argv[18];
+  $q = (int)$argv[19];
+
+  $req = static function (string $method, string $url, string $body = "", array $hdrs = []): array {
+    $ch = curl_init($url);
+    $opts = [CURLOPT_CUSTOMREQUEST => $method, CURLOPT_RETURNTRANSFER => true, CURLOPT_HTTPHEADER => array_merge(["Content-Type: application/json"], $hdrs)];
+    if ($body !== "" || $method === "POST" || $method === "PUT") $opts[CURLOPT_POSTFIELDS] = $body;
+    curl_setopt_array($ch, $opts);
+    $resp = curl_exec($ch); $code = curl_getinfo($ch, CURLINFO_HTTP_CODE); curl_close($ch);
+    return [$code, json_decode((string)$resp, true) ?: []];
+  };
+  $post = static fn(string $u, string $b, array $h = []) => $req("POST", $u, $b, $h);
+  $issueT = static function (string $u, string $sk, string $pk, string $aHex, int $q) use ($post): array {
+    $body = json_encode(["anchor_id" => $aHex, "retain_until_quarter" => $q, "pow_timestamp" => null, "pow_nonce" => null]);
+    $ts = time(); $nonce = bin2hex(random_bytes(16));
+    $msg = "HUMOCO-DROP-REQ-V1\nPOST\nlock_ticket\n\n{$ts}\n{$nonce}\n" . hash("sha256", $body);
+    $sig = bin2hex(sodium_crypto_sign_detached($msg, hex2bin($sk) . hex2bin($pk)));
+    [$c, $j] = $post("$u/sync.php?lock_ticket", $body, ["X-Drop-Pubkey: $pk", "X-Drop-Timestamp: $ts", "X-Drop-Nonce: $nonce", "X-Drop-Signature: $sig"]);
+    if ($c !== 200) throw new RuntimeException("ticket failed on $u: $c " . json_encode($j));
+    return $j["ticket"];
+  };
+  $kp = static function (string $seed): array {
+    $k = sodium_crypto_sign_seed_keypair(hash("sha256", $seed, true));
+    return [sodium_crypto_sign_secretkey($k), sodium_crypto_sign_publickey($k), bin2hex(sodium_crypto_sign_publickey($k))];
+  };
+  [$cSk, $cPk, $cHex] = $kp("B16_CREATOR");
+  [$gSk, $gPk, $gHex] = $kp("B16_GUARANTOR0");
+  $mkSrv = static fn(string $u, string $ap, string $lp, mixed $nom = "creator") => [
+    "write_url" => "$u/sync.php", "read_url" => "$u/humoco_sync_data", "admin_pub" => $ap, "lock_pub" => $lp, "nominated_by" => $nom,
+  ];
+  $encSrv = static function (array $s): string {
+    $nb = ($s["nominated_by"] === "creator") ? "\x00" : ("\x01" . chr((int)$s["nominated_by"]["guarantor"]));
+    return hex2bin($s["admin_pub"]) . hex2bin($s["lock_pub"]) . $nb;
+  };
+  $mkMan = static function (array $srvs, array $succs, int $thr, array $gPubs, int $issuedMs) use ($cHex, $q, $encSrv): array {
+    $sb = ""; foreach ($srvs as $s) $sb .= $encSrv($s);
+    $sub = ""; foreach ($succs as $s) $sub .= $encSrv($s);
+    $gb = ""; foreach ($gPubs as $gp) $gb .= hex2bin($gp);
+    $aid = bin2hex(hash("sha256", "HUMOCO_ANCHOR_MANIFEST_V1\x00" . pack("P", 1) . chr($thr) . chr(count($srvs)) . $sb . pack("v", count($succs)) . $sub . hex2bin($cHex) . chr(count($gPubs)) . $gb . pack("P", $issuedMs) . pack("v", $q), true));
+    $m = ["revision" => 1, "threshold" => $thr, "servers" => $srvs, "successors" => $succs, "authority" => ["creator_mig_pub" => $cHex, "guarantor_mig_pubs" => $gPubs], "migration_chain" => [], "issued_at_ms" => $issuedMs, "retain_until_quarter" => $q];
+    return [$aid, $m];
+  };
+  $propDigest = static function (array $p) use ($encSrv): string {
+    $sb = ""; foreach ($p["new_servers"] as $s) $sb .= $encSrv($s);
+    $sub = ""; foreach ($p["new_successors"] as $s) $sub .= $encSrv($s);
+    $k = $p["initiator"]["kind"];
+    $ib = ($k === "creator") ? "\x00" : (($k === "guarantor") ? ("\x01" . chr((int)$p["initiator"]["guarantor_index"])) : "\x02");
+    return hash("sha256", "HUMOCO_MIGRATION_PROP_V1" . hex2bin($p["anchor_id"]) . pack("P", $p["from_rev"]) . pack("P", $p["to_rev"]) . chr($p["new_threshold"]) . chr(count($p["new_servers"])) . $sb . pack("v", count($p["new_successors"])) . $sub . pack("v", $p["retain_until_quarter"]) . pack("P", $p["proposed_at"]) . $ib, true);
+  };
+  $mkProp = static function (string $aid, int $from, int $to, int $thr, array $srvs, array $succs, int $ts, array $init, ?string $pSk, array $cosigs = []) use ($q, $propDigest): array {
+    $p = ["anchor_id" => $aid, "from_rev" => $from, "to_rev" => $to, "new_threshold" => $thr, "new_servers" => $srvs, "new_successors" => $succs, "retain_until_quarter" => $q, "proposed_at" => $ts, "initiator" => $init, "proposer_sig" => null, "guarantor_cosigs" => []];
+    $dig = $propDigest($p);
+    if ($pSk !== null) $p["proposer_sig"] = bin2hex(sodium_crypto_sign_detached($dig, $pSk));
+    foreach ($cosigs as [$idx, $sk]) $p["guarantor_cosigs"][] = ["guarantor_index" => $idx, "sig" => bin2hex(sodium_crypto_sign_detached($dig, $sk))];
+    return [$p, $dig];
+  };
+  $mkEntry = static function (string $aid, string $tag, string $pSlot, int $ob, int $depth, string $cl, string $sSk, string $sPk, string $rHash, ?string $chgHash, ?string $rootSk): array {
+    $a32 = hex2bin($aid);
+    $slot = hash("sha256", "HUMOCO_SYNC_SLOT_V1" . $a32 . $tag, true);
+    $hasChg = $chgHash !== null ? 1 : 0; $c32 = $chgHash ?? str_repeat("\0", 32);
+    $cd = hash("sha256", "HUMOCO_CAUSAL_OUTPUT_V1" . $a32 . $slot . $pSlot . chr($ob) . pack("V", $depth) . $cl . $sPk . $rHash . chr($hasChg) . $c32, true);
+    $cs = sodium_crypto_sign_detached($cd, $sSk);
+    $hr = ($depth === 0) ? 1 : 0;
+    $rs = ($depth === 0) ? sodium_crypto_sign_detached(hash("sha256", "HUMOCO_ROOT_MIG_AUTH_V1" . $a32 . $slot . $sPk, true), $rootSk) : str_repeat("\0", 64);
+    $n = 0; $pre = "HUMOCO_LOCK_POW_V1" . $slot . $cl . pack("V", $depth);
+    while (true) { if (ord(hash("sha256", $pre . pack("P", $n), true)[0]) === 0) break; $n++; }
+    $wire = "HMLK\x01" . $slot . $pSlot . chr($ob) . pack("V", $depth) . $cl . $sPk . $rHash . chr($hasChg) . $c32 . $cs . chr($hr) . $rs . str_repeat("\x66", 265) . pack("P", $n);
+    return ["slot" => $slot, "eh" => hash("sha256", "HUMOCO_LOCK_ENTRY_V1" . substr($wire, 0, 597), true), "hex" => bin2hex($wire), "wire" => $wire];
+  };
+  $mkSyn = static function (string $lbl, mixed $nom = "creator") use ($kp): array {
+    [$ask, $apk, $ahex] = $kp("B16_SA_$lbl");
+    [$lsk, $lpk, $lhex] = $kp("B16_SL_$lbl");
+    return ["srv" => ["write_url" => "http://127.0.0.1:19/sync.php", "read_url" => "http://127.0.0.1:19/d", "admin_pub" => $ahex, "lock_pub" => $lhex, "nominated_by" => $nom], "sk" => $lsk, "lp" => $lhex];
+  };
+
+  $sA = $mkSrv($uA, $pkA, $lpA, "creator"); $sB = $mkSrv($uB, $pkB, $lpB, "creator");
+  $sC = $mkSrv($uC, $pkC, $lpC, "creator"); $sD = $mkSrv($uD, $pkD, $lpD, "creator");
+  $syn1 = $mkSyn("S1", ["guarantor" => 0]); $syn2 = $mkSyn("S2", ["guarantor" => 0]); $syn3 = $mkSyn("S3", "creator");
+  $sBg = $mkSrv($uB, $pkB, $lpB, ["guarantor" => 0]);
+
+  $t0 = time() - 10;
+  [$r0Sk, $r0Pk] = $kp("B16_R0"); [$r1Sk, $r1Pk] = $kp("B16_R1"); [$r2Sk, $r2Pk] = $kp("B16_R2"); [$r3Sk, $r3Pk] = $kp("B16_R3");
+  $r1Hash = hash("sha3-256", $r1Pk, true); $r2Hash = hash("sha3-256", $r2Pk, true); $r3Hash = hash("sha3-256", $r3Pk, true);
+
+  // 1) SYNC-S09-10: Cold SelfFrozen tombstone + pre_freeze -> 409 and ZERO rotation/anchor metadata leak!
+  [$aidSf, $mSf] = $mkMan([$sA], [], 1, [], $t0 * 1000);
+  $bSfHex = hash("sha256", "HUMOCO_SYNC_BUCKET_V1" . hex2bin($aidSf) . hex2bin($lpA));
+  $tSf = $issueT($uA, $skA, $pkA, $aidSf, $q);
+  $eSf = $mkEntry($aidSf, str_repeat("\x11", 32), str_repeat("\0", 32), 0, 0, str_repeat("\x12", 32), $r0Sk, $r0Pk, $r1Hash, null, $cSk);
+  [, $bSfRes] = $post("$uA/sync.php?lock", json_encode(["anchor_id" => $aidSf, "bucket" => $bSfHex, "recipient_nonce" => bin2hex(random_bytes(32)), "entries" => [$eSf["hex"]], "manifest" => $mSf, "genesis_ticket" => $tSf, "known_head_receipt" => null]));
+  $krSf = $bSfRes["receipts"][0];
+  @unlink("$docA/humoco_sync_data/.locks_meta/buckets/$bSfHex.json");
+  @unlink("$docA/humoco_sync_data/.locks_meta/rotations/$aidSf.json");
+  @unlink("$docA/humoco_sync_data/anchors/$aidSf.bin");
+  [$rbSfCode, ] = $post("$uA/sync.php?lock", json_encode(["anchor_id" => $aidSf, "bucket" => $bSfHex, "recipient_nonce" => bin2hex(random_bytes(32)), "entries" => [$eSf["hex"]], "manifest" => null, "genesis_ticket" => null, "known_head_receipt" => $krSf]));
+  [$pfSfCode, ] = $post("$uA/sync.php?lock_freeze", json_encode(["action" => "pre_freeze", "anchor_id" => $aidSf, "current_manifest" => $mSf]));
+  $pfSfRotExists = file_exists("$docA/humoco_sync_data/.locks_meta/rotations/$aidSf.json");
+  $pfSfAncExists = file_exists("$docA/humoco_sync_data/anchors/$aidSf.bin");
+
+  // 2) SYNC-S09-12 pre_freeze TTL lazy expiry (pre_freeze_ttl_secs=2)
+  [$aidTtl, $mTtl] = $mkMan([$sA], [], 1, [], ($t0 + 1) * 1000);
+  $bTtlHex = hash("sha256", "HUMOCO_SYNC_BUCKET_V1" . hex2bin($aidTtl) . hex2bin($lpA));
+  $tTtl = $issueT($uA, $skA, $pkA, $aidTtl, $q);
+  $eTtl0 = $mkEntry($aidTtl, str_repeat("\x21", 32), str_repeat("\0", 32), 0, 0, str_repeat("\x22", 32), $r0Sk, $r0Pk, $r1Hash, null, $cSk);
+  $eTtl1 = $mkEntry($aidTtl, str_repeat("\x23", 32), $eTtl0["slot"], 0, 1, str_repeat("\x24", 32), $r1Sk, $r1Pk, $r2Hash, null, null);
+  $post("$uA/sync.php?lock", json_encode(["anchor_id" => $aidTtl, "bucket" => $bTtlHex, "recipient_nonce" => bin2hex(random_bytes(32)), "entries" => [$eTtl0["hex"]], "manifest" => $mTtl, "genesis_ticket" => $tTtl, "known_head_receipt" => null]));
+  [$pfTtl1, $pfTtlRes1] = $post("$uA/sync.php?lock_freeze", json_encode(["action" => "pre_freeze", "anchor_id" => $aidTtl]));
+  [$pfTtlIdem, $pfTtlRes2] = $post("$uA/sync.php?lock_freeze", json_encode(["action" => "pre_freeze", "anchor_id" => $aidTtl]));
+  [$blkPre, $blkPreB] = $post("$uA/sync.php?lock", json_encode(["anchor_id" => $aidTtl, "bucket" => $bTtlHex, "recipient_nonce" => bin2hex(random_bytes(32)), "entries" => [$eTtl1["hex"]], "manifest" => null, "genesis_ticket" => null, "known_head_receipt" => null]));
+  sleep(3);
+  [$unblkPost, ] = $post("$uA/sync.php?lock", json_encode(["anchor_id" => $aidTtl, "bucket" => $bTtlHex, "recipient_nonce" => bin2hex(random_bytes(32)), "entries" => [$eTtl1["hex"]], "manifest" => null, "genesis_ticket" => null, "known_head_receipt" => null]));
+
+  // 3) SYNC-S09-11 JSON schema strictness parity (400, not 200/409/500) + SYNC-S09-12 timelock 0s vs 72h, threshold>=2 floor, veto replay, 30d inactivity, HolderStandby
+  // 3a) Negative veto.from_rev -> 400; missing proposer_sig/guarantor_cosigs -> 400
+  [$vNegCode, ] = $post("$uA/sync.php?lock_freeze", json_encode(["action" => "veto", "veto" => ["anchor_id" => $aidTtl, "from_rev" => -1, "proposal_hash" => str_repeat("11", 32), "vetoer_pub" => $cHex, "vetoed_at" => $t0, "sig" => str_repeat("22", 64)]]));
+  [$pNoCosig, ] = $mkProp($aidTtl, 1, 2, 2, [$sA, $sB], [], $t0, ["kind" => "creator"], $cSk);
+  $pMissingKey = $pNoCosig; unset($pMissingKey["guarantor_cosigs"]);
+  [$propMissCosigCode, ] = $post("$uA/sync.php?lock_freeze", json_encode(["action" => "propose", "proposal" => $pMissingKey]));
+  [$scMissCosigCode, ] = $post("$uA/sync.php?lock_commit", json_encode(["action" => "sign_commit", "anchor_id" => $aidTtl, "proposal" => $pMissingKey, "imported_state_hash" => str_repeat("11", 32), "import_acks" => []]));
+
+  // 3b) SnapshotExport non-list/missing fields + malformed QuorumCertificate -> 400 on lock_import
+  // Propose pPure first so we can mutate a genuinely valid SnapshotExport!
+  $pPure = $pNoCosig;
+  [$prPureCode, $prPureRes] = $post("$uA/sync.php?lock_freeze", json_encode(["action" => "propose", "proposal" => $pPure]));
+  $zeroTlOk = ($prPureCode === 200) && ((int)$prPureRes["effective_at"] === (int)$prPureRes["snapshot_export"]["snapshot"]["frozen_at"]);
+  $validSnap = $prPureRes["snapshot_export"];
+  $badSnap1 = ["snapshot" => $validSnap["snapshot"], "entries" => ["k0" => $validSnap["entries"][0], "k1" => $validSnap["entries"][1]], "conflicts" => []];
+  $badSnap2 = ["snapshot" => $validSnap["snapshot"], "entries" => $validSnap["entries"]];
+  [$impObjEntriesCode, ] = $post("$uB/sync.php?lock_import", json_encode(["anchor_id" => $aidTtl, "active_manifest" => $mTtl, "proposal" => $pPure, "snapshots" => [$badSnap1], "quorum_certificates" => []]));
+  [$impMissConfCode, ] = $post("$uB/sync.php?lock_import", json_encode(["anchor_id" => $aidTtl, "active_manifest" => $mTtl, "proposal" => $pPure, "snapshots" => [$badSnap2], "quorum_certificates" => []]));
+  [$impBadQcCode, ] = $post("$uB/sync.php?lock_import", json_encode(["anchor_id" => $aidTtl, "active_manifest" => $mTtl, "proposal" => $pPure, "snapshots" => [$validSnap], "quorum_certificates" => [["slot" => "bad"]]]));
+
+  // 3c) With default 259200s timelock: pure growth (N=1->2, no guarantors) has 0s timelock -> immediate import & sign_commit succeed (200); tampered ImportAck -> 401!
+  [$impA0, $impARes] = $post("$uA/sync.php?lock_import", json_encode(["anchor_id" => $aidTtl, "active_manifest" => $mTtl, "proposal" => $pPure, "snapshots" => [$prPureRes["snapshot_export"]], "quorum_certificates" => []]));
+  [$impB0, $impBRes] = $post("$uB/sync.php?lock_import", json_encode(["anchor_id" => $aidTtl, "active_manifest" => $mTtl, "proposal" => $pPure, "snapshots" => [$prPureRes["snapshot_export"]], "quorum_certificates" => []]));
+  $badAck = $impBRes["import_ack"]; $badAck["sig"] = str_repeat("00", 64);
+  [$tamperedAckCode, ] = $post("$uA/sync.php?lock_commit", json_encode(["action" => "sign_commit", "anchor_id" => $aidTtl, "proposal" => $pPure, "imported_state_hash" => $impARes["import_ack"]["imported_state_hash"], "import_acks" => [$impARes["import_ack"], $badAck]]));
+  $goodAcks = [$impARes["import_ack"], $impBRes["import_ack"]];
+  $ishPure = $impARes["import_ack"]["imported_state_hash"];
+  [$scPureCode, $scPureRes] = $post("$uA/sync.php?lock_commit", json_encode(["action" => "sign_commit", "anchor_id" => $aidTtl, "proposal" => $pPure, "imported_state_hash" => $ishPure, "import_acks" => $goodAcks]));
+  $csig = $scPureRes["committee_signature"] ?? [];
+  $csigDig = hash("sha256", "HUMOCO_MIGRATION_CERT_V1" . hex2bin($aidTtl) . $propDigest($pPure) . pack("P", 2) . hex2bin($ishPure), true);
+  $csigValid = ($scPureCode === 200) && sodium_crypto_sign_verify_detached(hex2bin($csig["sig"]), $csigDig, hex2bin($lpA));
+
+  // Non-list commit_sigs map in MigrationCert -> 400 on finalize!
+  $mBadMapCert = ["revision" => 2, "threshold" => 2, "servers" => [$sA, $sB], "successors" => [], "authority" => $mTtl["authority"], "migration_chain" => [["anchor_id" => $aidTtl, "genesis_manifest" => $mTtl, "proposal" => $pPure, "imported_state_hash" => $ishPure, "import_acks" => $goodAcks, "commit_sigs" => ["a" => $csig]]], "issued_at_ms" => $t0 * 1000, "retain_until_quarter" => $q];
+  [$finMapSigCode, ] = $post("$uB/sync.php?lock_commit", json_encode(["action" => "finalize", "anchor_id" => $aidTtl, "new_manifest" => $mBadMapCert]));
+
+  // Finalize N=2 (mTtl2) cleanly on A & B, then test N=2->N=1 collapse rejection (400) and N=2->N=2 replacement enforces full 259200s timelock!
+  $mTtl2 = ["revision" => 2, "threshold" => 2, "servers" => [$sA, $sB], "successors" => [], "authority" => $mTtl["authority"], "migration_chain" => [["anchor_id" => $aidTtl, "genesis_manifest" => $mTtl, "proposal" => $pPure, "imported_state_hash" => $ishPure, "import_acks" => $goodAcks, "commit_sigs" => [$csig]]], "issued_at_ms" => $t0 * 1000, "retain_until_quarter" => $q];
+  $post("$uA/sync.php?lock_commit", json_encode(["action" => "finalize", "anchor_id" => $aidTtl, "new_manifest" => $mTtl2]));
+  $post("$uB/sync.php?lock_commit", json_encode(["action" => "finalize", "anchor_id" => $aidTtl, "new_manifest" => $mTtl2]));
+  [$pCollapse, ] = $mkProp($aidTtl, 2, 3, 1, [$sA], [], $t0, ["kind" => "creator"], $cSk);
+  [$collapseCode, ] = $post("$uA/sync.php?lock_freeze", json_encode(["action" => "propose", "proposal" => $pCollapse]));
+  [$pReplace, ] = $mkProp($aidTtl, 2, 3, 2, [$sA, $sB], [], $t0, ["kind" => "creator"], $cSk);
+  // Wait: test replacement with non-growth sA, sC -> pReplace targets [sA, sC], while uB (259200s) can also be checked if in new_servers! Use [sB, sC]: check premature import on uB (259200s)!
+  [$pReplace, ] = $mkProp($aidTtl, 2, 3, 2, [$sB, $sC], [], $t0, ["kind" => "creator"], $cSk);
+  [$repCode, $repRes] = $post("$uA/sync.php?lock_freeze", json_encode(["action" => "propose", "proposal" => $pReplace]));
+  [$repBCode, $repBRes] = $post("$uB/sync.php?lock_freeze", json_encode(["action" => "propose", "proposal" => $pReplace]));
+  $repTlEnforced = ($repCode === 200) && ($repBCode === 200) && (((int)$repRes["effective_at"] - (int)$repRes["snapshot_export"]["snapshot"]["frozen_at"]) === 259200);
+  [$impRepPremCode, ] = $post("$uB/sync.php?lock_import", json_encode(["anchor_id" => $aidTtl, "active_manifest" => $mTtl2, "proposal" => $pReplace, "snapshots" => [$repRes["snapshot_export"], $repBRes["snapshot_export"]], "quorum_certificates" => []]));
+  // Creator self-veto -> 401
+  $selfVetoDig = hash("sha256", "HUMOCO_MIGRATION_VETO_V1" . hex2bin($aidTtl) . pack("P", 2) . $propDigest($pReplace) . hex2bin($cHex) . pack("P", $t0), true);
+  [$selfVetoCode, ] = $post("$uA/sync.php?lock_freeze", json_encode(["action" => "veto", "veto" => ["anchor_id" => $aidTtl, "from_rev" => 2, "proposal_hash" => bin2hex($propDigest($pReplace)), "vetoer_pub" => $cHex, "vetoed_at" => $t0, "sig" => bin2hex(sodium_crypto_sign_detached($selfVetoDig, $cSk))]]));
+
+  // 4) Guarantor present: N=1->2 growth enforces 72h, veto blacklist (409 replay), 30d inactivity (<30d 403, heartbeat 200/401, >=30d 200), HolderStandby, nomination binding
+  [$aidG, $mG] = $mkMan([$sA, $sBg], [$syn1["srv"], $syn3["srv"]], 2, [$gHex], $t0 * 1000);
+  // 4a) Cold guarantor proposal before 30d -> 403; wrong-sig heartbeat -> 401; valid heartbeat -> 200
+  [$pGTooEarly, ] = $mkProp($aidG, 1, 2, 2, [$sA, $syn1["srv"]], [$syn3["srv"]], $t0, ["kind" => "guarantor", "guarantor_index" => 0], $gSk);
+  [$gEarlyCode, ] = $post("$uA/sync.php?lock_freeze", json_encode(["action" => "propose", "proposal" => $pGTooEarly, "current_manifest" => $mG]));
+  $hbFakeDig = hash("sha256", "HUMOCO_CREATOR_HB_V1" . hex2bin($aidG) . pack("P", $t0), true);
+  [$hbBadSigCode, ] = $post("$uA/sync.php?lock_freeze", json_encode(["action" => "heartbeat", "heartbeat" => ["anchor_id" => $aidG, "timestamp_secs" => $t0, "sig" => bin2hex(sodium_crypto_sign_detached($hbFakeDig, $gSk))], "current_manifest" => $mG]));
+  [$hbGoodCode, $hbGoodRes] = $post("$uA/sync.php?lock_freeze", json_encode(["action" => "heartbeat", "heartbeat" => ["anchor_id" => $aidG, "timestamp_secs" => $t0, "sig" => bin2hex(sodium_crypto_sign_detached($hbFakeDig, $cSk))], "current_manifest" => $mG]));
+  // 4b) Creator replacing Guarantor(0) slot WITHOUT cosig -> 400; WITH cosig -> 200; Guarantor veto -> 200 & replay -> 409
+  [$pHijack, ] = $mkProp($aidG, 1, 2, 2, [$sA, $sC], [$syn1["srv"], $syn3["srv"]], $t0, ["kind" => "creator"], $cSk);
+  [$hijackCode, ] = $post("$uA/sync.php?lock_freeze", json_encode(["action" => "propose", "proposal" => $pHijack]));
+  [$pCosig, $pCosigDig] = $mkProp($aidG, 1, 2, 2, [$sA, $syn1["srv"]], [$syn3["srv"]], $t0, ["kind" => "creator"], $cSk, [[0, $gSk]]);
+  [$cosigCode, $cosigRes] = $post("$uA/sync.php?lock_freeze", json_encode(["action" => "propose", "proposal" => $pCosig]));
+  $cosigTlOk = ($cosigCode === 200) && (((int)$cosigRes["effective_at"] - (int)$cosigRes["snapshot_export"]["snapshot"]["frozen_at"]) === 259200);
+  $gVetoDig = hash("sha256", "HUMOCO_MIGRATION_VETO_V1" . hex2bin($aidG) . pack("P", 1) . $pCosigDig . hex2bin($gHex) . pack("P", $t0 + 1), true);
+  [$gVetoCode, ] = $post("$uA/sync.php?lock_freeze", json_encode(["action" => "veto", "veto" => ["anchor_id" => $aidG, "from_rev" => 1, "proposal_hash" => bin2hex($pCosigDig), "vetoer_pub" => $gHex, "vetoed_at" => $t0 + 1, "sig" => bin2hex(sodium_crypto_sign_detached($gVetoDig, $gSk))]]));
+  [$gReplayCode, ] = $post("$uA/sync.php?lock_freeze", json_encode(["action" => "propose", "proposal" => $pCosig]));
+  // 4c) HolderStandby invalid (has proposer_sig -> 400, bad origin -> 400), then valid unsigned HolderStandby -> 200!
+  [$pStBadSig, ] = $mkProp($aidG, 1, 2, 2, [$sA, $syn1["srv"]], [$syn3["srv"]], $t0, ["kind" => "holder_standby"], $cSk);
+  [$stBadSigCode, ] = $post("$uA/sync.php?lock_freeze", json_encode(["action" => "propose", "proposal" => $pStBadSig]));
+  [$pStBadOrd, ] = $mkProp($aidG, 1, 2, 2, [$sA, $syn3["srv"]], [$syn1["srv"]], $t0, ["kind" => "holder_standby"], null);
+  [$stBadOrdCode, ] = $post("$uA/sync.php?lock_freeze", json_encode(["action" => "propose", "proposal" => $pStBadOrd]));
+  [$pStOk, ] = $mkProp($aidG, 1, 2, 2, [$sA, $syn1["srv"]], [$syn3["srv"]], $t0, ["kind" => "holder_standby"], null);
+  [$stOkCode, $stOkRes] = $post("$uA/sync.php?lock_freeze", json_encode(["action" => "propose", "proposal" => $pStOk]));
+  $stTlOk = ($stOkCode === 200) && (((int)$stOkRes["effective_at"] - (int)$stOkRes["snapshot_export"]["snapshot"]["frozen_at"]) === 259200);
+
+  // 4d) Cold bucket with issued_at_ms > 30 days ago -> Guarantor(0) takeover succeeds (200) AND Creator can veto Guarantor proposal (200)!
+  $tOld = $t0 - 2_600_000;
+  [$aidOld, $mOld] = $mkMan([$sA, $sBg], [$syn1["srv"]], 2, [$gHex], $tOld * 1000);
+  [$pGTakeover, $pGDig] = $mkProp($aidOld, 1, 2, 2, [$sA, $syn1["srv"]], [], $t0, ["kind" => "guarantor", "guarantor_index" => 0], $gSk);
+  [$gTakeCode, ] = $post("$uA/sync.php?lock_freeze", json_encode(["action" => "propose", "proposal" => $pGTakeover, "current_manifest" => $mOld]));
+  $cVetoDig = hash("sha256", "HUMOCO_MIGRATION_VETO_V1" . hex2bin($aidOld) . pack("P", 1) . $pGDig . hex2bin($cHex) . pack("P", $t0 + 2), true);
+  [$cVetoCode, ] = $post("$uA/sync.php?lock_freeze", json_encode(["action" => "veto", "veto" => ["anchor_id" => $aidOld, "from_rev" => 1, "proposal_hash" => bin2hex($pGDig), "vetoer_pub" => $cHex, "vetoed_at" => $t0 + 2, "sig" => bin2hex(sodium_crypto_sign_detached($cVetoDig, $cSk))]]));
+
+  // 5) Union Conflict Resolution on C/D (proposal_timelock_secs=0):
+  $syn1c = $mkSyn("S1C", "creator"); $syn2c = $mkSyn("S2C", "creator");
+  // Part A: 2-of-3 QC resolves split between s1/s3 in favor of e1Win on target sD!
+  [$aidU1, $mU1] = $mkMan([$sC, $sD, $syn1c["srv"]], [], 2, [], $t0 * 1000);
+  $tUC = $issueT($uC, $skC, $pkC, $aidU1, $q); $tUD = $issueT($uD, $skD, $pkD, $aidU1, $q);
+  $bCHex = hash("sha256", "HUMOCO_SYNC_BUCKET_V1" . hex2bin($aidU1) . hex2bin($lpC));
+  $bDHex = hash("sha256", "HUMOCO_SYNC_BUCKET_V1" . hex2bin($aidU1) . hex2bin($lpD));
+  $eU0 = $mkEntry($aidU1, str_repeat("\x31", 32), str_repeat("\0", 32), 0, 0, str_repeat("\x41", 32), $r0Sk, $r0Pk, $r1Hash, null, $cSk);
+  $eU1Win = $mkEntry($aidU1, str_repeat("\x32", 32), $eU0["slot"], 0, 1, str_repeat("\x42", 32), $r1Sk, $r1Pk, $r2Hash, null, null);
+  $eU1Alt = $mkEntry($aidU1, str_repeat("\x32", 32), $eU0["slot"], 0, 1, str_repeat("\x43", 32), $r1Sk, $r1Pk, $r3Hash, null, null);
+  // C + synthetic syn1c both signed FirstWrite for eU1Win; D received conflicting eU1Alt (syn1c signs matching FirstWrite receipt)!
+  [, $bUC] = $post("$uC/sync.php?lock", json_encode(["anchor_id" => $aidU1, "bucket" => $bCHex, "recipient_nonce" => bin2hex(random_bytes(32)), "entries" => [$eU0["hex"], $eU1Win["hex"]], "manifest" => $mU1, "genesis_ticket" => $tUC, "known_head_receipt" => null]));
+  $post("$uD/sync.php?lock", json_encode(["anchor_id" => $aidU1, "bucket" => $bDHex, "recipient_nonce" => bin2hex(random_bytes(32)), "entries" => [$eU0["hex"], $eU1Alt["hex"]], "manifest" => $mU1, "genesis_ticket" => $tUD, "known_head_receipt" => null]));
+  $synBk = hash("sha256", "HUMOCO_SYNC_BUCKET_V1" . hex2bin($aidU1) . hex2bin($syn1c["lp"]), true);
+  $synRn = random_bytes(32); $synBh = random_bytes(32);
+  $synRcptDig = hash("sha256", "HUMOCO_LOCK_RECEIPT_V1\x00" . hex2bin($syn1c["lp"]) . $synBk . $eU1Win["slot"] . str_repeat("\x42", 32) . $eU1Win["eh"] . pack("v", $q) . pack("P", 2) . $synBh . $synRn, true);
+  $synRcpt = ["kind" => "first_write", "lock_pub" => $syn1c["lp"], "bucket" => bin2hex($synBk), "slot" => bin2hex($eU1Win["slot"]), "child_lock" => str_repeat("42", 32), "entry_hash" => bin2hex($eU1Win["eh"]), "retain_until_quarter" => $q, "write_seq" => 2, "bucket_head" => bin2hex($synBh), "recipient_nonce" => bin2hex($synRn), "sig" => bin2hex(sodium_crypto_sign_detached($synRcptDig, $syn1c["sk"]))];
+  $qc = ["slot" => bin2hex($eU1Win["slot"]), "child_lock" => str_repeat("42", 32), "receipts" => [$bUC["receipts"][1], $synRcpt]];
+  [$pQc, ] = $mkProp($aidU1, 1, 2, 2, [$sC, $sD, $syn2c["srv"]], [], $t0, ["kind" => "creator"], $cSk);
+  [, $frQcC] = $post("$uC/sync.php?lock_freeze", json_encode(["action" => "propose", "proposal" => $pQc]));
+  [, $frQcD] = $post("$uD/sync.php?lock_freeze", json_encode(["action" => "propose", "proposal" => $pQc]));
+  [$qcImpCode, $qcImpRes] = $post("$uD/sync.php?lock_import", json_encode(["anchor_id" => $aidU1, "active_manifest" => $mU1, "proposal" => $pQc, "snapshots" => [$frQcC["snapshot_export"], $frQcD["snapshot_export"]], "quorum_certificates" => [$qc]]));
+  $dBktAfterQc = json_decode((string)file_get_contents("$docD/humoco_sync_data/.locks_meta/buckets/$bDHex.json"), true);
+  $qcResolvedOk = ($qcImpCode === 200) && (($qcImpRes["imported_slots"] ?? 0) === 2) && empty($dBktAfterQc["conflicts"]);
+
+  // Part B: 1:1 unresolved conflict on C/D without QC preserves CONFLICT([A, B]), allows child spend eU2_of_A, returns ConflictSeen on new spend at conflicting slot!
+  [$aidU2, $mU2] = $mkMan([$sC, $sD, $syn1c["srv"]], [$syn2c["srv"]], 2, [], $t0 * 1000);
+  $t2C = $issueT($uC, $skC, $pkC, $aidU2, $q); $t2D = $issueT($uD, $skD, $pkD, $aidU2, $q);
+  $b2CHex = hash("sha256", "HUMOCO_SYNC_BUCKET_V1" . hex2bin($aidU2) . hex2bin($lpC));
+  $b2DHex = hash("sha256", "HUMOCO_SYNC_BUCKET_V1" . hex2bin($aidU2) . hex2bin($lpD));
+  $e0 = $mkEntry($aidU2, str_repeat("\x51", 32), str_repeat("\0", 32), 0, 0, str_repeat("\x61", 32), $r0Sk, $r0Pk, $r1Hash, null, $cSk);
+  $e1A = $mkEntry($aidU2, str_repeat("\x52", 32), $e0["slot"], 0, 1, str_repeat("\x62", 32), $r1Sk, $r1Pk, $r2Hash, null, null);
+  $e1B = $mkEntry($aidU2, str_repeat("\x52", 32), $e0["slot"], 0, 1, str_repeat("\x63", 32), $r1Sk, $r1Pk, $r3Hash, null, null);
+  $e1C = $mkEntry($aidU2, str_repeat("\x52", 32), $e0["slot"], 0, 1, str_repeat("\x64", 32), $r1Sk, $r1Pk, $r2Hash, null, null);
+  $e2Child = $mkEntry($aidU2, str_repeat("\x53", 32), $e1A["slot"], 0, 2, str_repeat("\x65", 32), $r2Sk, $r2Pk, $r3Hash, null, null);
+  $post("$uC/sync.php?lock", json_encode(["anchor_id" => $aidU2, "bucket" => $b2CHex, "recipient_nonce" => bin2hex(random_bytes(32)), "entries" => [$e0["hex"], $e1A["hex"]], "manifest" => $mU2, "genesis_ticket" => $t2C, "known_head_receipt" => null]));
+  $post("$uD/sync.php?lock", json_encode(["anchor_id" => $aidU2, "bucket" => $b2DHex, "recipient_nonce" => bin2hex(random_bytes(32)), "entries" => [$e0["hex"], $e1B["hex"]], "manifest" => $mU2, "genesis_ticket" => $t2D, "known_head_receipt" => null]));
+  [$pUnr, $pUnrDig] = $mkProp($aidU2, 1, 2, 2, [$sC, $sD, $syn2c["srv"]], [], $t0, ["kind" => "creator"], $cSk);
+  [, $frUnrC] = $post("$uC/sync.php?lock_freeze", json_encode(["action" => "propose", "proposal" => $pUnr]));
+  [, $frUnrD] = $post("$uD/sync.php?lock_freeze", json_encode(["action" => "propose", "proposal" => $pUnr]));
+  $impUnrReq = json_encode(["anchor_id" => $aidU2, "active_manifest" => $mU2, "proposal" => $pUnr, "snapshots" => [$frUnrC["snapshot_export"], $frUnrD["snapshot_export"]], "quorum_certificates" => []]);
+  [$uImpC, $uImpCRes] = $post("$uC/sync.php?lock_import", $impUnrReq);
+  [$uImpD, $uImpDRes] = $post("$uD/sync.php?lock_import", $impUnrReq);
+  $ishUnr = $uImpCRes["import_ack"]["imported_state_hash"];
+  $synAck = (function() use ($syn2c, $aidU2, $pUnrDig, $ishUnr, $q, $t0) {
+    $lp = hex2bin($syn2c["lp"]);
+    $dig = hash("sha256", "HUMOCO_IMPORT_ACK_V1" . hex2bin($aidU2) . $pUnrDig . pack("P", 2) . hex2bin($ishUnr) . pack("v", $q) . $lp . pack("P", $t0), true);
+    return ["anchor_id" => $aidU2, "proposal_hash" => bin2hex($pUnrDig), "to_rev" => 2, "imported_state_hash" => $ishUnr, "retain_until_quarter" => $q, "lock_pub" => $syn2c["lp"], "acked_at" => $t0, "sig" => bin2hex(sodium_crypto_sign_detached($dig, $syn2c["sk"]))];
+  })();
+  $uAcks = [$uImpCRes["import_ack"], $uImpDRes["import_ack"], $synAck];
+  [, $uScC] = $post("$uC/sync.php?lock_commit", json_encode(["action" => "sign_commit", "anchor_id" => $aidU2, "proposal" => $pUnr, "imported_state_hash" => $ishUnr, "import_acks" => $uAcks]));
+  [, $uScD] = $post("$uD/sync.php?lock_commit", json_encode(["action" => "sign_commit", "anchor_id" => $aidU2, "proposal" => $pUnr, "imported_state_hash" => $ishUnr, "import_acks" => $uAcks]));
+  $mUnr2 = ["revision" => 2, "threshold" => 2, "servers" => [$sC, $sD, $syn2c["srv"]], "successors" => [], "authority" => $mU2["authority"], "migration_chain" => [["anchor_id" => $aidU2, "genesis_manifest" => $mU2, "proposal" => $pUnr, "imported_state_hash" => $ishUnr, "import_acks" => $uAcks, "commit_sigs" => [$uScC["committee_signature"], $uScD["committee_signature"]]]], "issued_at_ms" => $t0 * 1000, "retain_until_quarter" => $q];
+  $post("$uD/sync.php?lock_commit", json_encode(["action" => "finalize", "anchor_id" => $aidU2, "new_manifest" => $mUnr2]));
+  [$csAfterRot, $csAfterRotB] = $post("$uD/sync.php?lock", json_encode(["anchor_id" => $aidU2, "bucket" => $b2DHex, "recipient_nonce" => bin2hex(random_bytes(32)), "entries" => [$e1C["hex"]], "manifest" => null, "genesis_ticket" => null, "known_head_receipt" => null]));
+  $unrCsOk = ($csAfterRot === 200) && (($csAfterRotB["status"] ?? "") === "conflict")
+    && (($csAfterRotB["conflict"]["receipt"]["kind"] ?? "") === "conflict_seen")
+    && lock_verify_receipt($csAfterRotB["conflict"]["receipt"], hex2bin($lpD), hex2bin($b2DHex));
+  [$childOkCode, $childOkB] = $post("$uD/sync.php?lock", json_encode(["anchor_id" => $aidU2, "bucket" => $b2DHex, "recipient_nonce" => bin2hex(random_bytes(32)), "entries" => [$e2Child["hex"]], "manifest" => null, "genesis_ticket" => null, "known_head_receipt" => null]));
+
+  echo json_encode([
+    "rb_sf" => $rbSfCode, "pf_sf" => $pfSfCode, "pf_sf_rot" => $pfSfRotExists, "pf_sf_anc" => $pfSfAncExists,
+    "pf_ttl_1" => $pfTtl1, "pf_ttl_idem" => $pfTtlIdem, "blk_pre" => $blkPre, "blk_pre_err" => $blkPreB["error"] ?? "", "unblk_post" => $unblkPost,
+    "v_neg" => $vNegCode, "p_miss_cosig" => $propMissCosigCode, "sc_miss_cosig" => $scMissCosigCode,
+    "imp_obj_entries" => $impObjEntriesCode, "imp_miss_conf" => $impMissConfCode, "imp_bad_qc" => $impBadQcCode,
+    "zero_tl_ok" => $zeroTlOk, "imp_a0" => $impA0, "imp_b0" => $impB0, "tampered_ack" => $tamperedAckCode, "csig_valid" => $csigValid,
+    "fin_map_sig" => $finMapSigCode, "collapse_code" => $collapseCode, "rep_tl_enforced" => $repTlEnforced, "imp_rep_prem" => $impRepPremCode, "self_veto" => $selfVetoCode,
+    "g_early" => $gEarlyCode, "hb_bad_sig" => $hbBadSigCode, "hb_good" => $hbGoodCode,
+    "hijack" => $hijackCode, "cosig_tl_ok" => $cosigTlOk, "g_veto" => $gVetoCode, "g_replay" => $gReplayCode,
+    "st_bad_sig" => $stBadSigCode, "st_bad_ord" => $stBadOrdCode, "st_tl_ok" => $stTlOk,
+    "g_take" => $gTakeCode, "c_veto" => $cVetoCode,
+    "qc_resolved_ok" => $qcResolvedOk, "unr_cs_ok" => $unrCsOk, "child_ok" => $childOkCode,
+  ]);
+' "$B16A_URL" "$B16A_SK" "$B16A_PK" "$B16A_LP" "$B16A_DOC" "$B16B_URL" "$B16B_PK" "$B16B_LP" "$B16C_URL" "$B16C_SK" "$B16C_PK" "$B16C_LP" "${ROOT_DIR}/php/lock_handler.php" "$B16D_URL" "$B16D_SK" "$B16D_PK" "$B16D_LP" "$B16D_DOC" "$QTR")"
+
+for xp in "${B16A_PID:-}" "${B16B_PID:-}" "${B16C_PID:-}" "${B16D_PID:-}"; do
+  if [[ -n "$xp" ]] && kill -0 "$xp" 2>/dev/null; then
+    kill "$xp" 2>/dev/null || true
+    wait "$xp" 2>/dev/null || true
+  fi
+done
+B16A_PID=""; B16B_PID=""; B16C_PID=""; B16D_PID=""
+
+assert_contains "$B16_OUT" '"pf_sf":409' "SYNC-S09-10: cold SelfFrozen pre_freeze returns 409"
+assert_contains "$B16_OUT" '"pf_sf_rot":false' "SYNC-S09-10: aborted cold SelfFrozen pre_freeze leaks 0 rotation files"
+assert_contains "$B16_OUT" '"pf_sf_anc":false' "SYNC-S09-10: aborted cold SelfFrozen pre_freeze leaks 0 /anchors/*.bin files"
+assert_contains "$B16_OUT" '"pf_ttl_1":200' "SYNC-S09-12: pre_freeze returns 200"
+assert_contains "$B16_OUT" '"pf_ttl_idem":200' "SYNC-S09-12: idempotent pre_freeze returns 200"
+assert_contains "$B16_OUT" '"blk_pre_err":"pre_proposal_frozen"' "SYNC-S09-12: POST ?lock blocked during pre_freeze TTL (409)"
+assert_contains "$B16_OUT" '"unblk_post":200' "SYNC-S09-12: POST ?lock succeeds once pre_freeze TTL expires"
+assert_contains "$B16_OUT" '"v_neg":400' "SYNC-S09-11: negative veto.from_rev returns 400"
+assert_contains "$B16_OUT" '"p_miss_cosig":400' "SYNC-S09-11: propose missing guarantor_cosigs returns 400"
+assert_contains "$B16_OUT" '"sc_miss_cosig":400' "SYNC-S09-11: sign_commit missing guarantor_cosigs returns 400"
+assert_contains "$B16_OUT" '"imp_obj_entries":400' "SYNC-S09-11: lock_import rejects non-list SnapshotExport.entries (400)"
+assert_contains "$B16_OUT" '"imp_miss_conf":400' "SYNC-S09-11: lock_import rejects missing SnapshotExport.conflicts (400)"
+assert_contains "$B16_OUT" '"imp_bad_qc":400' "SYNC-S09-11: lock_import rejects malformed QuorumCertificate (400)"
+assert_contains "$B16_OUT" '"fin_map_sig":400' "SYNC-S09-11: finalize rejects associative commit_sigs map (400)"
+assert_contains "$B16_OUT" '"zero_tl_ok":true' "SYNC-S09-12: pure growth without guarantors uses 0s timelock"
+assert_contains "$B16_OUT" '"imp_a0":200' "SYNC-S09-12: immediate lock_import succeeds on S1 under 0s pure growth"
+assert_contains "$B16_OUT" '"imp_b0":200' "SYNC-S09-12: immediate lock_import succeeds on S2 under 0s pure growth"
+assert_contains "$B16_OUT" '"tampered_ack":401' "SYNC-S09-12: sign_commit rejects tampered ImportAck signature (401)"
+assert_contains "$B16_OUT" '"csig_valid":true' "SYNC-S09-12: sign_commit CommitteeSignature verifies cryptographically"
+assert_contains "$B16_OUT" '"collapse_code":400' "SYNC-S09-12: rejects multi-server collapse below threshold 2 (400)"
+assert_contains "$B16_OUT" '"rep_tl_enforced":true' "SYNC-S09-12: creator non-growth replacement enforces 259200s timelock"
+assert_contains "$B16_OUT" '"imp_rep_prem":409' "SYNC-S09-12: lock_import blocks premature non-growth rotation (409)"
+assert_contains "$B16_OUT" '"self_veto":401' "SYNC-S09-12: creator self-veto rejected (401)"
+assert_contains "$B16_OUT" '"g_early":403' "SYNC-S09-12: guarantor takeover blocked before 30d inactivity (403)"
+assert_contains "$B16_OUT" '"hb_bad_sig":401' "SYNC-S09-12: forged CreatorHeartbeat rejected (401)"
+assert_contains "$B16_OUT" '"hb_good":200' "SYNC-S09-12: valid CreatorHeartbeat recorded (200)"
+assert_contains "$B16_OUT" '"hijack":400' "SYNC-S09-12: creator replacing Guarantor(0) slot without cosig rejected (400)"
+assert_contains "$B16_OUT" '"cosig_tl_ok":true' "SYNC-S09-12: guarantor-present proposal with cosig enforces 259200s timelock"
+assert_contains "$B16_OUT" '"g_veto":200' "SYNC-S09-12: guarantor valid veto succeeds (200)"
+assert_contains "$B16_OUT" '"g_replay":409' "SYNC-S09-12: vetoed proposal replay rejected (409)"
+assert_contains "$B16_OUT" '"st_bad_sig":400' "SYNC-S09-12: HolderStandby with authority signature rejected (400)"
+assert_contains "$B16_OUT" '"st_bad_ord":400' "SYNC-S09-12: HolderStandby out-of-order / wrong-origin successor rejected (400)"
+assert_contains "$B16_OUT" '"st_tl_ok":true' "SYNC-S09-12: unsigned HolderStandby FIFO promotion accepted with 259200s timelock"
+assert_contains "$B16_OUT" '"g_take":200' "SYNC-S09-12: cold manifest >=30d old allows Guarantor(0) takeover (200)"
+assert_contains "$B16_OUT" '"c_veto":200' "SYNC-S09-12: creator valid veto cancels Guarantor(0) takeover (200)"
+assert_contains "$B16_OUT" '"qc_resolved_ok":true' "SYNC-S09-12: lock_import resolves 1:1 split cleanly via QuorumCertificate"
+assert_contains "$B16_OUT" '"unr_cs_ok":true' "SYNC-S09-12: unresolved split yields ConflictSeen post-rotation"
+assert_contains "$B16_OUT" '"child_ok":200' "SYNC-S09-12: child spend on surviving conflict parent commits cleanly post-rotation (200)"
+
+echo ""
 echo "All PHP lock concurrency, rollback, quota & GC tests passed! (${PASS} assertions)"

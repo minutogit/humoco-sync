@@ -11641,3 +11641,293 @@ async fn test_s09_f2_lock_channel_cryptographic_and_adversarial_parity() {
     let static_405 = srv.client.post(&lock_url).send().await.unwrap();
     assert_eq!(static_405.status().as_u16(), 405);
 }
+
+#[tokio::test]
+async fn test_s09_f3_cold_self_frozen_pre_freeze_no_leak_and_schema_400_parity() {
+    let (admin_sk, _admin_pk, cold2) = start_lock_test_server(true, None).await;
+    let admin_pub = admin_sk.verifying_key().to_bytes();
+    let creator_mig_sk = SigningKey::from_bytes(&[171u8; 32]);
+    let creator_mig_pub = creator_mig_sk.verifying_key().to_bytes();
+    let quarter = humoco_proto::encode_quarter(2031, 4).unwrap();
+    let now = unix_now();
+    let g_sk = SigningKey::from_bytes(&[172u8; 32]);
+    let cold2_pub = cold2.state.db.lock_pubkey_bytes().unwrap();
+    let cold2_man = build_single_server_manifest(admin_pub, cold2_pub, creator_mig_pub, quarter);
+    let cold2_aid = cold2_man.rev1_anchor_id().unwrap();
+    let cold2_ahex = hex::encode(cold2_aid);
+    let cold2_bkt = humoco_proto::derive_bucket(&cold2_aid, &cold2_pub);
+    let cold2_tkt = issue_pow_ticket_db(&cold2, cold2_aid, quarter, now);
+    let cold2_e0 = sign_lock_entry_helper(
+        cold2_aid,
+        [0xF1; 32],
+        [0u8; 32],
+        0,
+        0,
+        [0xF2; 32],
+        &g_sk,
+        [0xF3; 32],
+        None,
+        Some(&creator_mig_sk),
+        8,
+    );
+    let (_, cold2_ok) = cold2
+        .state
+        .db
+        .process_lock_batch(
+            &cold2.state.config,
+            humoco_sync_server::locks::LockBatchRequest {
+                anchor_id: cold2_aid,
+                bucket: cold2_bkt,
+                recipient_nonce: [0xF4; 32],
+                entries: vec![cold2_e0.to_wire_hex().unwrap()],
+                manifest: Some(cold2_man.clone()),
+                genesis_ticket: Some(cold2_tkt),
+                known_head_receipt: None,
+            },
+            now,
+        )
+        .unwrap();
+    let _cold2_rcpt: humoco_proto::LockReceipt =
+        serde_json::from_value(cold2_ok["receipts"][0].clone()).unwrap();
+    let past_q = humoco_proto::encode_quarter(2025, 1).unwrap();
+    let past_man = build_single_server_manifest(admin_pub, cold2_pub, creator_mig_pub, past_q);
+    let past_aid = past_man.rev1_anchor_id().unwrap();
+    let past_ahex = hex::encode(past_aid);
+    let past_bkt = humoco_proto::derive_bucket(&past_aid, &cold2_pub);
+    let past_tkt = issue_pow_ticket_db(&cold2, past_aid, past_q, now);
+    let past_e0 = sign_lock_entry_helper(
+        past_aid,
+        [0xA1; 32],
+        [0u8; 32],
+        0,
+        0,
+        [0xA2; 32],
+        &g_sk,
+        [0xA3; 32],
+        None,
+        Some(&creator_mig_sk),
+        8,
+    );
+    let (_, past_ok) = cold2
+        .state
+        .db
+        .process_lock_batch(
+            &cold2.state.config,
+            humoco_sync_server::locks::LockBatchRequest {
+                anchor_id: past_aid,
+                bucket: past_bkt,
+                recipient_nonce: [0xA4; 32],
+                entries: vec![past_e0.to_wire_hex().unwrap()],
+                manifest: Some(past_man.clone()),
+                genesis_ticket: Some(past_tkt),
+                known_head_receipt: None,
+            },
+            now,
+        )
+        .unwrap();
+    let past_rcpt: humoco_proto::LockReceipt =
+        serde_json::from_value(past_ok["receipts"][0].clone()).unwrap();
+    // GC removes past_aid (2025-Q1 purged at `now`), wiping bucket + rotation + anchor!
+    let (purged_b, _) = cold2.state.db.run_lock_gc(now).unwrap();
+    assert_eq!(purged_b, 1);
+    assert!(cold2
+        .state
+        .db
+        .get_static_anchor_manifest(&past_ahex)
+        .unwrap()
+        .is_none());
+
+    // Replay past_rcpt -> creates SelfFrozen tombstone without rotation/anchor metadata
+    let (rb_code, rb_val) = cold2
+        .state
+        .db
+        .process_lock_batch(
+            &cold2.state.config,
+            humoco_sync_server::locks::LockBatchRequest {
+                anchor_id: past_aid,
+                bucket: past_bkt,
+                recipient_nonce: [0xA5; 32],
+                entries: vec![past_e0.to_wire_hex().unwrap()],
+                manifest: None,
+                genesis_ticket: None,
+                known_head_receipt: Some(past_rcpt),
+            },
+            now,
+        )
+        .unwrap();
+    assert_eq!(rb_code, 409);
+    assert_eq!(rb_val["error"], "bucket_self_frozen");
+
+    // PreFreeze with `current_manifest` MUST reject 409 AND leave 0 anchor/rotation records!
+    let pf_resp = cold2
+        .client
+        .post(format!("{}/sync.php?lock_freeze", cold2.base_url))
+        .json(&serde_json::json!({
+            "action": "pre_freeze",
+            "anchor_id": past_ahex,
+            "current_manifest": past_man,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pf_resp.status().as_u16(), 409);
+    assert!(cold2
+        .state
+        .db
+        .get_static_anchor_manifest(&past_ahex)
+        .unwrap()
+        .is_none());
+    let static_404 = cold2
+        .client
+        .get(format!("{}/anchors/{}.bin", cold2.base_url, past_ahex))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(static_404.status().as_u16(), 404);
+
+    // SYNC-S09-11 JSON schema strictness parity via HTTP (all MUST reject 400):
+    // 1) negative veto.from_rev -> 400
+    let r_vneg = cold2
+        .client
+        .post(format!("{}/sync.php?lock_freeze", cold2.base_url))
+        .json(&serde_json::json!({
+            "action": "veto",
+            "veto": {
+                "anchor_id": cold2_ahex,
+                "from_rev": -1,
+                "proposal_hash": "11".repeat(32),
+                "vetoer_pub": hex::encode(creator_mig_pub),
+                "vetoed_at": now,
+                "sig": "22".repeat(64),
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_vneg.status().as_u16(), 400);
+
+    // 2) propose & sign_commit missing guarantor_cosigs -> 400
+    let p_missing_cosigs = serde_json::json!({
+        "anchor_id": cold2_ahex,
+        "from_rev": 1,
+        "to_rev": 2,
+        "new_threshold": 2,
+        "new_servers": [cold2_man.servers[0]],
+        "new_successors": [],
+        "retain_until_quarter": quarter,
+        "proposed_at": now,
+        "initiator": {"kind": "creator"},
+        "proposer_sig": "00".repeat(64),
+    });
+    let r_pmiss = cold2
+        .client
+        .post(format!("{}/sync.php?lock_freeze", cold2.base_url))
+        .json(&serde_json::json!({"action": "propose", "proposal": p_missing_cosigs}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_pmiss.status().as_u16(), 400);
+
+    let r_scmiss = cold2
+        .client
+        .post(format!("{}/sync.php?lock_commit", cold2.base_url))
+        .json(&serde_json::json!({
+            "action": "sign_commit",
+            "anchor_id": cold2_ahex,
+            "proposal": p_missing_cosigs,
+            "imported_state_hash": "11".repeat(32),
+            "import_acks": [],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_scmiss.status().as_u16(), 400);
+
+    // 3) lock_import non-list SnapshotExport.entries, missing conflicts, malformed QuorumCertificate -> 400
+    let valid_prop = build_signed_proposal(
+        cold2_aid,
+        1,
+        2,
+        vec![cold2_man.servers[0].clone()],
+        Vec::new(),
+        quarter,
+        now,
+        humoco_proto::ProposalInitiator::Creator,
+        Some(&creator_mig_sk),
+        Vec::new(),
+    );
+    let r_imp_obj = cold2
+        .client
+        .post(format!("{}/sync.php?lock_import", cold2.base_url))
+        .json(&serde_json::json!({
+            "anchor_id": cold2_ahex,
+            "active_manifest": cold2_man,
+            "proposal": valid_prop,
+            "snapshots": [{"snapshot": {"anchor_id": cold2_ahex}, "entries": {"k0": "00"}, "conflicts": []}],
+            "quorum_certificates": [],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_imp_obj.status().as_u16(), 400);
+
+    let r_imp_miss = cold2
+        .client
+        .post(format!("{}/sync.php?lock_import", cold2.base_url))
+        .json(&serde_json::json!({
+            "anchor_id": cold2_ahex,
+            "active_manifest": cold2_man,
+            "proposal": valid_prop,
+            "snapshots": [{"snapshot": {"anchor_id": cold2_ahex}, "entries": []}],
+            "quorum_certificates": [],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_imp_miss.status().as_u16(), 400);
+
+    let r_imp_qc = cold2
+        .client
+        .post(format!("{}/sync.php?lock_import", cold2.base_url))
+        .json(&serde_json::json!({
+            "anchor_id": cold2_ahex,
+            "active_manifest": cold2_man,
+            "proposal": valid_prop,
+            "snapshots": [],
+            "quorum_certificates": [{"slot": "bad"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_imp_qc.status().as_u16(), 400);
+
+    // 4) finalize associative commit_sigs map -> 400
+    let r_fin_map = cold2
+        .client
+        .post(format!("{}/sync.php?lock_commit", cold2.base_url))
+        .json(&serde_json::json!({
+            "action": "finalize",
+            "anchor_id": cold2_ahex,
+            "new_manifest": {
+                "revision": 2,
+                "threshold": 1,
+                "servers": cold2_man.servers,
+                "successors": [],
+                "authority": cold2_man.authority,
+                "migration_chain": [{
+                    "anchor_id": cold2_ahex,
+                    "genesis_manifest": cold2_man,
+                    "proposal": valid_prop,
+                    "imported_state_hash": "11".repeat(32),
+                    "import_acks": [],
+                    "commit_sigs": {"a": {"lock_pub": hex::encode(cold2_pub), "committed_at": now, "sig": "00".repeat(64)}},
+                }],
+                "issued_at_ms": now * 1000,
+                "retain_until_quarter": quarter,
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_fin_map.status().as_u16(), 400);
+}
