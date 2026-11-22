@@ -1346,17 +1346,17 @@ async fn admin_login_submit(
         state.config.server.trusted_proxy_hops,
     );
     if !state.rate_limiter.allow_ip(ip) {
-        return Redirect::to("/admin?err=Rate+limit+exceeded").into_response();
+        return admin_redirect("/admin?err=Rate+limit+exceeded");
     }
     if !state
         .token_verifier
         .verify_token(&state.config.security.admin_token_hash, form.token.trim())
     {
-        return Redirect::to("/admin?err=Invalid+admin+token").into_response();
+        return admin_redirect("/admin?err=Invalid+admin+token");
     }
     let sid = random_hex(24);
     state.rate_limiter.create_admin_session(sid.clone(), 3600);
-    let secure = if state.config.server.public_base_url.starts_with("https://") {
+    let secure = if is_https_url(&state.config.server.public_base_url) {
         "; Secure"
     } else {
         ""
@@ -1365,7 +1365,7 @@ async fn admin_login_submit(
         "{}={}; HttpOnly; SameSite=Strict; Path=/admin{}",
         ADMIN_SESSION_COOKIE, sid, secure
     );
-    let mut resp = Redirect::to("/admin").into_response();
+    let mut resp = admin_redirect("/admin");
     if let Ok(hv) = HeaderValue::from_str(&cookie) {
         resp.headers_mut().insert(header::SET_COOKIE, hv);
     }
@@ -1382,10 +1382,11 @@ async fn admin_logout_submit(
     headers: HeaderMap,
     Form(form): Form<CsrfOnlyForm>,
 ) -> Response {
-    if let Some(sid) = verify_admin_cookie_and_csrf(&state, &headers, &form.csrf) {
-        state.rate_limiter.revoke_admin_session(&sid);
-    }
-    let secure = if state.config.server.public_base_url.starts_with("https://") {
+    let Some(sid) = verify_admin_cookie_and_csrf(&state, &headers, &form.csrf) else {
+        return admin_redirect("/admin?err=Session+expired");
+    };
+    state.rate_limiter.revoke_admin_session(&sid);
+    let secure = if is_https_url(&state.config.server.public_base_url) {
         "; Secure"
     } else {
         ""
@@ -1394,7 +1395,7 @@ async fn admin_logout_submit(
         "{}=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/admin{}",
         ADMIN_SESSION_COOKIE, secure
     );
-    let mut resp = Redirect::to("/admin").into_response();
+    let mut resp = admin_redirect("/admin");
     if let Ok(hv) = HeaderValue::from_str(&cookie) {
         resp.headers_mut().insert(header::SET_COOKIE, hv);
     }
@@ -1416,15 +1417,15 @@ async fn admin_user_profile_submit(
     Form(form): Form<AdminProfileForm>,
 ) -> Response {
     if verify_admin_cookie_and_csrf(&state, &headers, &form.csrf).is_none() {
-        return Redirect::to("/admin?err=Session+expired").into_response();
+        return admin_redirect("/admin?err=Session+expired");
     }
     let Some(pk) = normalize_pubkey_hex(&form.pubkey) else {
-        return Redirect::to("/admin?err=Invalid+pubkey").into_response();
+        return admin_redirect("/admin?err=Invalid+pubkey");
     };
     let dur = match parse_optional_positive_days(&form.duration_days) {
         Ok(d) => d,
         Err(msg) => {
-            return Redirect::to(&format!("/admin?err={}", url_encode(msg))).into_response();
+            return admin_redirect(&format!("/admin?err={}", url_encode(msg)));
         }
     };
     let now = unix_now();
@@ -1437,10 +1438,8 @@ async fn admin_user_profile_submit(
         "admin",
         now,
     ) {
-        Ok(_) => Redirect::to("/admin?msg=User+profile+updated").into_response(),
-        Err(e) => {
-            Redirect::to(&format!("/admin?err={}", url_encode(&e.to_string()))).into_response()
-        }
+        Ok(_) => admin_redirect("/admin?msg=User+profile+updated"),
+        Err(e) => admin_redirect(&format!("/admin?err={}", url_encode(&e.to_string()))),
     }
 }
 
@@ -1457,21 +1456,19 @@ async fn admin_user_status_submit(
     Form(form): Form<AdminStatusForm>,
 ) -> Response {
     if verify_admin_cookie_and_csrf(&state, &headers, &form.csrf).is_none() {
-        return Redirect::to("/admin?err=Session+expired").into_response();
+        return admin_redirect("/admin?err=Session+expired");
     }
     let Some(pk) = normalize_pubkey_hex(&form.pubkey) else {
-        return Redirect::to("/admin?err=Invalid+pubkey").into_response();
+        return admin_redirect("/admin?err=Invalid+pubkey");
     };
     let st = match form.status.as_str() {
         "active" => AccountStatus::Active,
         "suspended" => AccountStatus::Suspended,
-        _ => return Redirect::to("/admin?err=Invalid+status").into_response(),
+        _ => return admin_redirect("/admin?err=Invalid+status"),
     };
     match state.db.set_user_status(&pk, st, unix_now()) {
-        Ok(()) => Redirect::to("/admin?msg=User+status+updated").into_response(),
-        Err(e) => {
-            Redirect::to(&format!("/admin?err={}", url_encode(&e.to_string()))).into_response()
-        }
+        Ok(()) => admin_redirect("/admin?msg=User+status+updated"),
+        Err(e) => admin_redirect(&format!("/admin?err={}", url_encode(&e.to_string()))),
     }
 }
 
@@ -1487,16 +1484,14 @@ async fn admin_user_delete_submit(
     Form(form): Form<AdminDeleteUserForm>,
 ) -> Response {
     if verify_admin_cookie_and_csrf(&state, &headers, &form.csrf).is_none() {
-        return Redirect::to("/admin?err=Session+expired").into_response();
+        return admin_redirect("/admin?err=Session+expired");
     }
     let Some(pk) = normalize_pubkey_hex(&form.pubkey) else {
-        return Redirect::to("/admin?err=Invalid+pubkey").into_response();
+        return admin_redirect("/admin?err=Invalid+pubkey");
     };
     match state.db.delete_account_and_data(&pk) {
-        Ok(_) => Redirect::to("/admin?msg=User+deleted").into_response(),
-        Err(e) => {
-            Redirect::to(&format!("/admin?err={}", url_encode(&e.to_string()))).into_response()
-        }
+        Ok(_) => admin_redirect("/admin?msg=User+deleted"),
+        Err(e) => admin_redirect(&format!("/admin?err={}", url_encode(&e.to_string()))),
     }
 }
 
@@ -1518,22 +1513,21 @@ async fn admin_create_code_submit(
     Form(form): Form<AdminCreateCodeForm>,
 ) -> Response {
     if verify_admin_cookie_and_csrf(&state, &headers, &form.csrf).is_none() {
-        return Redirect::to("/admin?err=Session+expired").into_response();
+        return admin_redirect("/admin?err=Session+expired");
     }
     let count = match form.count.trim() {
         "" => 1usize,
         raw => match raw.parse::<usize>() {
-            Ok(n) if n > 0 => n.clamp(1, 100),
+            Ok(n) if (1..=100).contains(&n) => n,
             _ => {
-                return Redirect::to("/admin?err=Code+count+must+be+a+positive+integer")
-                    .into_response();
+                return admin_redirect("/admin?err=Code+count+must+be+between+1+and+100");
             }
         },
     };
     let dur = match parse_optional_positive_days(&form.duration_days) {
         Ok(d) => d,
         Err(msg) => {
-            return Redirect::to(&format!("/admin?err={}", url_encode(msg))).into_response();
+            return admin_redirect(&format!("/admin?err={}", url_encode(msg)));
         }
     };
     let note = Some(form.note.trim().to_string()).filter(|s| !s.is_empty());
@@ -1551,7 +1545,7 @@ async fn admin_create_code_submit(
     ) {
         Ok(created) => {
             let preview: Vec<_> = created.iter().take(5).map(|c| c.code.as_str()).collect();
-            Redirect::to(&format!(
+            admin_redirect(&format!(
                 "/admin?msg={}",
                 url_encode(&format!(
                     "Created {} code(s): {}",
@@ -1559,12 +1553,22 @@ async fn admin_create_code_submit(
                     preview.join(", ")
                 ))
             ))
-            .into_response()
         }
-        Err(e) => {
-            Redirect::to(&format!("/admin?err={}", url_encode(&e.to_string()))).into_response()
-        }
+        Err(e) => admin_redirect(&format!("/admin?err={}", url_encode(&e.to_string()))),
     }
+}
+
+fn is_https_url(url: &str) -> bool {
+    url.trim()
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+}
+
+fn admin_redirect(location: &str) -> Response {
+    let mut resp = Redirect::to(location).into_response();
+    resp.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    resp
 }
 
 fn extract_admin_session_cookie(headers: &HeaderMap) -> Option<String> {
@@ -1723,5 +1727,104 @@ mod tests {
         assert_eq!(format_short_pubkey("short"), "short");
         assert_eq!(format_short_pubkey("äöüß"), "äöüß");
         assert_eq!(format_short_pubkey(&"a".repeat(64)), "aaaaaaaaaa...aaaaaa");
+    }
+
+    #[tokio::test]
+    async fn test_s05_recheck_uppercase_https_cookie_secure_and_logout_csrf() {
+        use crate::crypto::hash_admin_token;
+
+        let dir = TempDir::new().unwrap();
+        let mut cfg = Config::default();
+        cfg.server.db_path = dir.path().join("web_unit_https.redb");
+        cfg.server.public_base_url = "HTTPS://sync.example.org".to_string();
+        cfg.mode.enable_admin_app = false;
+        cfg.security.admin_token_hash = hash_admin_token("secret-token").unwrap();
+
+        let state = AppState::from_config(cfg).unwrap();
+        let app = web_router(&state.config).with_state(state.clone());
+
+        let login_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/login")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from("token=secret-token"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login_resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            login_resp
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        let login_sc = login_resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            login_sc.contains("; Secure"),
+            "Uppercase HTTPS:// public_base_url must emit ; Secure on login cookie, got: {login_sc}"
+        );
+        let sess_cookie = login_sc.split(';').next().unwrap().to_string();
+
+        // Logout with bogus CSRF must NOT clear cookie or revoke session
+        let forged_logout = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/logout")
+                    .header(header::COOKIE, &sess_cookie)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from("csrf=bad"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forged_logout.status(), StatusCode::SEE_OTHER);
+        assert!(forged_logout.headers().get(header::SET_COOKIE).is_none());
+
+        // Logout with valid CSRF must clear cookie with ; Secure and Cache-Control: no-store
+        let sid = sess_cookie.split_once('=').unwrap().1;
+        let csrf = generate_session_csrf_pair(state.db.pepper(), sid);
+        let valid_logout = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/logout")
+                    .header(header::COOKIE, &sess_cookie)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!("csrf={}", url_encode(&csrf))))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(valid_logout.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            valid_logout
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        let logout_sc = valid_logout
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            logout_sc.contains("; Secure"),
+            "Uppercase HTTPS:// public_base_url must emit ; Secure on logout cookie, got: {logout_sc}"
+        );
     }
 }

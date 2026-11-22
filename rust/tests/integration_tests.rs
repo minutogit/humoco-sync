@@ -7376,6 +7376,179 @@ async fn test_s05_admin_api_rate_limit_preauth_and_cache_control() {
 }
 
 #[tokio::test]
+async fn test_s05_recheck_admin_api_bounds_and_ui_session_hardening() {
+    use humoco_sync_server::crypto::hash_admin_token;
+
+    let (_, admin_pk) = gen_keypair();
+    let (_, target_pk) = gen_keypair();
+    let api_secret = "recheck-admin-api-secret";
+    let ui_secret = "recheck-admin-ui-secret";
+
+    let mut cfg = base_hybrid_config(&admin_pk);
+    cfg.security.admin_token_hash = hash_admin_token(ui_secret).unwrap();
+    cfg.security.api_bearer_token_hash = hash_admin_token(api_secret).unwrap();
+    cfg.security.ip_requests_per_minute = 120;
+    let srv = TestServer::start(cfg).await;
+
+    // 1. POST /api/v1/admin/codes must reject count=0, count=501, duration_days=0, expires_in_days=0 with 400
+    for bad_codes_payload in [
+        serde_json::json!({ "profile": "pro", "count": 0 }),
+        serde_json::json!({ "profile": "pro", "count": 501 }),
+        serde_json::json!({ "profile": "pro", "count": 1, "duration_days": 0 }),
+        serde_json::json!({ "profile": "pro", "count": 1, "expires_in_days": 0 }),
+    ] {
+        let resp = srv
+            .client
+            .post(format!("{}/api/v1/admin/codes", srv.base_url))
+            .header("Authorization", format!("Bearer {}", api_secret))
+            .json(&bad_codes_payload)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            400,
+            "POST /api/v1/admin/codes must reject {bad_codes_payload} with 400"
+        );
+    }
+    assert!(
+        srv.state.db.list_redeem_codes().unwrap().is_empty(),
+        "Rejected /api/v1/admin/codes calls must NOT create any redeem codes"
+    );
+
+    // 2. POST /api/v1/admin/users/:pk/profile must reject duration_days=0 with 400
+    let zero_dur_prof = srv
+        .client
+        .post(format!(
+            "{}/api/v1/admin/users/{}/profile",
+            srv.base_url, target_pk
+        ))
+        .header("Authorization", format!("Bearer {}", api_secret))
+        .json(&serde_json::json!({ "profile": "pro", "duration_days": 0 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        zero_dur_prof.status().as_u16(),
+        400,
+        "POST /api/v1/admin/users/:pk/profile must reject duration_days=0 with 400"
+    );
+    assert!(srv
+        .state
+        .db
+        .get_registered_user(&target_pk)
+        .unwrap()
+        .is_none());
+
+    // 3. /admin/login must emit Cache-Control: no-store on redirect carrying Set-Cookie
+    let login_resp = srv
+        .client
+        .post(format!("{}/admin/login", srv.base_url))
+        .form(&[("token", ui_secret)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login_resp.status().as_u16(), 303);
+    assert_eq!(
+        login_resp
+            .headers()
+            .get(reqwest::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store"),
+        "/admin/login redirect with Set-Cookie must emit Cache-Control: no-store"
+    );
+    let sess_cookie = login_resp
+        .headers()
+        .get(reqwest::header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    let dash = srv
+        .client
+        .get(format!("{}/admin", srv.base_url))
+        .header(reqwest::header::COOKIE, &sess_cookie)
+        .send()
+        .await
+        .unwrap();
+    let html = dash.text().await.unwrap();
+    let csrf = html
+        .split("name=\"csrf\" value=\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .unwrap()
+        .to_string();
+
+    // 4. POST /admin/codes with count=101 must fail with err= instead of silently clamping to 100
+    let over_count = srv
+        .client
+        .post(format!("{}/admin/codes", srv.base_url))
+        .header(reqwest::header::COOKIE, &sess_cookie)
+        .form(&[
+            ("csrf", csrf.as_str()),
+            ("profile", "pro"),
+            ("count", "101"),
+            ("duration_days", "30"),
+            ("note", "over-limit"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(over_count.status().as_u16(), 303);
+    assert_eq!(
+        over_count
+            .headers()
+            .get(reqwest::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+    let over_loc = over_count
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        over_loc.contains("err="),
+        "POST /admin/codes count=101 must return err=, got {over_loc}"
+    );
+    assert!(srv.state.db.list_redeem_codes().unwrap().is_empty());
+
+    // 5. POST /admin/logout with wrong CSRF must NOT emit Set-Cookie clearing the admin session
+    let bad_logout = srv
+        .client
+        .post(format!("{}/admin/logout", srv.base_url))
+        .header(reqwest::header::COOKIE, &sess_cookie)
+        .form(&[("csrf", "forged-csrf-token")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_logout.status().as_u16(), 303);
+    assert!(
+        bad_logout
+            .headers()
+            .get(reqwest::header::SET_COOKIE)
+            .is_none(),
+        "Failed-CSRF /admin/logout must NOT emit Set-Cookie to clear session"
+    );
+    let dash_still_valid = srv
+        .client
+        .get(format!("{}/admin", srv.base_url))
+        .header(reqwest::header::COOKIE, &sess_cookie)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(dash_still_valid.contains("Authenticated Operator"));
+}
+
+#[tokio::test]
 async fn test_s09_f1_conditional_preconditions_parity() {
     let (_admin_sk, admin_pk) = gen_keypair();
     let (friend_sk, friend_pk) = gen_keypair();

@@ -184,6 +184,9 @@ async fn api_set_user_profile(
         Ok(p) => p,
         Err(resp) => return resp,
     };
+    if payload.duration_days == Some(0) {
+        return json_error(StatusCode::BAD_REQUEST, "duration_days must be >= 1");
+    }
     let now = unix_now();
     if let Err(e) = state.db.register_or_upgrade_user(
         &state.config,
@@ -314,11 +317,16 @@ async fn api_create_codes(
         Ok(p) => p,
         Err(resp) => return resp,
     };
-    let count = payload.count.clamp(1, 500);
+    if payload.duration_days == Some(0) {
+        return json_error(StatusCode::BAD_REQUEST, "duration_days must be >= 1");
+    }
+    if payload.expires_in_days == Some(0) {
+        return json_error(StatusCode::BAD_REQUEST, "expires_in_days must be >= 1");
+    }
     let now = unix_now();
     match state.db.create_redeem_codes(
         &state.config,
-        count,
+        payload.count,
         payload.profile.trim(),
         payload.duration_days,
         payload.max_uses,
