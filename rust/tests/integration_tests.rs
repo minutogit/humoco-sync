@@ -10487,3 +10487,301 @@ async fn test_s02_import_and_finalize_reject_forked_history_chain() {
     .unwrap();
     assert_eq!(stored_man, man_rev2_a);
 }
+
+#[tokio::test]
+async fn test_s03_suspended_media_ttl_enforcement() {
+    let (_admin_sk, admin_pk) = gen_keypair();
+    let (_free_sk, free_pk) = gen_keypair();
+    let (_pro_sk, pro_pk) = gen_keypair();
+    let (_observer_sk, observer_pk) = gen_keypair();
+
+    let mut cfg = base_hybrid_config(&admin_pk);
+    cfg.mode.enable_public_registration = true;
+    cfg.mode.registration_gates = vec!["open".to_string(), "code".to_string()];
+    cfg.media.ttl_days = 90; // global fallback differs from free (60d) and pro (365d)
+    let srv = TestServer::start(cfg).await;
+    let db = &srv.state.db;
+    let base_cfg = &srv.state.config;
+    let now = unix_now();
+
+    db.put_admin_members(base_cfg, "card", std::slice::from_ref(&observer_pk), now)
+        .unwrap();
+    db.register_or_upgrade_user(base_cfg, &free_pk, "free", None, None, "open", now)
+        .unwrap();
+    db.register_or_upgrade_user(base_cfg, &pro_pk, "pro", None, Some(400), "code", now)
+        .unwrap();
+
+    // Free media uploaded 65 days ago (> 60d free TTL, < 90d global fallback TTL)
+    let m_free = sha256_hex(b"suspended-free-media-65d");
+    let free_ts = now.saturating_sub(65 * 86_400);
+    db.put_media(
+        base_cfg,
+        &free_pk,
+        &m_free,
+        b"free-expired-payload",
+        &ConditionalPrecondition::None,
+        free_ts,
+    )
+    .unwrap();
+
+    // Pro media uploaded 100 days ago (> 90d global fallback TTL, < 365d pro TTL)
+    let m_pro = sha256_hex(b"suspended-pro-media-100d");
+    let pro_ts = now.saturating_sub(100 * 86_400);
+    db.put_media(
+        base_cfg,
+        &pro_pk,
+        &m_pro,
+        b"pro-active-payload",
+        &ConditionalPrecondition::None,
+        pro_ts,
+    )
+    .unwrap();
+
+    // Suspend both users
+    db.set_user_status(
+        &free_pk,
+        humoco_sync_server::db::AccountStatus::Suspended,
+        now,
+    )
+    .unwrap();
+    db.set_user_status(
+        &pro_pk,
+        humoco_sync_server::db::AccountStatus::Suspended,
+        now,
+    )
+    .unwrap();
+
+    // 1. Suspended free user's 65d-old media (> 60d free TTL) must remain expired (None), NOT resurrected by 90d global TTL
+    assert!(
+        db.get_media_blob(base_cfg, &m_free, now).unwrap().is_none(),
+        "get_media_blob must enforce free media TTL (60d) on Suspended accounts instead of 90d global fallback"
+    );
+
+    // 2. Suspended pro user's 100d-old media (< 365d pro TTL) must remain intact (Some), NOT prematurely treated as expired by 90d global TTL
+    assert!(
+        db.get_media_blob(base_cfg, &m_pro, now).unwrap().is_some(),
+        "get_media_blob must preserve pro media TTL (365d) when owner is Suspended"
+    );
+
+    // 3. head_capability must apply resolved profile media TTL for Suspended accounts (both owner stats and X-Media-Id lookup)
+    let cap_free = db
+        .head_capability(base_cfg, &free_pk, Some("media"), None, None, now)
+        .unwrap();
+    assert_eq!(
+        cap_free.media_used_count, 0,
+        "head_capability must exclude TTL-expired media for Suspended free user"
+    );
+    assert_eq!(cap_free.media_used_bytes, 0);
+
+    let cap_obs_free = db
+        .head_capability(
+            base_cfg,
+            &observer_pk,
+            Some("media"),
+            None,
+            Some(&m_free),
+            now,
+        )
+        .unwrap();
+    assert_eq!(
+        cap_obs_free.slot_occupied,
+        Some(false),
+        "head_capability X-Media-Id must report expired Suspended free media as unoccupied"
+    );
+
+    let cap_obs_pro = db
+        .head_capability(
+            base_cfg,
+            &observer_pk,
+            Some("media"),
+            None,
+            Some(&m_pro),
+            now,
+        )
+        .unwrap();
+    assert_eq!(
+        cap_obs_pro.slot_occupied,
+        Some(true),
+        "head_capability X-Media-Id must report live Suspended pro media as occupied"
+    );
+
+    // 4. run_maintenance must prune Suspended free expired media (65d > 60d) while retaining Suspended pro live media (100d < 365d)
+    db.run_maintenance(base_cfg, now).unwrap();
+    assert_eq!(
+        db.admin_status(base_cfg, now).unwrap().slot_count,
+        1,
+        "run_maintenance must prune Suspended free expired media and keep Suspended pro media"
+    );
+    assert!(db.get_media_blob(base_cfg, &m_pro, now).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn test_s03_admin_config_overrides_applied_across_all_db_paths() {
+    let (_admin_sk, admin_pk) = gen_keypair();
+    let (_dual_sk, dual_pk) = gen_keypair();
+    let (_reg_friends_sk, reg_friends_pk) = gen_keypair();
+    let (_dual2_sk, dual2_pk) = gen_keypair();
+
+    let mut cfg = base_hybrid_config(&admin_pk);
+    cfg.mode.enable_public_registration = true;
+    cfg.mode.registration_gates = vec!["open".to_string(), "code".to_string()];
+    cfg.profiles.insert(
+        "starter_backup".to_string(),
+        humoco_sync_server::config::ProfileConfig {
+            display_name: "Starter Backup".to_string(),
+            max_total_bytes: 15 * 1024 * 1024, // 15 MiB (< default 25 MiB friends, > 10 MiB overridden friends)
+            is_free_pool: false,
+            store_contact_email: false,
+            channels: std::collections::BTreeMap::from([
+                (
+                    "card".to_string(),
+                    humoco_sync_server::config::ChannelQuotaConfig {
+                        max_bytes: 524_288,
+                        ttl_days: 90,
+                        max_user_count: None,
+                        max_user_bytes: None,
+                    },
+                ),
+                (
+                    "backup".to_string(),
+                    humoco_sync_server::config::ChannelQuotaConfig {
+                        max_bytes: 524_288,
+                        ttl_days: 90,
+                        max_user_count: None,
+                        max_user_bytes: None,
+                    },
+                ),
+            ]),
+        },
+    );
+
+    let srv = TestServer::start(cfg).await;
+    let db = &srv.state.db;
+    let base_cfg = &srv.state.config;
+    let now = unix_now();
+
+    // Dual member: admin_app("card") + registered("pro" 100 MiB, card TTL 365d, media TTL 365d)
+    db.put_admin_members(base_cfg, "card", std::slice::from_ref(&dual_pk), now)
+        .unwrap();
+    db.register_or_upgrade_user(base_cfg, &dual_pk, "pro", None, Some(500), "code", now)
+        .unwrap();
+
+    // Override admin_app_profile ("friends") to 200 MiB (> pro's 100 MiB).
+    // Now effective chosen_prof for dual_pk is "friends" (card TTL 0 = infinite, media TTL 90d).
+    db.set_admin_config_overrides(&humoco_sync_server::db::AdminConfigOverrides {
+        max_total_storage_mb: 2048,
+        max_members: 300,
+        max_user_storage_mb: 200,
+    })
+    .unwrap();
+
+    let card_old_ts = now.saturating_sub(400 * 86_400); // > 365d pro TTL, valid under friends TTL 0
+    db.put_slot(
+        base_cfg,
+        &dual_pk,
+        "card",
+        None,
+        b"dual-infinite-friends-card",
+        &ConditionalPrecondition::None,
+        card_old_ts,
+    )
+    .unwrap();
+
+    let m_dual = sha256_hex(b"dual-friends-media-120d");
+    let media_old_ts = now.saturating_sub(120 * 86_400); // > 90d friends TTL, < 365d pro TTL
+    db.put_media(
+        base_cfg,
+        &dual_pk,
+        &m_dual,
+        b"dual-expired-friends-media",
+        &ConditionalPrecondition::None,
+        media_old_ts,
+    )
+    .unwrap();
+
+    // 1. head_capability, get_slot_blob, build_admin_index, get_media_blob must all agree on "friends"
+    let cap = db
+        .head_capability(base_cfg, &dual_pk, Some("card"), None, None, now)
+        .unwrap();
+    assert_eq!(cap.slot_occupied, Some(true));
+    assert!(
+        db.get_slot_blob(base_cfg, "card", &dual_pk, now)
+            .unwrap()
+            .is_some(),
+        "get_slot_blob must apply admin_config overrides so friends (TTL 0) beats pro (365d)"
+    );
+    let (idx_entries, _) = db.build_admin_index(base_cfg).unwrap();
+    assert_eq!(
+        idx_entries.len(),
+        1,
+        "build_admin_index must apply admin_config overrides so friends (TTL 0) stays in index.json"
+    );
+    assert!(
+        db.get_media_blob(base_cfg, &m_dual, now).unwrap().is_none(),
+        "get_media_blob must apply admin_config overrides so friends media TTL (90d) expires 120d blob"
+    );
+
+    // 2. run_maintenance must prune the 120d media (> 90d friends TTL) while preserving the 400d card slot (friends TTL 0)
+    db.run_maintenance(base_cfg, now).unwrap();
+    assert!(
+        db.get_slot_blob(base_cfg, "card", &dual_pk, now)
+            .unwrap()
+            .is_some(),
+        "run_maintenance must preserve friends infinite-TTL card slot under admin_config override"
+    );
+    assert_eq!(
+        db.admin_status(base_cfg, now).unwrap().slot_count,
+        1,
+        "run_maintenance must prune expired friends media while keeping friends card slot"
+    );
+
+    // 3. redeem_code_for_pubkey must compare against effective_config (200 MiB friends > 100 MiB pro => 409)
+    db.register_or_upgrade_user(
+        base_cfg,
+        &reg_friends_pk,
+        "friends",
+        None,
+        Some(30),
+        "admin",
+        now,
+    )
+    .unwrap();
+    let pro_codes = db
+        .create_redeem_codes(base_cfg, 1, "pro", Some(30), 1, None, None, None, now)
+        .unwrap();
+    let err = db
+        .redeem_code_for_pubkey(base_cfg, &reg_friends_pk, &pro_codes[0].code, now)
+        .unwrap_err();
+    assert!(
+        matches!(err, humoco_sync_server::db::DbError::Http { status: 409, .. }),
+        "redeem_code_for_pubkey must block downgrade from 200 MiB effective friends to 100 MiB pro, got {err:?}"
+    );
+
+    // 4. delete_slot must reflect effective_config when admin_config lowers friends below starter_backup (15 MiB)
+    let mut cfg2 = (**base_cfg).clone();
+    if let Some(fp) = cfg2.profiles.get_mut("friends") {
+        fp.channels.remove("backup");
+    }
+    db.put_admin_members(&cfg2, "card", std::slice::from_ref(&dual2_pk), now)
+        .unwrap();
+    db.register_or_upgrade_user(
+        &cfg2,
+        &dual2_pk,
+        "starter_backup",
+        None,
+        Some(60),
+        "code",
+        now,
+    )
+    .unwrap();
+    db.set_admin_config_overrides(&humoco_sync_server::db::AdminConfigOverrides {
+        max_total_storage_mb: 2048,
+        max_members: 300,
+        max_user_storage_mb: 10, // lowers friends to 10 MiB < starter_backup 15 MiB
+    })
+    .unwrap();
+    assert!(
+        db.delete_slot(&cfg2, &dual2_pk, "backup", None, now).is_ok(),
+        "delete_slot must honor admin_config overrides where starter_backup (15 MiB > 10 MiB friends) grants backup channel"
+    );
+}

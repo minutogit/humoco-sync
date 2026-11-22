@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 #[cfg(unix)]
@@ -393,10 +394,10 @@ impl SyncDb {
 
             // Anti-Amnesia guard (SPEC Section 6.1): if lock buckets exist, the persistent
             // lock signing keypair MUST already exist inside redb.
-            let lock_key_existing = server_meta.get("lock_key")?.map(|g| g.value().to_vec());
-            match lock_key_existing {
-                Some(raw) => {
-                    if raw.len() != 32 {
+            let lock_key_len = server_meta.get("lock_key")?.map(|g| g.value().len());
+            match lock_key_len {
+                Some(len) => {
+                    if len != 32 {
                         return Err(DbError::Backend(
                             "Corrupted SERVER_META['lock_key'] length".to_string(),
                         ));
@@ -416,12 +417,16 @@ impl SyncDb {
             }
 
             if !config_pepper_hex.is_empty() {
-                let bytes = hex::decode(config_pepper_hex)
-                    .map_err(|_| DbError::http(500, "Invalid configured server_pepper_hex"))?;
+                let bytes = Zeroizing::new(
+                    hex::decode(config_pepper_hex)
+                        .map_err(|_| DbError::http(500, "Invalid configured server_pepper_hex"))?,
+                );
                 let hash = blake3::hash(&bytes);
                 pepper.copy_from_slice(hash.as_bytes());
             } else {
-                let existing = server_meta.get("pepper")?.map(|g| g.value().to_vec());
+                let existing = server_meta
+                    .get("pepper")?
+                    .map(|g| Zeroizing::new(g.value().to_vec()));
                 if let Some(raw) = existing {
                     if raw.len() == 32 {
                         pepper.copy_from_slice(&raw);
@@ -560,22 +565,39 @@ impl SyncDb {
         Ok(())
     }
 
+    fn apply_admin_config_overrides(cfg: &mut Config, ov: &AdminConfigOverrides) {
+        cfg.storage.max_total_storage_mb = ov.max_total_storage_mb;
+        cfg.storage.max_free_pool_mb = cfg.storage.max_free_pool_mb.min(ov.max_total_storage_mb);
+        cfg.mode.max_admin_members = ov.max_members;
+        let user_bytes = ov.max_user_storage_mb.saturating_mul(1024 * 1024);
+        if let Some(prof) = cfg.profiles.get_mut(&cfg.mode.admin_app_profile) {
+            prof.max_total_bytes = user_bytes;
+            if let Some(mq) = prof.channels.get_mut("media") {
+                if let Some(ref mut ubytes) = mq.max_user_bytes {
+                    *ubytes = (*ubytes).min(user_bytes);
+                }
+            }
+        }
+    }
+
+    fn effective_config_in_txn<'a, R: ReadableTable<&'static str, &'static [u8]>>(
+        base: &'a Config,
+        server_meta: &R,
+    ) -> Result<Cow<'a, Config>, DbError> {
+        if let Some(guard) = server_meta.get("admin_config")? {
+            let ov: AdminConfigOverrides = serde_json::from_slice(guard.value())?;
+            let mut cfg = base.clone();
+            Self::apply_admin_config_overrides(&mut cfg, &ov);
+            Ok(Cow::Owned(cfg))
+        } else {
+            Ok(Cow::Borrowed(base))
+        }
+    }
+
     pub fn effective_config(&self, base: &Config) -> Result<Config, DbError> {
         let mut cfg = base.clone();
         if let Some(ov) = self.get_admin_config_overrides()? {
-            cfg.storage.max_total_storage_mb = ov.max_total_storage_mb;
-            cfg.storage.max_free_pool_mb =
-                cfg.storage.max_free_pool_mb.min(ov.max_total_storage_mb);
-            cfg.mode.max_admin_members = ov.max_members;
-            let user_bytes = ov.max_user_storage_mb.saturating_mul(1024 * 1024);
-            if let Some(prof) = cfg.profiles.get_mut(&cfg.mode.admin_app_profile) {
-                prof.max_total_bytes = user_bytes;
-                if let Some(mq) = prof.channels.get_mut("media") {
-                    if let Some(ref mut ubytes) = mq.max_user_bytes {
-                        *ubytes = (*ubytes).min(user_bytes);
-                    }
-                }
-            }
+            Self::apply_admin_config_overrides(&mut cfg, &ov);
         }
         Ok(cfg)
     }
@@ -645,7 +667,7 @@ impl SyncDb {
         Ok((requested_name, requested_prof, false, None))
     }
 
-    fn effective_slot_ttl_days_in_txn<
+    fn effective_channel_ttl_days_in_txn<
         R1: ReadableTable<&'static str, &'static [u8]>,
         R2: ReadableTable<&'static str, &'static [u8]>,
     >(
@@ -656,6 +678,11 @@ impl SyncDb {
         channel: &str,
         now_secs: u64,
     ) -> Result<u32, DbError> {
+        let fallback_ttl = if channel == "media" {
+            cfg.media.ttl_days
+        } else {
+            0
+        };
         if let Some(access) =
             Self::resolve_member_access_in_txn(admin_table, reg_table, cfg, owner_pubkey, now_secs)?
         {
@@ -664,23 +691,31 @@ impl SyncDb {
                 .channels
                 .get(channel)
                 .map(|q| q.ttl_days)
-                .unwrap_or(0));
+                .unwrap_or(fallback_ttl));
         }
         if let Some(g) = reg_table.get(owner_pubkey)? {
             let rec: RegisteredUserRecord = serde_json::from_slice(g.value())?;
             let (_, prof, _, _) = Self::resolve_registered_profile(&rec, cfg, now_secs)?;
-            return Ok(prof.channels.get(channel).map(|q| q.ttl_days).unwrap_or(0));
+            return Ok(prof
+                .channels
+                .get(channel)
+                .map(|q| q.ttl_days)
+                .unwrap_or(fallback_ttl));
         }
         if Self::has_any_raw_admin_membership(admin_table, owner_pubkey)? {
             if let Some(prof) = cfg.profiles.get(&cfg.mode.admin_app_profile) {
-                return Ok(prof.channels.get(channel).map(|q| q.ttl_days).unwrap_or(0));
+                return Ok(prof
+                    .channels
+                    .get(channel)
+                    .map(|q| q.ttl_days)
+                    .unwrap_or(fallback_ttl));
             }
         }
         Ok(cfg
             .profiles
             .get(&cfg.mode.default_public_profile)
             .and_then(|p| p.channels.get(channel).map(|q| q.ttl_days))
-            .unwrap_or(0))
+            .unwrap_or(fallback_ttl))
     }
 
     fn resolve_member_access_in_txn<
@@ -805,8 +840,9 @@ impl SyncDb {
         pubkey: &str,
         now_secs: u64,
     ) -> Result<Option<EffectiveAccess>, DbError> {
-        let eff_cfg = self.effective_config(cfg)?;
         let read_txn = self.db.begin_read()?;
+        let server_meta = read_txn.open_table(SERVER_META)?;
+        let eff_cfg = Self::effective_config_in_txn(cfg, &server_meta)?;
         let admin_table = read_txn.open_table(ADMIN_MEMBERS)?;
         let reg_table = read_txn.open_table(REGISTERED_USERS)?;
         Self::resolve_member_access_in_txn(&admin_table, &reg_table, &eff_cfg, pubkey, now_secs)
@@ -833,9 +869,10 @@ impl SyncDb {
         media_id: Option<&str>,
         now_secs: u64,
     ) -> Result<HeadCapability, DbError> {
-        let effective_cfg = self.effective_config(cfg)?;
-        let cfg = &effective_cfg;
         let read_txn = self.db.begin_read()?;
+        let server_meta = read_txn.open_table(SERVER_META)?;
+        let effective_cfg = Self::effective_config_in_txn(cfg, &server_meta)?;
+        let cfg = effective_cfg.as_ref();
         let admin_table = read_txn.open_table(ADMIN_MEMBERS)?;
         let reg_table = read_txn.open_table(REGISTERED_USERS)?;
         let slot_meta = read_txn.open_table(SLOT_META)?;
@@ -843,10 +880,22 @@ impl SyncDb {
 
         let access =
             Self::resolve_member_access_in_txn(&admin_table, &reg_table, cfg, pubkey, now_secs)?;
-        let caller_media_ttl = access
-            .as_ref()
-            .and_then(|a| a.profile.channels.get("media").map(|q| q.ttl_days))
-            .unwrap_or(cfg.media.ttl_days);
+        let caller_media_ttl = if let Some(ref a) = access {
+            a.profile
+                .channels
+                .get("media")
+                .map(|q| q.ttl_days)
+                .unwrap_or(cfg.media.ttl_days)
+        } else {
+            Self::effective_channel_ttl_days_in_txn(
+                &admin_table,
+                &reg_table,
+                cfg,
+                pubkey,
+                "media",
+                now_secs,
+            )?
+        };
 
         let mut media_used_count = 0usize;
         let mut media_used_bytes = 0u64;
@@ -931,15 +980,14 @@ impl SyncDb {
                 if let Some(mid) = media_id {
                     if let Some(g) = media_meta.get(mid)? {
                         let meta: MediaMetaRecord = serde_json::from_slice(g.value())?;
-                        let ttl_days = Self::resolve_member_access_in_txn(
+                        let ttl_days = Self::effective_channel_ttl_days_in_txn(
                             &admin_table,
                             &reg_table,
                             cfg,
                             &meta.owner_pubkey,
+                            "media",
                             now_secs,
-                        )?
-                        .and_then(|a| a.profile.channels.get("media").map(|q| q.ttl_days))
-                        .unwrap_or(cfg.media.ttl_days);
+                        )?;
                         if is_ttl_expired(meta.created_at, ttl_days, now_secs) {
                             (Some(false), None)
                         } else if meta.owner_pubkey == pubkey {
@@ -1011,13 +1059,14 @@ impl SyncDb {
         if data.is_empty() {
             return Err(DbError::http(400, "Empty payload"));
         }
-        let effective_cfg = self.effective_config(cfg)?;
-        let cfg = &effective_cfg;
         let slot_id = crate::crypto::format_slot_id(pubkey, prefix);
         let skey = slot_key(channel, &slot_id);
 
         let write_txn = self.db.begin_write()?;
         let outcome = {
+            let server_meta = write_txn.open_table(SERVER_META)?;
+            let effective_cfg = Self::effective_config_in_txn(cfg, &server_meta)?;
+            let cfg = effective_cfg.as_ref();
             let admin_table = write_txn.open_table(ADMIN_MEMBERS)?;
             let reg_table = write_txn.open_table(REGISTERED_USERS)?;
             let mut slot_meta = write_txn.open_table(SLOT_META)?;
@@ -1120,10 +1169,11 @@ impl SyncDb {
         if data.is_empty() {
             return Err(DbError::http(400, "Empty payload"));
         }
-        let effective_cfg = self.effective_config(cfg)?;
-        let cfg = &effective_cfg;
         let write_txn = self.db.begin_write()?;
         let outcome = {
+            let server_meta = write_txn.open_table(SERVER_META)?;
+            let effective_cfg = Self::effective_config_in_txn(cfg, &server_meta)?;
+            let cfg = effective_cfg.as_ref();
             let admin_table = write_txn.open_table(ADMIN_MEMBERS)?;
             let reg_table = write_txn.open_table(REGISTERED_USERS)?;
             let slot_meta = write_txn.open_table(SLOT_META)?;
@@ -1306,6 +1356,9 @@ impl SyncDb {
         let skey = slot_key(channel, &slot_id);
         let write_txn = self.db.begin_write()?;
         {
+            let server_meta = write_txn.open_table(SERVER_META)?;
+            let effective_cfg = Self::effective_config_in_txn(cfg, &server_meta)?;
+            let cfg = effective_cfg.as_ref();
             let admin_table = write_txn.open_table(ADMIN_MEMBERS)?;
             let reg_table = write_txn.open_table(REGISTERED_USERS)?;
             let mut slot_meta = write_txn.open_table(SLOT_META)?;
@@ -1358,6 +1411,9 @@ impl SyncDb {
     ) -> Result<usize, DbError> {
         let write_txn = self.db.begin_write()?;
         let deleted_count = {
+            let server_meta = write_txn.open_table(SERVER_META)?;
+            let effective_cfg = Self::effective_config_in_txn(cfg, &server_meta)?;
+            let cfg = effective_cfg.as_ref();
             let admin_table = write_txn.open_table(ADMIN_MEMBERS)?;
             let reg_table = write_txn.open_table(REGISTERED_USERS)?;
             let mut media_meta = write_txn.open_table(MEDIA_META)?;
@@ -1481,21 +1537,22 @@ impl SyncDb {
         pubkeys: &[String],
         now_secs: u64,
     ) -> Result<usize, DbError> {
-        let effective_cfg = self.effective_config(cfg)?;
-        let cfg = &effective_cfg;
         if !cfg.mode.enable_admin_app {
             return Err(DbError::http(403, "Admin app member management disabled"));
         }
         let target_set: BTreeSet<String> = pubkeys.iter().cloned().collect();
-        if target_set.len() > cfg.mode.max_admin_members {
-            return Err(DbError::http(
-                507,
-                "Insufficient Storage: Exceeds max_members limit",
-            ));
-        }
 
         let write_txn = self.db.begin_write()?;
         {
+            let server_meta = write_txn.open_table(SERVER_META)?;
+            let effective_cfg = Self::effective_config_in_txn(cfg, &server_meta)?;
+            let cfg = effective_cfg.as_ref();
+            if target_set.len() > cfg.mode.max_admin_members {
+                return Err(DbError::http(
+                    507,
+                    "Insufficient Storage: Exceeds max_members limit",
+                ));
+            }
             let mut admin_table = write_txn.open_table(ADMIN_MEMBERS)?;
             let reg_table = write_txn.open_table(REGISTERED_USERS)?;
             let mut slot_meta = write_txn.open_table(SLOT_META)?;
@@ -1612,6 +1669,9 @@ impl SyncDb {
     ) -> Result<(Vec<SyncIndexEntry>, String), DbError> {
         let now_secs = crate::crypto::unix_now();
         let read_txn = self.db.begin_read()?;
+        let server_meta = read_txn.open_table(SERVER_META)?;
+        let effective_cfg = Self::effective_config_in_txn(cfg, &server_meta)?;
+        let cfg = effective_cfg.as_ref();
         let admin_table = read_txn.open_table(ADMIN_MEMBERS)?;
         let reg_table = read_txn.open_table(REGISTERED_USERS)?;
         let slot_meta = read_txn.open_table(SLOT_META)?;
@@ -1676,6 +1736,9 @@ impl SyncDb {
     ) -> Result<Option<(SlotMetaRecord, Vec<u8>)>, DbError> {
         let skey = slot_key(channel, slot_id);
         let read_txn = self.db.begin_read()?;
+        let server_meta = read_txn.open_table(SERVER_META)?;
+        let effective_cfg = Self::effective_config_in_txn(cfg, &server_meta)?;
+        let cfg = effective_cfg.as_ref();
         let admin_table = read_txn.open_table(ADMIN_MEMBERS)?;
         let reg_table = read_txn.open_table(REGISTERED_USERS)?;
         let slot_meta = read_txn.open_table(SLOT_META)?;
@@ -1687,7 +1750,7 @@ impl SyncDb {
         let meta: SlotMetaRecord = serde_json::from_slice(meta_guard.value())?;
 
         // Respect TTL expiration (including Suspended or inactive accounts via profile fallback)
-        let ttl_days = Self::effective_slot_ttl_days_in_txn(
+        let ttl_days = Self::effective_channel_ttl_days_in_txn(
             &admin_table,
             &reg_table,
             cfg,
@@ -1712,6 +1775,9 @@ impl SyncDb {
         now_secs: u64,
     ) -> Result<Option<(MediaMetaRecord, Vec<u8>)>, DbError> {
         let read_txn = self.db.begin_read()?;
+        let server_meta = read_txn.open_table(SERVER_META)?;
+        let effective_cfg = Self::effective_config_in_txn(cfg, &server_meta)?;
+        let cfg = effective_cfg.as_ref();
         let admin_table = read_txn.open_table(ADMIN_MEMBERS)?;
         let reg_table = read_txn.open_table(REGISTERED_USERS)?;
         let media_meta = read_txn.open_table(MEDIA_META)?;
@@ -1722,15 +1788,14 @@ impl SyncDb {
         };
         let meta: MediaMetaRecord = serde_json::from_slice(meta_guard.value())?;
 
-        let ttl_days = Self::resolve_member_access_in_txn(
+        let ttl_days = Self::effective_channel_ttl_days_in_txn(
             &admin_table,
             &reg_table,
             cfg,
             &meta.owner_pubkey,
+            "media",
             now_secs,
-        )?
-        .and_then(|a| a.profile.channels.get("media").map(|q| q.ttl_days))
-        .unwrap_or(cfg.media.ttl_days);
+        )?;
         if is_ttl_expired(meta.created_at, ttl_days, now_secs) {
             return Ok(None);
         }
@@ -1769,9 +1834,10 @@ impl SyncDb {
         cfg: &Config,
         now_secs: u64,
     ) -> Result<AdminStatusResponse, DbError> {
-        let effective_cfg = self.effective_config(cfg)?;
-        let cfg = &effective_cfg;
         let read_txn = self.db.begin_read()?;
+        let server_meta = read_txn.open_table(SERVER_META)?;
+        let effective_cfg = Self::effective_config_in_txn(cfg, &server_meta)?;
+        let cfg = effective_cfg.as_ref();
         let admin_table = read_txn.open_table(ADMIN_MEMBERS)?;
         let reg_table = read_txn.open_table(REGISTERED_USERS)?;
         let slot_meta = read_txn.open_table(SLOT_META)?;
@@ -2103,6 +2169,9 @@ impl SyncDb {
 
         let write_txn = self.db.begin_write()?;
         let rec = {
+            let server_meta = write_txn.open_table(SERVER_META)?;
+            let effective_cfg = Self::effective_config_in_txn(cfg, &server_meta)?;
+            let cfg = effective_cfg.as_ref();
             let mut code_table = write_txn.open_table(REDEEM_CODES)?;
             let mut reg_table = write_txn.open_table(REGISTERED_USERS)?;
 
@@ -2207,14 +2276,14 @@ impl SyncDb {
             let (_, v) = entry?;
             let m: SlotMetaRecord = serde_json::from_slice(v.value())?;
             let u = usage.entry(m.owner_pubkey).or_default();
-            u.0 += m.size as u64;
+            u.0 = u.0.saturating_add(m.size as u64);
             u.1 += 1;
         }
         for entry in media_meta.iter()? {
             let (_, v) = entry?;
             let m: MediaMetaRecord = serde_json::from_slice(v.value())?;
             let u = usage.entry(m.owner_pubkey).or_default();
-            u.0 += m.size as u64;
+            u.0 = u.0.saturating_add(m.size as u64);
             u.2 += 1;
         }
 
@@ -2305,6 +2374,9 @@ impl SyncDb {
     pub fn run_maintenance(&self, cfg: &Config, now_secs: u64) -> Result<(), DbError> {
         let write_txn = self.db.begin_write()?;
         {
+            let server_meta = write_txn.open_table(SERVER_META)?;
+            let effective_cfg = Self::effective_config_in_txn(cfg, &server_meta)?;
+            let cfg = effective_cfg.as_ref();
             let admin_table = write_txn.open_table(ADMIN_MEMBERS)?;
             let mut reg_table = write_txn.open_table(REGISTERED_USERS)?;
             let mut nonces = write_txn.open_table(NONCES)?;
@@ -2376,7 +2448,7 @@ impl SyncDb {
             for entry in slot_meta.iter()? {
                 let (k, v) = entry?;
                 let m: SlotMetaRecord = serde_json::from_slice(v.value())?;
-                let ttl_days = Self::effective_slot_ttl_days_in_txn(
+                let ttl_days = Self::effective_channel_ttl_days_in_txn(
                     &admin_table,
                     &reg_table,
                     cfg,
@@ -2397,15 +2469,14 @@ impl SyncDb {
             for entry in media_meta.iter()? {
                 let (k, v) = entry?;
                 let m: MediaMetaRecord = serde_json::from_slice(v.value())?;
-                let ttl_days = Self::resolve_member_access_in_txn(
+                let ttl_days = Self::effective_channel_ttl_days_in_txn(
                     &admin_table,
                     &reg_table,
                     cfg,
                     &m.owner_pubkey,
+                    "media",
                     now_secs,
-                )?
-                .and_then(|a| a.profile.channels.get("media").map(|q| q.ttl_days))
-                .unwrap_or(cfg.media.ttl_days);
+                )?;
                 if is_ttl_expired(m.created_at, ttl_days, now_secs) {
                     exp_media.push(k.value().to_string());
                 }
