@@ -7,7 +7,7 @@ use humoco_proto::{
     required_lock_pow_bits, AnchorManifest, GenesisTicket, LockEntry, LockPubKey, LockReceipt,
     LockReceiptKind, LOCK_ENTRY_IDENTITY_LEN, LOCK_ENTRY_WIRE_LEN,
 };
-use redb::{ReadableTable, WriteTransaction};
+use redb::{ReadableTable, ReadableTableMetadata, WriteTransaction};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest as _, Sha3_256};
 use zeroize::Zeroizing;
@@ -714,7 +714,7 @@ impl SyncDb {
 
             let bucket = derive_bucket(&req.anchor_id, &lock_pub);
             let bucket_hex = hex::encode(bucket);
-            if let Some(g) = buckets.get(bucket_hex.as_str())? {
+            let bucket_exists = if let Some(g) = buckets.get(bucket_hex.as_str())? {
                 let b: LockBucketRecord = serde_json::from_slice(g.value())?;
                 match b.freeze_state {
                     BucketFreezeState::SelfFrozen { .. } => {
@@ -731,8 +731,14 @@ impl SyncDb {
                     }
                     BucketFreezeState::Active | BucketFreezeState::PreProposal { .. } => {}
                 }
-            }
+                true
+            } else {
+                false
+            };
 
+            if !bucket_exists && buckets.len()? >= cfg.lock.max_buckets {
+                return Err(DbError::http(507, "Lock bucket budget exhausted"));
+            }
             let used_inodes = read_used_inodes(&meta)?;
             if used_inodes >= cfg.lock.max_inodes {
                 return Err(DbError::http(507, "Lock inode budget exhausted"));
@@ -1084,6 +1090,9 @@ impl SyncDb {
                     ));
                 }
 
+                if buckets.len()? >= cfg.lock.max_buckets {
+                    return Err(DbError::http(507, "Lock bucket budget exhausted"));
+                }
                 let used_inodes = read_used_inodes(&meta)?;
                 if used_inodes >= cfg.lock.max_inodes {
                     return Err(DbError::http(507, "Lock inode budget exhausted"));
@@ -1548,5 +1557,99 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(err, DbError::Http { status: 401, .. }));
         }
+    }
+
+    #[test]
+    fn test_s01_max_buckets_does_not_suppress_rollback_self_freeze_tombstone() {
+        let dir = TempDir::new().unwrap();
+        let db = SyncDb::open(&dir.path().join("sync.redb"), "").unwrap();
+        let mut cfg = Config::default();
+        cfg.lock.max_buckets = 1;
+
+        let quarter = humoco_proto::encode_quarter(2031, 3).unwrap();
+        let now = 1_795_000_000u64;
+
+        // Fill max_buckets = 1 with Bucket 1
+        {
+            let write_txn = db.raw_db().begin_write().unwrap();
+            {
+                let mut buckets = write_txn.open_table(LOCK_BUCKETS).unwrap();
+                let b1 = LockBucketRecord {
+                    anchor_id: [0x11; 32],
+                    retain_until_quarter: quarter,
+                    creator_mig_pub: [0x22; 32],
+                    write_seq: 1,
+                    bucket_head: [0x33; 32],
+                    freeze_state: BucketFreezeState::Active,
+                };
+                buckets
+                    .insert(
+                        "aa".repeat(32).as_str(),
+                        serde_json::to_vec(&b1).unwrap().as_slice(),
+                    )
+                    .unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+
+        // Valid signed receipt from this server for a missing Bucket 2 (simulated DB rollback)
+        let lock_sk = {
+            let rt = db.raw_db().begin_read().unwrap();
+            let meta = rt.open_table(SERVER_META).unwrap();
+            load_lock_signing_key_read(&meta).unwrap()
+        };
+        let lock_pub = lock_sk.verifying_key().to_bytes();
+        let aid2 = [0x44; 32];
+        let b2 = derive_bucket(&aid2, &lock_pub);
+        let mut kr = LockReceipt {
+            kind: LockReceiptKind::FirstWrite,
+            lock_pub,
+            bucket: b2,
+            slot: [0x55; 32],
+            child_lock: [0x66; 32],
+            entry_hash: [0x77; 32],
+            retain_until_quarter: quarter,
+            write_seq: 1,
+            bucket_head: [0x88; 32],
+            recipient_nonce: [0x99; 32],
+            sig: [0u8; 64],
+        };
+        kr.sig = lock_sk.sign(&kr.digest()).to_bytes();
+
+        let dummy_sk = SigningKey::from_bytes(&[99u8; 32]);
+        let slot = humoco_proto::derive_slot(&aid2, &[0x01; 32]);
+        let pow = humoco_proto::solve_lock_pow(&slot, &[0x02; 32], 0, 8, 0, 100_000).unwrap();
+        let entry = LockEntry {
+            slot,
+            parent_slot: [0u8; 32],
+            output_branch: 0,
+            depth: 0,
+            child_lock: [0x02; 32],
+            sender_pubkey: dummy_sk.verifying_key().to_bytes(),
+            receiver_pubkey_hash: [0x03; 32],
+            change_pubkey_hash: None,
+            causal_sig: [0u8; 64],
+            root_mig_sig: Some([0u8; 64]),
+            encrypted_payload: [0u8; 265],
+            pow_nonce: pow,
+        };
+
+        let (code, body) = db
+            .process_lock_batch(
+                &cfg,
+                LockBatchRequest {
+                    anchor_id: aid2,
+                    bucket: b2,
+                    recipient_nonce: [0xAB; 32],
+                    entries: vec![entry.to_wire_hex().unwrap()],
+                    manifest: None,
+                    genesis_ticket: None,
+                    known_head_receipt: Some(kr),
+                },
+                now,
+            )
+            .unwrap();
+        assert_eq!(code, 409);
+        assert_eq!(body["error"], "bucket_self_frozen");
     }
 }

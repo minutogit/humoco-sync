@@ -8731,7 +8731,8 @@ async fn test_audit_decisions_cluster4_revoke_and_delete_account_parity() {
         400
     );
 
-    // 3. Valid HTTPS replacement with uppercase hex + empty reason "" normalizes to lowercase / null
+    // 3. Whitespace/newline in revocation signature must be rejected (400) before persistence;
+    //    valid HTTPS replacement with uppercase hex + empty reason "" normalizes to lowercase / null.
     let canonical_valid = build_signed_notice(
         100,
         200,
@@ -8740,6 +8741,15 @@ async fn test_audit_decisions_cluster4_revoke_and_delete_account_parity() {
         None,
     );
     let expected_sig = canonical_valid.signature.clone();
+    let mut dirty_sig = canonical_valid.clone();
+    dirty_sig.signature = format!("{}\n", expected_sig);
+    assert_eq!(
+        send_revoke(serde_json::to_value(&dirty_sig).unwrap())
+            .await
+            .status()
+            .as_u16(),
+        400
+    );
     let upper_payload = serde_json::json!({
         "drop_pub": admin_pk.to_ascii_uppercase(),
         "issued_at": 100u64,
@@ -8926,4 +8936,178 @@ async fn test_audit_decisions_cluster4_revoke_and_delete_account_parity() {
     assert_eq!(del_json["deleted_account"], user_pk);
     assert_eq!(del_json["deleted_slots"], 1);
     assert_eq!(del_json["deleted_media"], 1);
+}
+
+#[tokio::test]
+async fn test_s01_max_buckets_enforced_on_ticket_and_batch_creation() {
+    let (admin_sk, admin_pk) = gen_keypair();
+    let mut cfg = base_hybrid_config(&admin_pk);
+    cfg.lock.allow_pow_tickets = true;
+    cfg.lock.ticket_pow_bits = 8;
+    cfg.lock.max_buckets = 1;
+    cfg.lock.max_inodes = 50;
+    let srv = TestServer::start(cfg).await;
+
+    let lock_pub = srv.state.db.lock_pubkey_bytes().unwrap();
+    let admin_pub = admin_sk.verifying_key().to_bytes();
+    let quarter = humoco_proto::encode_quarter(2031, 3).unwrap();
+
+    let cmig1_sk = SigningKey::from_bytes(&[161u8; 32]);
+    let cmig1_pub = cmig1_sk.verifying_key().to_bytes();
+    let m1 = build_single_server_manifest(admin_pub, lock_pub, cmig1_pub, quarter);
+    let aid1 = m1.rev1_anchor_id().unwrap();
+    let b1 = humoco_proto::derive_bucket(&aid1, &lock_pub);
+
+    let cmig2_sk = SigningKey::from_bytes(&[162u8; 32]);
+    let cmig2_pub = cmig2_sk.verifying_key().to_bytes();
+    let m2 = build_single_server_manifest(admin_pub, lock_pub, cmig2_pub, quarter);
+    let aid2 = m2.rev1_anchor_id().unwrap();
+    let b2 = humoco_proto::derive_bucket(&aid2, &lock_pub);
+
+    // Pre-fetch ticket2 BEFORE Bucket 1 exists (simulates pre-issued GenesisTicket race).
+    let ticket1 = issue_pow_ticket_http(&srv, aid1, quarter).await;
+    let ticket2_prefetched = issue_pow_ticket_http(&srv, aid2, quarter).await;
+
+    let g1_sk = SigningKey::from_bytes(&[163u8; 32]);
+    let r1_sk = SigningKey::from_bytes(&[164u8; 32]);
+    let r1_hash = humoco_proto::hash_pubkey_sha3(&r1_sk.verifying_key().to_bytes());
+    let e1_0 = sign_lock_entry_helper(
+        aid1,
+        [0x01; 32],
+        [0u8; 32],
+        0,
+        0,
+        [0x11; 32],
+        &g1_sk,
+        r1_hash,
+        None,
+        Some(&cmig1_sk),
+        8,
+    );
+
+    // 1. Creating Bucket 1 succeeds (1/1 bucket budget used)
+    let resp1 = srv
+        .client
+        .post(format!("{}/sync.php?lock", srv.base_url))
+        .json(&serde_json::json!({
+            "anchor_id": hex::encode(aid1),
+            "bucket": hex::encode(b1),
+            "recipient_nonce": hex::encode([0xA1; 32]),
+            "entries": [e1_0.to_wire_hex().unwrap()],
+            "manifest": m1,
+            "genesis_ticket": ticket1,
+            "known_head_receipt": serde_json::Value::Null,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp1.status().as_u16(), 200);
+    assert_eq!(srv.state.db.lock_bucket_count_and_inodes().unwrap(), (1, 1));
+
+    // 2. Existing Bucket 1 continues to accept new entries and tickets when max_buckets is full
+    let e1_1 = sign_lock_entry_helper(
+        aid1, [0x02; 32], e1_0.slot, 0, 1, [0x12; 32], &r1_sk, [0x77; 32], None, None, 8,
+    );
+    let resp1_next = srv
+        .client
+        .post(format!("{}/sync.php?lock", srv.base_url))
+        .json(&serde_json::json!({
+            "anchor_id": hex::encode(aid1),
+            "bucket": hex::encode(b1),
+            "recipient_nonce": hex::encode([0xA2; 32]),
+            "entries": [e1_1.to_wire_hex().unwrap()],
+            "manifest": serde_json::Value::Null,
+            "genesis_ticket": serde_json::Value::Null,
+            "known_head_receipt": serde_json::Value::Null,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp1_next.status().as_u16(), 200);
+    assert_eq!(srv.state.db.lock_bucket_count_and_inodes().unwrap(), (1, 2));
+
+    let now = unix_now();
+    let pow1_existing = humoco_proto::solve_ticket_pow(
+        &aid1,
+        quarter,
+        now,
+        8,
+        ticket1.issued_at + 100_000,
+        200_000,
+    )
+    .unwrap();
+    let existing_ticket_resp = srv
+        .client
+        .post(format!("{}/sync.php?lock_ticket", srv.base_url))
+        .json(&serde_json::json!({
+            "anchor_id": hex::encode(aid1),
+            "retain_until_quarter": quarter,
+            "pow_timestamp": now,
+            "pow_nonce": pow1_existing,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        existing_ticket_resp.status().as_u16(),
+        200,
+        "POST ?lock_ticket for already-existing Bucket 1 must still succeed at max_buckets=1"
+    );
+
+    // 3. New bucket ticket request beyond max_buckets=1 must fail with 507
+    let pow2 = humoco_proto::solve_ticket_pow(&aid2, quarter, now, 8, 100_000, 200_000).unwrap();
+    let t2_resp = srv
+        .client
+        .post(format!("{}/sync.php?lock_ticket", srv.base_url))
+        .json(&serde_json::json!({
+            "anchor_id": hex::encode(aid2),
+            "retain_until_quarter": quarter,
+            "pow_timestamp": now,
+            "pow_nonce": pow2,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        t2_resp.status().as_u16(),
+        507,
+        "POST ?lock_ticket for unseen bucket beyond max_buckets=1 must return 507"
+    );
+
+    // 4. Pre-fetched GenesisTicket for Bucket 2 must ALSO fail with 507 on POST ?lock
+    let g2_sk = SigningKey::from_bytes(&[165u8; 32]);
+    let e2_0 = sign_lock_entry_helper(
+        aid2,
+        [0x03; 32],
+        [0u8; 32],
+        0,
+        0,
+        [0x13; 32],
+        &g2_sk,
+        [0x88; 32],
+        None,
+        Some(&cmig2_sk),
+        8,
+    );
+    let resp2 = srv
+        .client
+        .post(format!("{}/sync.php?lock", srv.base_url))
+        .json(&serde_json::json!({
+            "anchor_id": hex::encode(aid2),
+            "bucket": hex::encode(b2),
+            "recipient_nonce": hex::encode([0xA3; 32]),
+            "entries": [e2_0.to_wire_hex().unwrap()],
+            "manifest": m2,
+            "genesis_ticket": ticket2_prefetched,
+            "known_head_receipt": serde_json::Value::Null,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp2.status().as_u16(),
+        507,
+        "POST ?lock creating unseen bucket beyond max_buckets=1 must return 507"
+    );
+    assert_eq!(srv.state.db.lock_bucket_count_and_inodes().unwrap(), (1, 2));
 }

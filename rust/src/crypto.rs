@@ -366,6 +366,9 @@ pub fn verify_revocation_notice(
             return Err("Invalid replacement URLs".to_string());
         }
     }
+    if !is_hex_exact(&notice.signature.to_ascii_lowercase(), 128) {
+        return Err("Invalid revocation signature".to_string());
+    }
     let msg = canonical_revocation_message(notice);
     verify_ed25519_hex(&expected, &notice.signature, msg.as_bytes())
         .then_some(())
@@ -927,5 +930,23 @@ mod tests {
             signature: String::new(),
         });
         assert!(verify_revocation_notice(&case_f, &pk_hex).is_ok());
+
+        // Case G: trailing/leading whitespace in notice.signature must be rejected (no .trim() bypass)
+        let mut case_g = case_f.clone();
+        case_g.signature = format!("{}\n", case_f.signature);
+        assert!(
+            verify_revocation_notice(&case_g, &pk_hex).is_err(),
+            "expected revocation signature with trailing newline to be rejected"
+        );
+        let mut case_g_pad = case_f.clone();
+        case_g_pad.signature = format!(" {} ", case_f.signature);
+        assert!(
+            verify_revocation_notice(&case_g_pad, &pk_hex).is_err(),
+            "expected revocation signature with leading/trailing spaces to be rejected"
+        );
+        // Uppercase hex signature still passes verify_revocation_notice (normalized by PUT ?revoke)
+        let mut case_g_upper = case_f;
+        case_g_upper.signature = case_g_upper.signature.to_ascii_uppercase();
+        assert!(verify_revocation_notice(&case_g_upper, &pk_hex).is_ok());
     }
 }
