@@ -22,10 +22,10 @@ Blindly "fixing" intentional zero-knowledge, static-read, partial-batch, or anti
 Before triaging findings, the auditor MUST inspect:
 1. [`SPEC.md`](../../SPEC.md) — Canonical HTTP wire protocol shared identically by PHP and Rust (`v1.2`).
 2. [`README.md`](../../README.md) — Dual-runtime architecture, quick start, and unified blackbox/hoster test entry points.
-3. [`STATUS.md`](../../STATUS.md) — Implemented milestones (`SYNC-001`–`SYNC-012` and TLA+ V3 verification).
+3. [`STATUS.md`](../../STATUS.md) — Implemented milestones (`SYNC-001`–`SYNC-013`, `S01`–`S09` audit sweep, and TLA+ V3 verification).
 4. [`php/README.md`](../../php/README.md) — Shared-hosting PHP >= 8.1 invariants, 1-inode rate limiter, and `.htaccess` hardening.
 5. [`formal/README.md`](../../formal/README.md) — Formal TLA+ safety and liveness proofs (`SyncLocks.tla`, `Rotation.tla`).
-6. [`../AGENTS.md`](../../../AGENTS.md) — Ecosystem guardrails, zero-knowledge server paradigm, and Pre-Launch Zero-Compat policy.
+6. [`AGENTS.md`](../../AGENTS.md) (and optional workspace [`../AGENTS.md`](../../../AGENTS.md)) — Zero-knowledge comfort & lock server guardrails, PHP↔Rust parity, and Pre-Launch Zero-Compat policy.
 
 ---
 
@@ -88,7 +88,7 @@ For **every** candidate finding produced during an audit pass, answer these four
 * **Rule:** Never relax lock durability, rollback detection, or committee rotation constraints to satisfy generic CRUD assumptions.
 
 ### 3. Established Specification Check
-* **Question:** Is the behavior explicitly specified in `SPEC.md` (`v1.2`), `php/README.md`, `formal/README.md` (`SyncLocks.tla`/`Rotation.tla`), or `STATUS.md` (`SYNC-001`–`SYNC-012`)?
+* **Question:** Is the behavior explicitly specified in `SPEC.md` (`v1.2`), `php/README.md`, `formal/README.md` (`SyncLocks.tla`/`Rotation.tla`), or `STATUS.md` (`SYNC-001`–`SYNC-013`)?
 * **Rule:** Behavior mandated by `SPEC.md` and formally verified in `formal/` is `[INTENTIONAL DESIGN REQUIREMENT]`.
 
 ### 4. Dual-Runtime Parity & Functional Trade-Off Evaluation

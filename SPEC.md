@@ -30,7 +30,7 @@ Both `/sync.php` and `/sync` accept identical query parameters and HTTP methods.
 | Issue offline GenesisTicket | `POST /sync.php?lock_ticket` | Member/Registered/Admin `HUMOCO-DROP-REQ-V1` or server ticket PoW |
 | Submit lock batch or WAF probe | `POST /sync.php?lock` | Public (IP rate-limited; cryptographic causal & PoW admission) |
 | Inspect rotation / freeze state | `GET /sync.php?lock_freeze&anchor_id=<64-hex>` | Public (IP rate-limited) |
-| Submit pre-freeze, proposal, veto, heartbeat | `POST /sync.php?lock_freeze` | Authority / holder per Concept §5.4 |
+| Submit pre-freeze, proposal, veto, heartbeat | `POST /sync.php?lock_freeze` | Authority / holder per §7.2 rotation rules |
 | Target union import & `ImportAck` | `POST /sync.php?lock_import` | Public (IP rate-limited; verifies `>= Q_old` snapshots & timelock) |
 | Sign or finalize `MigrationCert` commit | `POST /sync.php?lock_commit` | Public (IP rate-limited; verifies all `ImportAck`s / chain) |
 | Static catalog (friends only) | `GET <read_url>/index.json` | Public |
@@ -427,7 +427,7 @@ The Lock Channel provides a blind, write-once, voucher-pinned collision registry
   1. configured `admin_pubkey`,
   2. an `admin_app` member on channel `lock`, or
   3. an active `registered` user whose account is not downgraded/disabled.
-  *(If server config enables `allow_pow_tickets = true`, an unauthenticated request carrying `pow_timestamp` (`|now - pow_timestamp| <= 300`) and `pow_nonce: u64` satisfying `leading_zero_bits(SHA-256(b"HUMOCO_LOCK_TICKET_POW_V1" || anchor_id (32B) || retain_until_quarter_le (2B) || pow_timestamp_le (8B) || pow_nonce_le (8B))) >= lock_ticket_pow_bits` is also accepted; the server records `SHA-256(pow_tuple)` in the 600s replay table to reject PoW replays.)*
+  *(If server config enables `allow_pow_tickets = true`, an unauthenticated request carrying `pow_timestamp` (`|now - pow_timestamp| <= 300`) and `pow_nonce: u64` satisfying `leading_zero_bits(SHA-256(b"HUMOCO_LOCK_TICKET_POW_V1" || anchor_id (32B) || retain_until_quarter_le (2B) || pow_timestamp_le (8B) || pow_nonce_le (8B))) >= lock_ticket_pow_bits` (capped at `MAX_LOCK_POW_BITS = 24`) is also accepted; the server records `SHA-256(pow_tuple)` in the 600s replay table to reject PoW replays.)*
 - **Request JSON:**
   ```json
   {
@@ -437,7 +437,7 @@ The Lock Channel provides a blind, write-once, voucher-pinned collision registry
     "pow_nonce": null
   }
   ```
-- **Checks:** `retain_until_quarter <= lock_max_retention_quarter` (else `400 Bad Request` / `422`), `used_inodes < lock_max_inodes` (else `507 Insufficient Storage`), bucket not frozen.
+- **Checks:** `retain_until_quarter <= lock_max_retention_quarter` (else `400 Bad Request` / `422`), `used_inodes < lock_max_inodes` and creating a new bucket respects `lock_max_buckets` (`50000` default cap, else `507 Insufficient Storage`), bucket not frozen.
 - **Response (`200 OK`):**
   ```json
   {
@@ -511,7 +511,7 @@ The Lock Channel provides a blind, write-once, voucher-pinned collision registry
 4. **Server Validation & Execution Order (Single Atomic `redb` Write Tx / PHP Lock+Link):**
    1. **Rollback Check (before writes):** If `known_head_receipt` is supplied, verify its `lock_pub == S.lock_pub`, `bucket == request.bucket`, `sig` valid over `HUMOCO_LOCK_RECEIPT_V1`. (Unsigned or forged receipts are rejected with `400`/`401` and **never** freeze a bucket.) If the bucket exists and either `known.write_seq > local.write_seq` or (`known.write_seq == local.write_seq && known.bucket_head != local.bucket_head`), OR if `known_head_receipt` carries a valid signature for this bucket when the bucket is missing altogether: **immediately mark the bucket self-frozen (`BUCKET_SELF_FROZEN`)** and return **`409 Conflict`** (`{"error": "bucket_self_frozen", "bucket": "<64-hex>"}`).
    2. **Frozen Check:** If bucket is already frozen (rotation or self-frozen), return `409 Conflict` (`{"error": "bucket_self_frozen" | "epoch_frozen", ...}`).
-   3. **Bucket Creation (if absent):** Require valid `manifest` (`manifest.revision == 1`, `manifest.rev1_anchor_id() == anchor_id`, `manifest.servers` contains `S.lock_pub`, `bucket == derive_bucket(anchor_id, S.lock_pub)`), valid `genesis_ticket` (`ticket.anchor_id == anchor_id`, valid `S.lock_sk` signature), `ticket.retain_until_quarter == manifest.retain_until_quarter`, `retain_until_quarter <= lock_max_retention_quarter`, and `used_inodes < lock_max_inodes`. Persist immutable `(anchor_id, retain_until_quarter, creator_mig_pub, bucket_head_0, write_seq = 0)`.
+   3. **Bucket Creation (if absent):** Require valid `manifest` (`manifest.revision == 1`, `manifest.rev1_anchor_id() == anchor_id`, `manifest.servers` contains `S.lock_pub`, `bucket == derive_bucket(anchor_id, S.lock_pub)`), valid `genesis_ticket` (`ticket.anchor_id == anchor_id`, valid `S.lock_sk` signature), `ticket.retain_until_quarter == manifest.retain_until_quarter`, `retain_until_quarter <= lock_max_retention_quarter`, `used_inodes < lock_max_inodes`, and total tracked buckets `< lock_max_buckets` (`50000` default cap, else `507 Insufficient Storage`). Persist immutable `(anchor_id, retain_until_quarter, creator_mig_pub, bucket_head_0, write_seq = 0)`.
    4. **Sequential Batch Entry Processing (`for idx, entry in entries`):**
       - Parse 605-byte `LockEntry` (`magic == "HMLK"`, `version == 1`, valid `output_branch <= 1`).
       - Verify PoW (`HUMOCO_LOCK_POW_V1`).
@@ -560,8 +560,8 @@ The Lock Channel provides a blind, write-once, voucher-pinned collision registry
 
 ### 7.1 Bucket Freeze States & Revocation
 
-1. **Planned Server Move (Fall A / `PUT ?revoke`):** When a server revocation notice is active (`GET ?revoke` / `revocation.json`), `POST ?lock_ticket`, `POST ?lock`, and `?lock_freeze` / `?lock_import` / `?lock_commit` fail closed with **`410 Gone`** carrying the signed `SyncRevocationNotice` (`"revocation": { ... }`). Existing static `.lock` blobs remain readable unless decommissioned.
-2. **Pre-Proposal Freeze (`pre_proposal_frozen`, TTL `1800 s`):** Temporarily halts `POST ?lock` (`409 Conflict` with `"error": "pre_proposal_frozen"` and `"expires_at"`). Automatically reverts to `Active` on any request once `now >= expires_at` (`LÜCKE-04c`), preventing indefinite Freeze-DoS without an accepted proposal.
+1. **Planned Server Move (`PUT ?revoke`):** When a server revocation notice is active (visible via `GET ?info` and static `<read_url>/revocation.json`), `POST ?lock_ticket`, `POST ?lock`, and `?lock_freeze` / `?lock_import` / `?lock_commit` fail closed with **`410 Gone`** carrying the signed `SyncRevocationNotice` (`"revocation": { ... }`). Existing static `.lock` blobs remain readable unless decommissioned.
+2. **Pre-Proposal Freeze (`pre_proposal_frozen`, TTL `1800 s`):** Temporarily halts `POST ?lock` (`409 Conflict` with `"error": "pre_proposal_frozen"` and `"expires_at"`). Automatically reverts to `Active` on any request once `now >= expires_at`, preventing indefinite Freeze-DoS without an accepted proposal.
 3. **Epoch Freeze (`409 epoch_frozen`):** After `MigrationCert` commit removes an old server from the active committee, it responds to `POST ?lock` with **`409 Conflict`**:
    ```json
    {
@@ -578,13 +578,13 @@ The Lock Channel provides a blind, write-once, voucher-pinned collision registry
 2. **`POST /sync.php?lock_freeze` (`{"action": ...}`):**
    - `pre_freeze`: Freezes active bucket with TTL `lock.pre_freeze_ttl_secs` (`1800 s`) and returns non-permanent `SnapshotExport`.
    - `heartbeat`: Verifies `CreatorHeartbeat` (`HUMOCO_CREATOR_HB_V1`) against `creator_mig_pub` and updates `last_creator_activity_secs`.
-   - `propose`: Enforces `voted_proposal[from_rev]` uniqueness (re-returns idempotently if identical digest, `409 Conflict` on differing proposal), authority/standby authorization, `CREATOR_INACTIVITY_TAKEOVER_SECS` (`30 d`) for `ProposalInitiator::Guarantor`, nomination binding (`humoco_proto::verify_nomination_binding`), binds `frozen_at = now` for the effective timelock (`0 s` when `initiator == Creator` and `guarantor_mig_pubs` is empty, otherwise `72 h` / `259200 s`), permanently freezes the bucket, and returns signed `SnapshotExport` (`HUMOCO_FREEZE_SNAP_V1` + `HUMOCO_FREEZE_STATE_V1`).
+   - `propose`: Enforces `voted_proposal[from_rev]` uniqueness (re-returns idempotently if identical digest, `409 Conflict` on differing proposal), authority/standby authorization, `CREATOR_INACTIVITY_TAKEOVER_SECS` (`30 d`) for `ProposalInitiator::Guarantor`, nomination binding (`humoco_proto::verify_nomination_binding`, including monotone `new_threshold >= 2` floor whenever `guarantor_mig_pubs` is empty and `prev.threshold >= 2`), binds `frozen_at = now` for the effective timelock (`0 s` only when `initiator == Creator`, `guarantor_mig_pubs` is empty, AND `is_pure_committee_growth` holds without shrinking/replacing any existing server; otherwise `72 h` / `259200 s`), permanently freezes the bucket, and returns signed `SnapshotExport` (`HUMOCO_FREEZE_SNAP_V1` + `HUMOCO_FREEZE_STATE_V1`).
    - `veto`: Before `timelock` expiry, verifies `MigrationVeto` (`HUMOCO_MIGRATION_VETO_V1`) from an authority distinct from the proposer, blacklists `proposal_hash`, clears `voted_proposal[from_rev]`, and unfreezes the bucket back to `Active`.
-3. **`POST /sync.php?lock_import`:** Target server in `proposal.new_servers` verifies `active_manifest.verify_anchor_id(&anchor_id)`, `retain_until_quarter` invariance, effective timelock elapsed against both `proposal.proposed_at` and `>= Q_old` snapshot `frozen_at` timestamps, nomination binding, and executes `humoco_proto::resolve_import_union`:
+3. **`POST /sync.php?lock_import`:** Target server in `proposal.new_servers` verifies `active_manifest.verify_anchor_id(&anchor_id)`, `retain_until_quarter` invariance, `lock_max_buckets` budget (`50000` default cap), effective timelock elapsed against both `proposal.proposed_at` and `>= Q_old` snapshot `frozen_at` timestamps, nomination binding, and executes `humoco_proto::resolve_import_union`:
    - Preserves every single-entry slot and resolves conflicting slots with a verified `QuorumCertificate` across historical committees `1..=from_rev`.
    - Conflicting entries lacking a QC stay `CONFLICT([A, B, ...])` (`LOCK_CONFLICTS` table; future `POST ?lock` returns `ConflictSeen` carrying the competing wire entry, while valid children of surviving branches remain unblocked).
    - Signs and returns `ImportAck` (`HUMOCO_IMPORT_ACK_V1`) committing `imported_state_hash` (`HUMOCO_IMPORT_STATE_V1`).
 4. **`POST /sync.php?lock_commit` (`{"action": ...}`):**
    - `sign_commit`: Verifies `import_acks` cover every member of `proposal.new_servers` with identical `imported_state_hash`, then returns this server's `CommitteeSignature` (`HUMOCO_MIGRATION_CERT_V1`).
-   - `finalize`: Verifies completed `new_manifest.verify_anchor_id(&anchor_id)`, stores `new_manifest` for `/anchors/<anchor_id>.bin`, transitions active committee members back to `Active` (except `SelfFrozen`), and marks retired servers `EpochFrozen`.
-5. **Static Discovery (`GET /anchors/<anchor_id>.bin` and `<read_url>/anchors/<anchor_id>.bin`):** Serves the latest verified `AnchorManifest` JSON with `ETag` and `Cache-Control: no-cache`, purged only during bucket retention GC (`Quartalsende + 30 d`).
+   - `finalize`: Verifies completed `new_manifest.verify_anchor_id(&anchor_id)`, enforces `lock_max_buckets` when introducing a new bucket record, stores `new_manifest` for `/anchors/<anchor_id>.bin`, transitions active committee members back to `Active` (except `SelfFrozen`), and marks retired servers `EpochFrozen`.
+5. **Static Discovery (`GET /anchors/<anchor_id>.bin` and `<read_url>/anchors/<anchor_id>.bin`):** Serves the latest verified `AnchorManifest` JSON with `ETag` and `Cache-Control: no-cache`, purged only during bucket retention GC (`quarter_end + 30 d`).

@@ -1,11 +1,13 @@
-# `humoco-sync` — HuMoCo Sync Server (Rust & PHP)
+# `humoco-sync` — HuMoCo Sync & Lock Server (Rust & PHP)
 
-**`humoco-sync`** provides two wire-compatible server implementations for privacy-preserving, zero-knowledge synchronization in the **Human Money (HuMoCo)** ecosystem:
+**`humoco-sync`** provides two wire-compatible server implementations for zero-knowledge comfort synchronization (encrypted backups, marketplace/media, contact cards, WoT distribution, async payments) and the **launch Blind Collision Lock Registry** (`LockCommittee`) in the **Human Money (HuMoCo)** ecosystem:
 
-1. **`php/` (`sync.php`)** — Zero-dependency PHP ($\ge 8.1$ + `ext-sodium`, `hash('sha3-256')`) drop-in (`sync.php`, `lock_handler.php`, lazy-loaded `lock_rotation.php`) for shared web hosting and small friend circles.
+1. **`php/` (`sync.php`)** — Zero-dependency PHP ($\ge 8.1$ + `ext-sodium`, `hash('sha3-256')`) drop-in (`sync.php`, `lock_handler.php`, lazy-loaded `lock_rotation.php`) for shared web hosting and small friend circles, keeping infrastructure decentralized without server admin overhead.
 2. **`rust/` (`humoco-sync-server`)** — High-performance, `#![forbid(unsafe_code)]`, async Rust daemon (`axum` + `tokio` + `redb`) built for public community hosting, VPS deployments, hybrid friend+public operation, storage pool isolation, quota profiles, and web/API self-service.
 
-Both servers implement the exact protocol defined in [`SPEC.md`](SPEC.md), so **Human Money App** treats them identically.
+Both servers implement the exact protocol defined in [`SPEC.md`](SPEC.md), so **Human Money App** treats them identically. Note that the Rust daemon links sibling [`../humoco-proto`](../humoco-proto) via relative path (`../../humoco-proto` in `rust/Cargo.toml`).
+
+See also [`AGENTS.md`](AGENTS.md), [`formal/README.md`](formal/README.md) (TLA+ proofs), [`docs/security/DESIGN_INTENT_TRIAGE.md`](docs/security/DESIGN_INTENT_TRIAGE.md), and [`prompts/AUDIT_LOOP.md`](prompts/AUDIT_LOOP.md).
 
 ---
 
