@@ -124,6 +124,22 @@ fn restore_non_proposal_freeze_state(rot: &AnchorRotationRecord) -> BucketFreeze
     }
 }
 
+fn manifests_share_chain_prefix(existing: &AnchorManifest, incoming: &AnchorManifest) -> bool {
+    if incoming.revision < existing.revision {
+        return false;
+    }
+    existing
+        .migration_chain
+        .iter()
+        .zip(&incoming.migration_chain)
+        .all(|(e_cert, i_cert)| {
+            matches!(
+                (e_cert.proposal.core_digest(), i_cert.proposal.core_digest()),
+                (Ok(a), Ok(b)) if a == b
+            ) && e_cert.imported_state_hash == i_cert.imported_state_hash
+        })
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum LockFreezeRequest {
@@ -985,6 +1001,15 @@ impl SyncDb {
                             "Target revision has already been finalized",
                         ));
                     }
+                    if !manifests_share_chain_prefix(
+                        &existing.active_manifest,
+                        &req.active_manifest,
+                    ) {
+                        return Err(DbError::http(
+                            409,
+                            "Active manifest conflicts with finalized history on this server",
+                        ));
+                    }
                     existing
                 }
                 None => AnchorRotationRecord::new(
@@ -1024,6 +1049,14 @@ impl SyncDb {
                 }
             }
 
+            let prev_bucket: Option<LockBucketRecord> = match buckets.get(bucket_hex.as_str())? {
+                Some(g) => Some(serde_json::from_slice(g.value())?),
+                None => None,
+            };
+            if prev_bucket.is_none() && buckets.len()? >= cfg.lock.max_buckets {
+                return Err(DbError::http(507, "Lock bucket budget exhausted"));
+            }
+
             let mut used_inodes = read_used_inodes(&meta)?;
             let prefix = bucket_entry_prefix(&bucket_hex);
             let removed_single = remove_keys_with_prefix(&mut entries_tbl, &prefix)?;
@@ -1037,15 +1070,32 @@ impl SyncDb {
             used_inodes = used_inodes.saturating_sub(old_inodes);
             if new_inodes > 0
                 && used_inodes.saturating_add(new_inodes) > cfg.lock.max_inodes
-                && buckets.get(bucket_hex.as_str())?.is_none()
+                && prev_bucket.is_none()
                 && used_inodes >= cfg.lock.max_inodes
             {
                 return Err(DbError::http(507, "Lock inode budget exhausted"));
             }
 
-            let mut bucket_head =
-                compute_bucket_init_head(&bucket, req.proposal.retain_until_quarter);
-            let mut write_seq = 0u64;
+            // Preserve monotonic (write_seq, bucket_head) across rotation on existing buckets so
+            // pre-rotation signed LockReceipts cannot falsely trigger 409 bucket_self_frozen.
+            let mut prev_single_hashes: HashMap<[u8; 32], [u8; 32]> = HashMap::new();
+            if prev_bucket.is_some() {
+                for (_, wire) in &removed_single {
+                    if let Ok(entry) = LockEntry::from_wire_bytes(wire) {
+                        if let Ok(eh) = entry.entry_hash() {
+                            prev_single_hashes.insert(entry.slot, eh);
+                        }
+                    }
+                }
+            }
+
+            let (mut write_seq, mut bucket_head) = match prev_bucket.as_ref() {
+                Some(prev_b) => (prev_b.write_seq, prev_b.bucket_head),
+                None => (
+                    0u64,
+                    compute_bucket_init_head(&bucket, req.proposal.retain_until_quarter),
+                ),
+            };
 
             for (slot, resolved) in &union.slots {
                 let slot_hex = hex::encode(slot);
@@ -1062,8 +1112,14 @@ impl SyncDb {
                         let file_hex = hex::encode(derive_slot_file_id(slot, &lock_pub));
                         let f_key = file_index_key(&quarter_str, &bucket_hex, &file_hex);
                         file_idx.insert(f_key.as_str(), e_key.as_bytes())?;
-                        write_seq = write_seq.saturating_add(1);
-                        bucket_head = compute_bucket_step_head(&bucket_head, write_seq, slot, &eh);
+                        let unchanged_slot = prev_single_hashes
+                            .get(slot)
+                            .is_some_and(|prev_eh| *prev_eh == eh);
+                        if !unchanged_slot {
+                            write_seq = write_seq.saturating_add(1);
+                            bucket_head =
+                                compute_bucket_step_head(&bucket_head, write_seq, slot, &eh);
+                        }
                     }
                     ResolvedSlot::Conflict(group) => {
                         let encoded = LockEntryStorageExt::encode_conflict_group(group)?;
@@ -1081,23 +1137,18 @@ impl SyncDb {
 
             // Preserve PermanentProposal/SelfFrozen freeze state if this server is ALSO in OldCommittee
             // until Phase 3 (?lock_commit Finalize) switches epoch; pure new target starts Active.
-            let freeze_state = match buckets.get(bucket_hex.as_str())? {
-                Some(g) => {
-                    let prev_b: LockBucketRecord = serde_json::from_slice(g.value())?;
-                    match prev_b.freeze_state {
-                        BucketFreezeState::SelfFrozen { .. }
-                        | BucketFreezeState::PermanentProposal { .. }
-                        | BucketFreezeState::EpochFrozen { .. } => prev_b.freeze_state,
-                        BucketFreezeState::PreProposal { expires_at, .. }
-                            if now_secs < expires_at =>
-                        {
-                            prev_b.freeze_state
-                        }
-                        BucketFreezeState::Active | BucketFreezeState::PreProposal { .. } => {
-                            BucketFreezeState::Active
-                        }
+            let freeze_state = match prev_bucket {
+                Some(prev_b) => match prev_b.freeze_state {
+                    BucketFreezeState::SelfFrozen { .. }
+                    | BucketFreezeState::PermanentProposal { .. }
+                    | BucketFreezeState::EpochFrozen { .. } => prev_b.freeze_state,
+                    BucketFreezeState::PreProposal { expires_at, .. } if now_secs < expires_at => {
+                        prev_b.freeze_state
                     }
-                }
+                    BucketFreezeState::Active | BucketFreezeState::PreProposal { .. } => {
+                        BucketFreezeState::Active
+                    }
+                },
                 None => BucketFreezeState::Active,
             };
 
@@ -1335,22 +1386,16 @@ impl SyncDb {
                                     "Cannot downgrade active manifest revision",
                                 ));
                             }
+                            if !manifests_share_chain_prefix(
+                                &existing.active_manifest,
+                                &new_manifest,
+                            ) {
+                                return Err(DbError::http(
+                                    409,
+                                    "Manifest migration_chain conflicts with finalized history on this server",
+                                ));
+                            }
                             if new_manifest.revision == existing.active_manifest.revision {
-                                let same_transition = existing
-                                    .active_manifest
-                                    .migration_chain
-                                    .last()
-                                    .is_some_and(|cert| {
-                                        cert.proposal.core_digest().ok() == Some(latest_prop_hash)
-                                            && cert.imported_state_hash
-                                                == latest_cert.imported_state_hash
-                                    });
-                                if !same_transition {
-                                    return Err(DbError::http(
-                                        409,
-                                        "Conflicting manifest already finalized at this revision",
-                                    ));
-                                }
                                 if let Some(bg) = buckets.get(bucket_hex.as_str())? {
                                     let b: LockBucketRecord = serde_json::from_slice(bg.value())?;
                                     return Ok((
@@ -1386,6 +1431,15 @@ impl SyncDb {
                         }
                     }
 
+                    let existing_bucket: Option<LockBucketRecord> =
+                        match buckets.get(bucket_hex.as_str())? {
+                            Some(g) => Some(serde_json::from_slice(g.value())?),
+                            None => None,
+                        };
+                    if existing_bucket.is_none() && buckets.len()? >= cfg.lock.max_buckets {
+                        return Err(DbError::http(507, "Lock bucket budget exhausted"));
+                    }
+
                     rot.active_manifest = new_manifest.clone();
                     rot.imported_proposal = None;
                     rotations_tbl
@@ -1395,9 +1449,8 @@ impl SyncDb {
                         serde_json::to_vec(&new_manifest)?.as_slice(),
                     )?;
 
-                    let updated_bucket = match buckets.get(bucket_hex.as_str())? {
-                        Some(g) => {
-                            let mut b: LockBucketRecord = serde_json::from_slice(g.value())?;
+                    let updated_bucket = match existing_bucket {
+                        Some(mut b) => {
                             b.freeze_state = if in_new_committee {
                                 match b.freeze_state {
                                     BucketFreezeState::SelfFrozen { .. } => b.freeze_state,

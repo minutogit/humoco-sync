@@ -9111,3 +9111,1379 @@ async fn test_s01_max_buckets_enforced_on_ticket_and_batch_creation() {
     );
     assert_eq!(srv.state.db.lock_bucket_count_and_inodes().unwrap(), (1, 2));
 }
+
+#[tokio::test]
+async fn test_s02_import_and_finalize_enforce_max_buckets() {
+    let (av_sk, av_pk) = gen_keypair();
+    let mut cfg_v = base_hybrid_config(&av_pk);
+    cfg_v.lock.allow_pow_tickets = true;
+    cfg_v.lock.ticket_pow_bits = 8;
+    cfg_v.lock.max_buckets = 1;
+    cfg_v.lock.max_inodes = 50;
+    let s_victim = TestServer::start(cfg_v).await;
+
+    let (aa1_sk, _, s_att1) = start_lock_test_server(true, Some(0)).await;
+    let (aa2_sk, _, s_att2) = start_lock_test_server(true, Some(0)).await;
+    let (an_sk, _, s_new) = start_lock_test_server(true, Some(0)).await;
+
+    let ev = server_entry_for_test(&s_victim, &av_sk, humoco_proto::NominatedBy::Creator);
+    let ea1 = server_entry_for_test(&s_att1, &aa1_sk, humoco_proto::NominatedBy::Creator);
+    let ea2 = server_entry_for_test(&s_att2, &aa2_sk, humoco_proto::NominatedBy::Creator);
+    let en = server_entry_for_test(&s_new, &an_sk, humoco_proto::NominatedBy::Creator);
+
+    let cmig_sk = SigningKey::from_bytes(&[171u8; 32]);
+    let cmig_pub = cmig_sk.verifying_key().to_bytes();
+    let quarter = humoco_proto::encode_quarter(2031, 4).unwrap();
+    let t0 = 1_795_000_000u64;
+
+    // 1. Fill max_buckets = 1 on s_victim with Bucket 1 (aid1)
+    let man1 = build_multi_server_manifest(
+        vec![ev.clone(), ea1.clone(), ea2.clone()],
+        Vec::new(),
+        2,
+        cmig_pub,
+        Vec::new(),
+        t0 * 1_000,
+        quarter,
+    );
+    let aid1 = man1.rev1_anchor_id().unwrap();
+    let g_sk = SigningKey::from_bytes(&[172u8; 32]);
+    let e1_0 = sign_lock_entry_helper(
+        aid1,
+        [0x11; 32],
+        [0u8; 32],
+        0,
+        0,
+        [0x21; 32],
+        &g_sk,
+        [0x31; 32],
+        None,
+        Some(&cmig_sk),
+        8,
+    );
+    for srv in [&s_victim, &s_att1, &s_att2] {
+        let tkt = issue_pow_ticket_db(srv, aid1, quarter, t0);
+        let bkt = humoco_proto::derive_bucket(&aid1, &srv.state.db.lock_pubkey_bytes().unwrap());
+        let (code, _) = srv
+            .state
+            .db
+            .process_lock_batch(
+                &srv.state.config,
+                humoco_sync_server::locks::LockBatchRequest {
+                    anchor_id: aid1,
+                    bucket: bkt,
+                    recipient_nonce: [0x41; 32],
+                    entries: vec![e1_0.to_wire_hex().unwrap()],
+                    manifest: Some(man1.clone()),
+                    genesis_ticket: Some(tkt),
+                    known_head_receipt: None,
+                },
+                t0,
+            )
+            .unwrap();
+        assert_eq!(code, 200);
+    }
+    assert_eq!(
+        s_victim.state.db.lock_bucket_count_and_inodes().unwrap(),
+        (1, 1)
+    );
+
+    // 2. Unseen anchor aid2 via POST ?lock_import (0s pure growth [s_att1] -> [s_att1, s_victim])
+    //    even with 0 entries MUST fail 507 when max_buckets=1 is already reached!
+    let man2 = build_multi_server_manifest(
+        vec![ea1.clone()],
+        Vec::new(),
+        1,
+        cmig_pub,
+        Vec::new(),
+        t0 * 1_000,
+        quarter,
+    );
+    let aid2 = man2.rev1_anchor_id().unwrap();
+    let prop2 = build_signed_proposal(
+        aid2,
+        1,
+        2,
+        vec![ea1.clone(), ev.clone()],
+        Vec::new(),
+        quarter,
+        t0 + 10,
+        humoco_proto::ProposalInitiator::Creator,
+        Some(&cmig_sk),
+        Vec::new(),
+    );
+    let (_, pf2) = s_att1
+        .state
+        .db
+        .process_lock_freeze(
+            &s_att1.state.config,
+            humoco_sync_server::lock_rotation::LockFreezeRequest::Propose {
+                proposal: prop2.clone(),
+                current_manifest: Some(man2.clone()),
+            },
+            t0 + 10,
+        )
+        .unwrap();
+    let snap2: humoco_proto::SnapshotExport =
+        serde_json::from_value(pf2["snapshot_export"].clone()).unwrap();
+    let imp_err = s_victim
+        .state
+        .db
+        .process_lock_import(
+            &s_victim.state.config,
+            humoco_sync_server::lock_rotation::LockImportRequest {
+                anchor_id: aid2,
+                active_manifest: man2,
+                proposal: prop2,
+                snapshots: vec![snap2],
+                quorum_certificates: Vec::new(),
+            },
+            t0 + 10,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            imp_err,
+            humoco_sync_server::db::DbError::Http { status: 507, .. }
+        ),
+        "Unseen bucket via ?lock_import beyond max_buckets=1 must fail with 507, got {imp_err:?}"
+    );
+    assert_eq!(
+        s_victim.state.db.lock_bucket_count_and_inodes().unwrap(),
+        (1, 1)
+    );
+
+    // 3. Unseen anchor aid3 via ?lock_commit Finalize ([s_victim, s_att1, s_att2] -> [s_att1, s_att2])
+    //    signed solely by s_att1 & s_att2 MUST also fail 507 on s_victim!
+    let man3_rev1 = build_multi_server_manifest(
+        vec![ev.clone(), ea1.clone(), ea2.clone()],
+        Vec::new(),
+        2,
+        cmig_pub,
+        Vec::new(),
+        (t0 + 20) * 1_000,
+        quarter,
+    );
+    let aid3 = man3_rev1.rev1_anchor_id().unwrap();
+    let prop3 = build_signed_proposal(
+        aid3,
+        1,
+        2,
+        vec![ea1.clone(), ea2.clone()],
+        Vec::new(),
+        quarter,
+        t0 + 25,
+        humoco_proto::ProposalInitiator::Creator,
+        Some(&cmig_sk),
+        Vec::new(),
+    );
+    let mut snaps3 = Vec::new();
+    for srv in [&s_att1, &s_att2] {
+        let (_, v) = srv
+            .state
+            .db
+            .process_lock_freeze(
+                &srv.state.config,
+                humoco_sync_server::lock_rotation::LockFreezeRequest::Propose {
+                    proposal: prop3.clone(),
+                    current_manifest: Some(man3_rev1.clone()),
+                },
+                t0 + 25,
+            )
+            .unwrap();
+        snaps3.push(
+            serde_json::from_value::<humoco_proto::SnapshotExport>(v["snapshot_export"].clone())
+                .unwrap(),
+        );
+    }
+    let mut acks3 = Vec::new();
+    let mut ish3 = [0u8; 32];
+    for srv in [&s_att1, &s_att2] {
+        let (_, v) = srv
+            .state
+            .db
+            .process_lock_import(
+                &srv.state.config,
+                humoco_sync_server::lock_rotation::LockImportRequest {
+                    anchor_id: aid3,
+                    active_manifest: man3_rev1.clone(),
+                    proposal: prop3.clone(),
+                    snapshots: snaps3.clone(),
+                    quorum_certificates: Vec::new(),
+                },
+                t0 + 25,
+            )
+            .unwrap();
+        let ack: humoco_proto::ImportAck = serde_json::from_value(v["import_ack"].clone()).unwrap();
+        ish3 = ack.imported_state_hash;
+        acks3.push(ack);
+    }
+    let mut cs3 = Vec::new();
+    for srv in [&s_att1, &s_att2] {
+        let (_, v) = srv
+            .state
+            .db
+            .process_lock_commit(
+                &srv.state.config,
+                humoco_sync_server::lock_rotation::LockCommitRequest::SignCommit {
+                    anchor_id: aid3,
+                    proposal: prop3.clone(),
+                    imported_state_hash: ish3,
+                    import_acks: acks3.clone(),
+                },
+                t0 + 25,
+            )
+            .unwrap();
+        cs3.push(
+            serde_json::from_value::<humoco_proto::CommitteeSignature>(
+                v["committee_signature"].clone(),
+            )
+            .unwrap(),
+        );
+    }
+    let cert3 = humoco_proto::MigrationCert {
+        anchor_id: aid3,
+        genesis_manifest: Some(Box::new(man3_rev1.clone())),
+        proposal: prop3,
+        imported_state_hash: ish3,
+        import_acks: acks3,
+        commit_sigs: cs3,
+    };
+    let (man3_rev2, _) = cert3.verify_step(&aid3, &man3_rev1).unwrap();
+    let fin3_err = s_victim
+        .state
+        .db
+        .process_lock_commit(
+            &s_victim.state.config,
+            humoco_sync_server::lock_rotation::LockCommitRequest::Finalize {
+                anchor_id: aid3,
+                new_manifest: man3_rev2,
+            },
+            t0 + 30,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            fin3_err,
+            humoco_sync_server::db::DbError::Http { status: 507, .. }
+        ),
+        "Unseen bucket via ?lock_commit Finalize beyond max_buckets=1 must fail with 507, got {fin3_err:?}"
+    );
+    assert_eq!(
+        s_victim.state.db.lock_bucket_count_and_inodes().unwrap(),
+        (1, 1)
+    );
+    assert!(s_victim
+        .state
+        .db
+        .get_static_anchor_manifest(&hex::encode(aid3))
+        .unwrap()
+        .is_none());
+
+    // 4. Existing Bucket 1 (aid1) rotation still succeeds at max_buckets = 1!
+    let t_prop1 = t0 + 40;
+    let prop1 = build_signed_proposal(
+        aid1,
+        1,
+        2,
+        vec![ev, ea1, en],
+        Vec::new(),
+        quarter,
+        t_prop1,
+        humoco_proto::ProposalInitiator::Creator,
+        Some(&cmig_sk),
+        Vec::new(),
+    );
+    let mut snaps1 = Vec::new();
+    for srv in [&s_victim, &s_att1] {
+        let (_, v) = srv
+            .state
+            .db
+            .process_lock_freeze(
+                &srv.state.config,
+                humoco_sync_server::lock_rotation::LockFreezeRequest::Propose {
+                    proposal: prop1.clone(),
+                    current_manifest: None,
+                },
+                t_prop1,
+            )
+            .unwrap();
+        snaps1.push(
+            serde_json::from_value::<humoco_proto::SnapshotExport>(v["snapshot_export"].clone())
+                .unwrap(),
+        );
+    }
+    let t_mat1 = t_prop1 + s_victim.state.config.lock.proposal_timelock_secs;
+    let mut acks1 = Vec::new();
+    let mut ish1 = [0u8; 32];
+    for srv in [&s_victim, &s_att1, &s_new] {
+        let (code, v) = srv
+            .state
+            .db
+            .process_lock_import(
+                &srv.state.config,
+                humoco_sync_server::lock_rotation::LockImportRequest {
+                    anchor_id: aid1,
+                    active_manifest: man1.clone(),
+                    proposal: prop1.clone(),
+                    snapshots: snaps1.clone(),
+                    quorum_certificates: Vec::new(),
+                },
+                t_mat1,
+            )
+            .unwrap();
+        assert_eq!(code, 200);
+        let ack: humoco_proto::ImportAck = serde_json::from_value(v["import_ack"].clone()).unwrap();
+        ish1 = ack.imported_state_hash;
+        acks1.push(ack);
+    }
+    let mut cs1 = Vec::new();
+    for srv in [&s_victim, &s_att1] {
+        let (_, v) = srv
+            .state
+            .db
+            .process_lock_commit(
+                &srv.state.config,
+                humoco_sync_server::lock_rotation::LockCommitRequest::SignCommit {
+                    anchor_id: aid1,
+                    proposal: prop1.clone(),
+                    imported_state_hash: ish1,
+                    import_acks: acks1.clone(),
+                },
+                t_mat1,
+            )
+            .unwrap();
+        cs1.push(
+            serde_json::from_value::<humoco_proto::CommitteeSignature>(
+                v["committee_signature"].clone(),
+            )
+            .unwrap(),
+        );
+    }
+    let cert1 = humoco_proto::MigrationCert {
+        anchor_id: aid1,
+        genesis_manifest: Some(Box::new(man1.clone())),
+        proposal: prop1,
+        imported_state_hash: ish1,
+        import_acks: acks1,
+        commit_sigs: cs1,
+    };
+    let (man1_rev2, _) = cert1.verify_step(&aid1, &man1).unwrap();
+    let (fin1_code, _) = s_victim
+        .state
+        .db
+        .process_lock_commit(
+            &s_victim.state.config,
+            humoco_sync_server::lock_rotation::LockCommitRequest::Finalize {
+                anchor_id: aid1,
+                new_manifest: man1_rev2,
+            },
+            t_mat1,
+        )
+        .unwrap();
+    assert_eq!(fin1_code, 200);
+    assert_eq!(
+        s_victim.state.db.lock_bucket_count_and_inodes().unwrap(),
+        (1, 1)
+    );
+}
+
+#[tokio::test]
+async fn test_s02_import_preserves_monotonic_head_against_prerotation_receipt() {
+    let (a1_sk, _, s1) = start_lock_test_server(true, None).await;
+    let (a2_sk, _, s2) = start_lock_test_server(true, None).await;
+    let (a3_sk, _, s3) = start_lock_test_server(true, None).await;
+    let (a5_sk, _, s5) = start_lock_test_server(true, None).await;
+
+    let e_s1 = server_entry_for_test(&s1, &a1_sk, humoco_proto::NominatedBy::Creator);
+    let e_s2 = server_entry_for_test(&s2, &a2_sk, humoco_proto::NominatedBy::Creator);
+    let e_s3 = server_entry_for_test(&s3, &a3_sk, humoco_proto::NominatedBy::Creator);
+    let e_s5 = server_entry_for_test(&s5, &a5_sk, humoco_proto::NominatedBy::Creator);
+
+    let cmig_sk = SigningKey::from_bytes(&[181u8; 32]);
+    let cmig_pub = cmig_sk.verifying_key().to_bytes();
+    let quarter = humoco_proto::encode_quarter(2031, 4).unwrap();
+    let t0 = 1_795_000_000u64;
+
+    let man_rev1 = build_multi_server_manifest(
+        vec![e_s1.clone(), e_s2.clone(), e_s3],
+        Vec::new(),
+        2,
+        cmig_pub,
+        Vec::new(),
+        t0 * 1_000,
+        quarter,
+    );
+    let aid = man_rev1.rev1_anchor_id().unwrap();
+
+    // Order two root slots deterministically so slot_hi > slot_lo lexicographically
+    let g_sk = SigningKey::from_bytes(&[182u8; 32]);
+    let r_lo_sk = SigningKey::from_bytes(&[183u8; 32]);
+    let r_hi_sk = SigningKey::from_bytes(&[184u8; 32]);
+    let (ds_lo, ds_hi) = if humoco_proto::derive_slot(&aid, &[0x11; 32])
+        < humoco_proto::derive_slot(&aid, &[0x22; 32])
+    {
+        ([0x11; 32], [0x22; 32])
+    } else {
+        ([0x22; 32], [0x11; 32])
+    };
+    let root_hi = sign_lock_entry_helper(
+        aid,
+        ds_hi,
+        [0u8; 32],
+        0,
+        0,
+        [0x51; 32],
+        &g_sk,
+        humoco_proto::hash_pubkey_sha3(&r_hi_sk.verifying_key().to_bytes()),
+        None,
+        Some(&cmig_sk),
+        8,
+    );
+    let root_lo = sign_lock_entry_helper(
+        aid,
+        ds_lo,
+        [0u8; 32],
+        0,
+        0,
+        [0x52; 32],
+        &g_sk,
+        humoco_proto::hash_pubkey_sha3(&r_lo_sk.verifying_key().to_bytes()),
+        None,
+        Some(&cmig_sk),
+        8,
+    );
+    assert!(root_hi.slot > root_lo.slot);
+
+    // Insert root_hi FIRST (write_seq=1) and root_lo SECOND (write_seq=2) on S1
+    let tkt1 = issue_pow_ticket_db(&s1, aid, quarter, t0);
+    let bkt1 = humoco_proto::derive_bucket(&aid, &s1.state.db.lock_pubkey_bytes().unwrap());
+    let (c1, _) = s1
+        .state
+        .db
+        .process_lock_batch(
+            &s1.state.config,
+            humoco_sync_server::locks::LockBatchRequest {
+                anchor_id: aid,
+                bucket: bkt1,
+                recipient_nonce: [0x61; 32],
+                entries: vec![root_hi.to_wire_hex().unwrap()],
+                manifest: Some(man_rev1.clone()),
+                genesis_ticket: Some(tkt1),
+                known_head_receipt: None,
+            },
+            t0,
+        )
+        .unwrap();
+    assert_eq!(c1, 200);
+    let (c2, v2) = s1
+        .state
+        .db
+        .process_lock_batch(
+            &s1.state.config,
+            humoco_sync_server::locks::LockBatchRequest {
+                anchor_id: aid,
+                bucket: bkt1,
+                recipient_nonce: [0x62; 32],
+                entries: vec![root_lo.to_wire_hex().unwrap()],
+                manifest: None,
+                genesis_ticket: None,
+                known_head_receipt: None,
+            },
+            t0 + 1,
+        )
+        .unwrap();
+    assert_eq!(c2, 200);
+    let resp2: humoco_sync_server::locks::LockBatchResponse = serde_json::from_value(v2).unwrap();
+    let rev1_head_receipt = resp2.receipts.into_iter().next().unwrap();
+    assert_eq!(rev1_head_receipt.write_seq, 2);
+
+    // Commit both entries to S2 as well (no extra entries, so union has exact same 2 entries)
+    let tkt2 = issue_pow_ticket_db(&s2, aid, quarter, t0);
+    let bkt2 = humoco_proto::derive_bucket(&aid, &s2.state.db.lock_pubkey_bytes().unwrap());
+    s2.state
+        .db
+        .process_lock_batch(
+            &s2.state.config,
+            humoco_sync_server::locks::LockBatchRequest {
+                anchor_id: aid,
+                bucket: bkt2,
+                recipient_nonce: [0x63; 32],
+                entries: vec![
+                    root_lo.to_wire_hex().unwrap(),
+                    root_hi.to_wire_hex().unwrap(),
+                ],
+                manifest: Some(man_rev1.clone()),
+                genesis_ticket: Some(tkt2),
+                known_head_receipt: None,
+            },
+            t0 + 1,
+        )
+        .unwrap();
+
+    // Rotate Rev 1 -> Rev 2 keeping S1 in committee: [S1, S2, S3] -> [S1, S2, S5]
+    let t_prop = t0 + 10;
+    let prop12 = build_signed_proposal(
+        aid,
+        1,
+        2,
+        vec![e_s1.clone(), e_s2.clone(), e_s5.clone()],
+        Vec::new(),
+        quarter,
+        t_prop,
+        humoco_proto::ProposalInitiator::Creator,
+        Some(&cmig_sk),
+        Vec::new(),
+    );
+    let mut snaps = Vec::new();
+    for srv in [&s1, &s2] {
+        let (_, v) = srv
+            .state
+            .db
+            .process_lock_freeze(
+                &srv.state.config,
+                humoco_sync_server::lock_rotation::LockFreezeRequest::Propose {
+                    proposal: prop12.clone(),
+                    current_manifest: None,
+                },
+                t_prop,
+            )
+            .unwrap();
+        snaps.push(
+            serde_json::from_value::<humoco_proto::SnapshotExport>(v["snapshot_export"].clone())
+                .unwrap(),
+        );
+    }
+    let t_mat = t_prop + s1.state.config.lock.proposal_timelock_secs;
+    let mut acks = Vec::new();
+    let mut ish = [0u8; 32];
+    for srv in [&s1, &s2, &s5] {
+        let (_, v) = srv
+            .state
+            .db
+            .process_lock_import(
+                &srv.state.config,
+                humoco_sync_server::lock_rotation::LockImportRequest {
+                    anchor_id: aid,
+                    active_manifest: man_rev1.clone(),
+                    proposal: prop12.clone(),
+                    snapshots: snaps.clone(),
+                    quorum_certificates: Vec::new(),
+                },
+                t_mat,
+            )
+            .unwrap();
+        let ack: humoco_proto::ImportAck = serde_json::from_value(v["import_ack"].clone()).unwrap();
+        ish = ack.imported_state_hash;
+        acks.push(ack);
+    }
+    let mut cs = Vec::new();
+    for srv in [&s1, &s2] {
+        let (_, v) = srv
+            .state
+            .db
+            .process_lock_commit(
+                &srv.state.config,
+                humoco_sync_server::lock_rotation::LockCommitRequest::SignCommit {
+                    anchor_id: aid,
+                    proposal: prop12.clone(),
+                    imported_state_hash: ish,
+                    import_acks: acks.clone(),
+                },
+                t_mat,
+            )
+            .unwrap();
+        cs.push(
+            serde_json::from_value::<humoco_proto::CommitteeSignature>(
+                v["committee_signature"].clone(),
+            )
+            .unwrap(),
+        );
+    }
+    let cert12 = humoco_proto::MigrationCert {
+        anchor_id: aid,
+        genesis_manifest: Some(Box::new(man_rev1.clone())),
+        proposal: prop12,
+        imported_state_hash: ish,
+        import_acks: acks,
+        commit_sigs: cs,
+    };
+    let (man_rev2, _) = cert12.verify_step(&aid, &man_rev1).unwrap();
+    for srv in [&s1, &s2, &s5] {
+        srv.state
+            .db
+            .process_lock_commit(
+                &srv.state.config,
+                humoco_sync_server::lock_rotation::LockCommitRequest::Finalize {
+                    anchor_id: aid,
+                    new_manifest: man_rev2.clone(),
+                },
+                t_mat,
+            )
+            .unwrap();
+    }
+
+    // In Rev 2, an honest client presents pre-rotation receipt (write_seq=2) on S1:
+    // MUST NOT falsely SelfFreeze S1!
+    let child_entry = sign_lock_entry_helper(
+        aid,
+        [0x33; 32],
+        root_lo.slot,
+        0,
+        1,
+        [0x53; 32],
+        &r_lo_sk,
+        [0xAA; 32],
+        None,
+        None,
+        8,
+    );
+    let (post_rot_code, post_rot_val) = s1
+        .state
+        .db
+        .process_lock_batch(
+            &s1.state.config,
+            humoco_sync_server::locks::LockBatchRequest {
+                anchor_id: aid,
+                bucket: bkt1,
+                recipient_nonce: [0x64; 32],
+                entries: vec![child_entry.to_wire_hex().unwrap()],
+                manifest: None,
+                genesis_ticket: None,
+                known_head_receipt: Some(rev1_head_receipt),
+            },
+            t_mat + 5,
+        )
+        .unwrap();
+    assert_eq!(
+        post_rot_code, 200,
+        "Retained server S1 must not falsely SelfFreeze on valid Rev-1 receipt after rotation, got: {post_rot_val}"
+    );
+    let rev2_resp: humoco_sync_server::locks::LockBatchResponse =
+        serde_json::from_value(post_rot_val).unwrap();
+    let rev2_head_receipt = rev2_resp.receipts.into_iter().next().unwrap();
+    assert_eq!(rev2_head_receipt.write_seq, 3);
+
+    // Also test Rev 2 -> Rev 3 when S1's Single slot (child_entry) turns into an unresolved
+    // Conflict on S5: Single count drops 3 -> 2, yet S1's write_seq MUST NOT drop below 3!
+    let bkt5 = humoco_proto::derive_bucket(&aid, &s5.state.db.lock_pubkey_bytes().unwrap());
+    let child_conflict = sign_lock_entry_helper(
+        aid,
+        [0x33; 32],
+        root_lo.slot,
+        0,
+        1,
+        [0x54; 32],
+        &r_lo_sk,
+        [0xBB; 32],
+        None,
+        None,
+        8,
+    );
+    s5.state
+        .db
+        .process_lock_batch(
+            &s5.state.config,
+            humoco_sync_server::locks::LockBatchRequest {
+                anchor_id: aid,
+                bucket: bkt5,
+                recipient_nonce: [0x65; 32],
+                entries: vec![child_conflict.to_wire_hex().unwrap()],
+                manifest: None,
+                genesis_ticket: None,
+                known_head_receipt: None,
+            },
+            t_mat + 6,
+        )
+        .unwrap();
+
+    let t_prop23 = t_mat + 10;
+    let prop23 = build_signed_proposal(
+        aid,
+        2,
+        2,
+        vec![e_s1, e_s2, e_s5],
+        Vec::new(),
+        quarter,
+        t_prop23,
+        humoco_proto::ProposalInitiator::Creator,
+        Some(&cmig_sk),
+        Vec::new(),
+    );
+    let mut snaps23 = Vec::new();
+    for srv in [&s1, &s5] {
+        let (_, v) = srv
+            .state
+            .db
+            .process_lock_freeze(
+                &srv.state.config,
+                humoco_sync_server::lock_rotation::LockFreezeRequest::Propose {
+                    proposal: prop23.clone(),
+                    current_manifest: None,
+                },
+                t_prop23,
+            )
+            .unwrap();
+        snaps23.push(
+            serde_json::from_value::<humoco_proto::SnapshotExport>(v["snapshot_export"].clone())
+                .unwrap(),
+        );
+    }
+    let t_mat23 = t_prop23 + s1.state.config.lock.proposal_timelock_secs;
+    let mut acks23 = Vec::new();
+    let mut ish23 = [0u8; 32];
+    for srv in [&s1, &s2, &s5] {
+        let (_, v) = srv
+            .state
+            .db
+            .process_lock_import(
+                &srv.state.config,
+                humoco_sync_server::lock_rotation::LockImportRequest {
+                    anchor_id: aid,
+                    active_manifest: man_rev2.clone(),
+                    proposal: prop23.clone(),
+                    snapshots: snaps23.clone(),
+                    quorum_certificates: Vec::new(),
+                },
+                t_mat23,
+            )
+            .unwrap();
+        let ack: humoco_proto::ImportAck = serde_json::from_value(v["import_ack"].clone()).unwrap();
+        ish23 = ack.imported_state_hash;
+        acks23.push(ack);
+    }
+    let mut cs23 = Vec::new();
+    for srv in [&s1, &s5] {
+        let (_, v) = srv
+            .state
+            .db
+            .process_lock_commit(
+                &srv.state.config,
+                humoco_sync_server::lock_rotation::LockCommitRequest::SignCommit {
+                    anchor_id: aid,
+                    proposal: prop23.clone(),
+                    imported_state_hash: ish23,
+                    import_acks: acks23.clone(),
+                },
+                t_mat23,
+            )
+            .unwrap();
+        cs23.push(
+            serde_json::from_value::<humoco_proto::CommitteeSignature>(
+                v["committee_signature"].clone(),
+            )
+            .unwrap(),
+        );
+    }
+    let cert23 = humoco_proto::MigrationCert {
+        anchor_id: aid,
+        genesis_manifest: None,
+        proposal: prop23,
+        imported_state_hash: ish23,
+        import_acks: acks23,
+        commit_sigs: cs23,
+    };
+    let (man_rev3, _) = cert23.verify_step(&aid, &man_rev2).unwrap();
+    for srv in [&s1, &s2, &s5] {
+        srv.state
+            .db
+            .process_lock_commit(
+                &srv.state.config,
+                humoco_sync_server::lock_rotation::LockCommitRequest::Finalize {
+                    anchor_id: aid,
+                    new_manifest: man_rev3.clone(),
+                },
+                t_mat23,
+            )
+            .unwrap();
+    }
+
+    // Presenting rev2_head_receipt (write_seq=3) on S1 in Rev 3 must return 200 ConflictSeen,
+    // NOT falsely SelfFreeze!
+    let (rev3_code, rev3_val) = s1
+        .state
+        .db
+        .process_lock_batch(
+            &s1.state.config,
+            humoco_sync_server::locks::LockBatchRequest {
+                anchor_id: aid,
+                bucket: bkt1,
+                recipient_nonce: [0x66; 32],
+                entries: vec![child_entry.to_wire_hex().unwrap()],
+                manifest: None,
+                genesis_ticket: None,
+                known_head_receipt: Some(rev2_head_receipt),
+            },
+            t_mat23 + 5,
+        )
+        .unwrap();
+    assert_eq!(
+        rev3_code, 200,
+        "S1 must not falsely SelfFreeze when Single slot turned into Conflict across rotation, got: {rev3_val}"
+    );
+    assert_eq!(rev3_val["status"], "conflict");
+}
+
+#[tokio::test]
+async fn test_s02_import_and_finalize_reject_forked_history_chain() {
+    let dir = TempDir::new().unwrap();
+    let db2_path = dir.path().join("s2.redb");
+    let db2_fork_path = dir.path().join("s2_fork.redb");
+    let db5b_path = dir.path().join("s5b.redb");
+
+    let (a1_sk, _, s1) = start_lock_test_server(true, Some(0)).await;
+    let (a2_sk, a2_pk) = gen_keypair();
+    let (a3_sk, _, s3) = start_lock_test_server(true, Some(0)).await;
+    let (a5a_sk, _, s5a) = start_lock_test_server(true, Some(0)).await;
+    let (a5b_sk, a5b_pk) = gen_keypair();
+
+    let mut cfg2 = base_hybrid_config(&a2_pk);
+    cfg2.lock.proposal_timelock_secs = 0;
+    let mut cfg5b = base_hybrid_config(&a5b_pk);
+    cfg5b.lock.proposal_timelock_secs = 0;
+
+    let lp2 = {
+        let db2 = humoco_sync_server::db::SyncDb::open(&db2_path, "").unwrap();
+        db2.lock_pubkey_bytes().unwrap()
+    };
+    std::fs::copy(&db2_path, &db2_fork_path).unwrap();
+    let lp5b = {
+        let db5b = humoco_sync_server::db::SyncDb::open(&db5b_path, "").unwrap();
+        db5b.lock_pubkey_bytes().unwrap()
+    };
+
+    let e_s1 = server_entry_for_test(&s1, &a1_sk, humoco_proto::NominatedBy::Creator);
+    let e_s2 = humoco_proto::ServerEntry {
+        write_url: "https://s2.example/sync.php".to_string(),
+        read_url: "https://s2.example/humoco_sync_data".to_string(),
+        admin_pub: a2_sk.verifying_key().to_bytes(),
+        lock_pub: lp2,
+        nominated_by: humoco_proto::NominatedBy::Creator,
+    };
+    let e_s3 = server_entry_for_test(&s3, &a3_sk, humoco_proto::NominatedBy::Creator);
+    let e_s5a = server_entry_for_test(&s5a, &a5a_sk, humoco_proto::NominatedBy::Creator);
+    let e_s5b = humoco_proto::ServerEntry {
+        write_url: "https://s5b.example/sync.php".to_string(),
+        read_url: "https://s5b.example/humoco_sync_data".to_string(),
+        admin_pub: a5b_sk.verifying_key().to_bytes(),
+        lock_pub: lp5b,
+        nominated_by: humoco_proto::NominatedBy::Creator,
+    };
+
+    let cmig_sk = SigningKey::from_bytes(&[191u8; 32]);
+    let cmig_pub = cmig_sk.verifying_key().to_bytes();
+    let quarter = humoco_proto::encode_quarter(2031, 4).unwrap();
+    let t0 = 1_795_000_000u64;
+
+    let man_rev1 = build_multi_server_manifest(
+        vec![e_s1.clone(), e_s2.clone(), e_s3.clone()],
+        Vec::new(),
+        2,
+        cmig_pub,
+        Vec::new(),
+        t0 * 1_000,
+        quarter,
+    );
+    let aid = man_rev1.rev1_anchor_id().unwrap();
+
+    // Branch A: Finalize Rev 1 -> Rev 2A ([S1, S2, S5a]) on S1
+    let prop_2a = build_signed_proposal(
+        aid,
+        1,
+        2,
+        vec![e_s1.clone(), e_s2.clone(), e_s5a.clone()],
+        Vec::new(),
+        quarter,
+        t0 + 10,
+        humoco_proto::ProposalInitiator::Creator,
+        Some(&cmig_sk),
+        Vec::new(),
+    );
+    let db2_a = humoco_sync_server::db::SyncDb::open(&db2_path, "").unwrap();
+    let (_, pf1_a) = s1
+        .state
+        .db
+        .process_lock_freeze(
+            &s1.state.config,
+            humoco_sync_server::lock_rotation::LockFreezeRequest::Propose {
+                proposal: prop_2a.clone(),
+                current_manifest: Some(man_rev1.clone()),
+            },
+            t0 + 10,
+        )
+        .unwrap();
+    let (_, pf2_a) = db2_a
+        .process_lock_freeze(
+            &cfg2,
+            humoco_sync_server::lock_rotation::LockFreezeRequest::Propose {
+                proposal: prop_2a.clone(),
+                current_manifest: Some(man_rev1.clone()),
+            },
+            t0 + 10,
+        )
+        .unwrap();
+    let snaps_2a = vec![
+        serde_json::from_value::<humoco_proto::SnapshotExport>(pf1_a["snapshot_export"].clone())
+            .unwrap(),
+        serde_json::from_value::<humoco_proto::SnapshotExport>(pf2_a["snapshot_export"].clone())
+            .unwrap(),
+    ];
+    let t_2a = t0 + 10 + s1.state.config.lock.proposal_timelock_secs;
+    let (_, i1_a) = s1
+        .state
+        .db
+        .process_lock_import(
+            &s1.state.config,
+            humoco_sync_server::lock_rotation::LockImportRequest {
+                anchor_id: aid,
+                active_manifest: man_rev1.clone(),
+                proposal: prop_2a.clone(),
+                snapshots: snaps_2a.clone(),
+                quorum_certificates: Vec::new(),
+            },
+            t_2a,
+        )
+        .unwrap();
+    let (_, i2_a) = db2_a
+        .process_lock_import(
+            &cfg2,
+            humoco_sync_server::lock_rotation::LockImportRequest {
+                anchor_id: aid,
+                active_manifest: man_rev1.clone(),
+                proposal: prop_2a.clone(),
+                snapshots: snaps_2a.clone(),
+                quorum_certificates: Vec::new(),
+            },
+            t_2a,
+        )
+        .unwrap();
+    let (_, i5_a) = s5a
+        .state
+        .db
+        .process_lock_import(
+            &s5a.state.config,
+            humoco_sync_server::lock_rotation::LockImportRequest {
+                anchor_id: aid,
+                active_manifest: man_rev1.clone(),
+                proposal: prop_2a.clone(),
+                snapshots: snaps_2a,
+                quorum_certificates: Vec::new(),
+            },
+            t_2a,
+        )
+        .unwrap();
+    let acks_2a: Vec<humoco_proto::ImportAck> = [i1_a, i2_a, i5_a]
+        .into_iter()
+        .map(|v| serde_json::from_value(v["import_ack"].clone()).unwrap())
+        .collect();
+    let ish_2a = acks_2a[0].imported_state_hash;
+    let (_, sc1_a) = s1
+        .state
+        .db
+        .process_lock_commit(
+            &s1.state.config,
+            humoco_sync_server::lock_rotation::LockCommitRequest::SignCommit {
+                anchor_id: aid,
+                proposal: prop_2a.clone(),
+                imported_state_hash: ish_2a,
+                import_acks: acks_2a.clone(),
+            },
+            t_2a,
+        )
+        .unwrap();
+    let (_, sc2_a) = db2_a
+        .process_lock_commit(
+            &cfg2,
+            humoco_sync_server::lock_rotation::LockCommitRequest::SignCommit {
+                anchor_id: aid,
+                proposal: prop_2a.clone(),
+                imported_state_hash: ish_2a,
+                import_acks: acks_2a.clone(),
+            },
+            t_2a,
+        )
+        .unwrap();
+    let cert_2a = humoco_proto::MigrationCert {
+        anchor_id: aid,
+        genesis_manifest: Some(Box::new(man_rev1.clone())),
+        proposal: prop_2a,
+        imported_state_hash: ish_2a,
+        import_acks: acks_2a,
+        commit_sigs: vec![
+            serde_json::from_value(sc1_a["committee_signature"].clone()).unwrap(),
+            serde_json::from_value(sc2_a["committee_signature"].clone()).unwrap(),
+        ],
+    };
+    let (man_rev2_a, _) = cert_2a.verify_step(&aid, &man_rev1).unwrap();
+    s1.state
+        .db
+        .process_lock_commit(
+            &s1.state.config,
+            humoco_sync_server::lock_rotation::LockCommitRequest::Finalize {
+                anchor_id: aid,
+                new_manifest: man_rev2_a.clone(),
+            },
+            t_2a,
+        )
+        .unwrap();
+
+    // Branch B (equivocating fork using cloned db2_fork + s3): Rev 1 -> Rev 2B ([S2, S5b], Q=2)
+    let db2_b = humoco_sync_server::db::SyncDb::open(&db2_fork_path, "").unwrap();
+    let prop_2b = build_signed_proposal(
+        aid,
+        1,
+        2,
+        vec![e_s2.clone(), e_s5b.clone()],
+        Vec::new(),
+        quarter,
+        t0 + 20,
+        humoco_proto::ProposalInitiator::Creator,
+        Some(&cmig_sk),
+        Vec::new(),
+    );
+    let (_, pf2_b) = db2_b
+        .process_lock_freeze(
+            &cfg2,
+            humoco_sync_server::lock_rotation::LockFreezeRequest::Propose {
+                proposal: prop_2b.clone(),
+                current_manifest: Some(man_rev1.clone()),
+            },
+            t0 + 20,
+        )
+        .unwrap();
+    let (_, pf3_b) = s3
+        .state
+        .db
+        .process_lock_freeze(
+            &s3.state.config,
+            humoco_sync_server::lock_rotation::LockFreezeRequest::Propose {
+                proposal: prop_2b.clone(),
+                current_manifest: Some(man_rev1.clone()),
+            },
+            t0 + 20,
+        )
+        .unwrap();
+    let snaps_2b = vec![
+        serde_json::from_value::<humoco_proto::SnapshotExport>(pf2_b["snapshot_export"].clone())
+            .unwrap(),
+        serde_json::from_value::<humoco_proto::SnapshotExport>(pf3_b["snapshot_export"].clone())
+            .unwrap(),
+    ];
+    let t_2b = t0 + 20 + s3.state.config.lock.proposal_timelock_secs;
+    let (_, i2_b) = db2_b
+        .process_lock_import(
+            &cfg2,
+            humoco_sync_server::lock_rotation::LockImportRequest {
+                anchor_id: aid,
+                active_manifest: man_rev1.clone(),
+                proposal: prop_2b.clone(),
+                snapshots: snaps_2b.clone(),
+                quorum_certificates: Vec::new(),
+            },
+            t_2b,
+        )
+        .unwrap();
+    let db5b = humoco_sync_server::db::SyncDb::open(&db5b_path, "").unwrap();
+    let (_, i5_b) = db5b
+        .process_lock_import(
+            &cfg5b,
+            humoco_sync_server::lock_rotation::LockImportRequest {
+                anchor_id: aid,
+                active_manifest: man_rev1.clone(),
+                proposal: prop_2b.clone(),
+                snapshots: snaps_2b,
+                quorum_certificates: Vec::new(),
+            },
+            t_2b,
+        )
+        .unwrap();
+    let acks_2b: Vec<humoco_proto::ImportAck> = [i2_b, i5_b]
+        .into_iter()
+        .map(|v| serde_json::from_value(v["import_ack"].clone()).unwrap())
+        .collect();
+    let ish_2b = acks_2b[0].imported_state_hash;
+    let (_, sc2_b) = db2_b
+        .process_lock_commit(
+            &cfg2,
+            humoco_sync_server::lock_rotation::LockCommitRequest::SignCommit {
+                anchor_id: aid,
+                proposal: prop_2b.clone(),
+                imported_state_hash: ish_2b,
+                import_acks: acks_2b.clone(),
+            },
+            t_2b,
+        )
+        .unwrap();
+    let (_, sc3_b) = s3
+        .state
+        .db
+        .process_lock_commit(
+            &s3.state.config,
+            humoco_sync_server::lock_rotation::LockCommitRequest::SignCommit {
+                anchor_id: aid,
+                proposal: prop_2b.clone(),
+                imported_state_hash: ish_2b,
+                import_acks: acks_2b.clone(),
+            },
+            t_2b,
+        )
+        .unwrap();
+    let cert_2b = humoco_proto::MigrationCert {
+        anchor_id: aid,
+        genesis_manifest: Some(Box::new(man_rev1.clone())),
+        proposal: prop_2b,
+        imported_state_hash: ish_2b,
+        import_acks: acks_2b,
+        commit_sigs: vec![
+            serde_json::from_value(sc2_b["committee_signature"].clone()).unwrap(),
+            serde_json::from_value(sc3_b["committee_signature"].clone()).unwrap(),
+        ],
+    };
+    let (man_rev2_b, _) = cert_2b.verify_step(&aid, &man_rev1).unwrap();
+    db2_b
+        .process_lock_commit(
+            &cfg2,
+            humoco_sync_server::lock_rotation::LockCommitRequest::Finalize {
+                anchor_id: aid,
+                new_manifest: man_rev2_b.clone(),
+            },
+            t_2b,
+        )
+        .unwrap();
+    db5b.process_lock_commit(
+        &cfg5b,
+        humoco_sync_server::lock_rotation::LockCommitRequest::Finalize {
+            anchor_id: aid,
+            new_manifest: man_rev2_b.clone(),
+        },
+        t_2b,
+    )
+    .unwrap();
+
+    // Snapshot db2_b and db5b at Rev 2B before advancing to Rev 3B so we can generate valid
+    // snapshots for both prop_3b_to_s1 (?lock_import test) and prop_3b_fin (Finalize test)
+    let db2_rev2b_copy = dir.path().join("s2_rev2b_copy.redb");
+    let db5b_rev2b_copy = dir.path().join("s5b_rev2b_copy.redb");
+    drop(db2_b);
+    drop(db5b);
+    std::fs::copy(&db2_fork_path, &db2_rev2b_copy).unwrap();
+    std::fs::copy(&db5b_path, &db5b_rev2b_copy).unwrap();
+
+    // 1. Test ?lock_import on S1 (at Rev 2A) with forked active_manifest = man_rev2_b -> must reject 409!
+    let prop_3b_to_s1 = build_signed_proposal(
+        aid,
+        2,
+        2,
+        vec![e_s1, e_s2.clone(), e_s5b.clone()],
+        Vec::new(),
+        quarter,
+        t_2b + 10,
+        humoco_proto::ProposalInitiator::Creator,
+        Some(&cmig_sk),
+        Vec::new(),
+    );
+    let db2_b_imp = humoco_sync_server::db::SyncDb::open(&db2_rev2b_copy, "").unwrap();
+    let db5b_imp = humoco_sync_server::db::SyncDb::open(&db5b_rev2b_copy, "").unwrap();
+    let (_, pf2_imp) = db2_b_imp
+        .process_lock_freeze(
+            &cfg2,
+            humoco_sync_server::lock_rotation::LockFreezeRequest::Propose {
+                proposal: prop_3b_to_s1.clone(),
+                current_manifest: None,
+            },
+            t_2b + 10,
+        )
+        .unwrap();
+    let (_, pf5_imp) = db5b_imp
+        .process_lock_freeze(
+            &cfg5b,
+            humoco_sync_server::lock_rotation::LockFreezeRequest::Propose {
+                proposal: prop_3b_to_s1.clone(),
+                current_manifest: None,
+            },
+            t_2b + 10,
+        )
+        .unwrap();
+    let snaps_3b_imp = vec![
+        serde_json::from_value::<humoco_proto::SnapshotExport>(pf2_imp["snapshot_export"].clone())
+            .unwrap(),
+        serde_json::from_value::<humoco_proto::SnapshotExport>(pf5_imp["snapshot_export"].clone())
+            .unwrap(),
+    ];
+    let imp_fork_err = s1
+        .state
+        .db
+        .process_lock_import(
+            &s1.state.config,
+            humoco_sync_server::lock_rotation::LockImportRequest {
+                anchor_id: aid,
+                active_manifest: man_rev2_b.clone(),
+                proposal: prop_3b_to_s1,
+                snapshots: snaps_3b_imp,
+                quorum_certificates: Vec::new(),
+            },
+            t_2b + 10,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            imp_fork_err,
+            humoco_sync_server::db::DbError::Http { status: 409, .. }
+        ),
+        "?lock_import with forked active_manifest (Rev 2B != Rev 2A) must fail with 409, got {imp_fork_err:?}"
+    );
+
+    // 2. Test Finalize on S1 (at Rev 2A) with forked Rev 3B -> must reject 409!
+    let db2_b = humoco_sync_server::db::SyncDb::open(&db2_fork_path, "").unwrap();
+    let db5b = humoco_sync_server::db::SyncDb::open(&db5b_path, "").unwrap();
+    let prop_3b_fin = build_signed_proposal(
+        aid,
+        2,
+        2,
+        vec![e_s2, e_s3, e_s5b],
+        Vec::new(),
+        quarter,
+        t_2b + 20,
+        humoco_proto::ProposalInitiator::Creator,
+        Some(&cmig_sk),
+        Vec::new(),
+    );
+    let (_, pf2_3b) = db2_b
+        .process_lock_freeze(
+            &cfg2,
+            humoco_sync_server::lock_rotation::LockFreezeRequest::Propose {
+                proposal: prop_3b_fin.clone(),
+                current_manifest: None,
+            },
+            t_2b + 20,
+        )
+        .unwrap();
+    let (_, pf5_3b) = db5b
+        .process_lock_freeze(
+            &cfg5b,
+            humoco_sync_server::lock_rotation::LockFreezeRequest::Propose {
+                proposal: prop_3b_fin.clone(),
+                current_manifest: None,
+            },
+            t_2b + 20,
+        )
+        .unwrap();
+    let snaps_3b = vec![
+        serde_json::from_value::<humoco_proto::SnapshotExport>(pf2_3b["snapshot_export"].clone())
+            .unwrap(),
+        serde_json::from_value::<humoco_proto::SnapshotExport>(pf5_3b["snapshot_export"].clone())
+            .unwrap(),
+    ];
+    let t_3b = t_2b + 20 + cfg5b.lock.proposal_timelock_secs;
+    let (_, i2_3b) = db2_b
+        .process_lock_import(
+            &cfg2,
+            humoco_sync_server::lock_rotation::LockImportRequest {
+                anchor_id: aid,
+                active_manifest: man_rev2_b.clone(),
+                proposal: prop_3b_fin.clone(),
+                snapshots: snaps_3b.clone(),
+                quorum_certificates: Vec::new(),
+            },
+            t_3b,
+        )
+        .unwrap();
+    let (_, i3_3b) = s3
+        .state
+        .db
+        .process_lock_import(
+            &s3.state.config,
+            humoco_sync_server::lock_rotation::LockImportRequest {
+                anchor_id: aid,
+                active_manifest: man_rev2_b.clone(),
+                proposal: prop_3b_fin.clone(),
+                snapshots: snaps_3b.clone(),
+                quorum_certificates: Vec::new(),
+            },
+            t_3b,
+        )
+        .unwrap();
+    let (_, i5_3b) = db5b
+        .process_lock_import(
+            &cfg5b,
+            humoco_sync_server::lock_rotation::LockImportRequest {
+                anchor_id: aid,
+                active_manifest: man_rev2_b.clone(),
+                proposal: prop_3b_fin.clone(),
+                snapshots: snaps_3b,
+                quorum_certificates: Vec::new(),
+            },
+            t_3b,
+        )
+        .unwrap();
+    let acks_3b: Vec<humoco_proto::ImportAck> = [i2_3b, i3_3b, i5_3b]
+        .into_iter()
+        .map(|v| serde_json::from_value(v["import_ack"].clone()).unwrap())
+        .collect();
+    let ish_3b = acks_3b[0].imported_state_hash;
+    let (_, sc2_3b) = db2_b
+        .process_lock_commit(
+            &cfg2,
+            humoco_sync_server::lock_rotation::LockCommitRequest::SignCommit {
+                anchor_id: aid,
+                proposal: prop_3b_fin.clone(),
+                imported_state_hash: ish_3b,
+                import_acks: acks_3b.clone(),
+            },
+            t_3b,
+        )
+        .unwrap();
+    let (_, sc5_3b) = db5b
+        .process_lock_commit(
+            &cfg5b,
+            humoco_sync_server::lock_rotation::LockCommitRequest::SignCommit {
+                anchor_id: aid,
+                proposal: prop_3b_fin.clone(),
+                imported_state_hash: ish_3b,
+                import_acks: acks_3b.clone(),
+            },
+            t_3b,
+        )
+        .unwrap();
+    let cert_3b = humoco_proto::MigrationCert {
+        anchor_id: aid,
+        genesis_manifest: None,
+        proposal: prop_3b_fin,
+        imported_state_hash: ish_3b,
+        import_acks: acks_3b,
+        commit_sigs: vec![
+            serde_json::from_value(sc2_3b["committee_signature"].clone()).unwrap(),
+            serde_json::from_value(sc5_3b["committee_signature"].clone()).unwrap(),
+        ],
+    };
+    let (man_rev3_b, _) = cert_3b.verify_step(&aid, &man_rev2_b).unwrap();
+
+    let fin_fork_err = s1
+        .state
+        .db
+        .process_lock_commit(
+            &s1.state.config,
+            humoco_sync_server::lock_rotation::LockCommitRequest::Finalize {
+                anchor_id: aid,
+                new_manifest: man_rev3_b,
+            },
+            t_3b,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            fin_fork_err,
+            humoco_sync_server::db::DbError::Http { status: 409, .. }
+        ),
+        "Finalize with forked history chain (Rev 3B != Rev 2A prefix) must fail with 409, got {fin_fork_err:?}"
+    );
+    let stored_man: humoco_proto::AnchorManifest = serde_json::from_slice(
+        &s1.state
+            .db
+            .get_static_anchor_manifest(&hex::encode(aid))
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(stored_man, man_rev2_a);
+}
