@@ -1375,7 +1375,7 @@ impl SyncDb {
         bucket_hex: &str,
         file_hex: &str,
     ) -> Result<Option<Vec<u8>>, DbError> {
-        if parse_quarter(quarter_str).is_err() {
+        if !quarter_str.is_ascii() || parse_quarter(quarter_str).is_err() {
             return Ok(None);
         }
         if decode_hex_fixed::<32>(bucket_hex).is_err() || decode_hex_fixed::<32>(file_hex).is_err()
@@ -1641,6 +1641,88 @@ mod tests {
                     anchor_id: aid2,
                     bucket: b2,
                     recipient_nonce: [0xAB; 32],
+                    entries: vec![entry.to_wire_hex().unwrap()],
+                    manifest: None,
+                    genesis_ticket: None,
+                    known_head_receipt: Some(kr),
+                },
+                now,
+            )
+            .unwrap();
+        assert_eq!(code, 409);
+        assert_eq!(body["error"], "bucket_self_frozen");
+    }
+
+    #[test]
+    fn test_s09_f2_get_static_lock_entry_non_ascii_quarter_no_panic() {
+        let dir = TempDir::new().unwrap();
+        let db = SyncDb::open(&dir.path().join("sync.redb"), "").unwrap();
+        let dummy_hex = "00".repeat(32);
+
+        // "aäää" has 7 UTF-8 bytes, placing byte indices 4 and 6 inside multi-byte UTF-8 characters.
+        let res = db.get_static_lock_entry("aäää", &dummy_hex, &dummy_hex);
+        assert!(matches!(res, Ok(None)));
+
+        let res2 = db.get_static_lock_entry("äääa", &dummy_hex, &dummy_hex);
+        assert!(matches!(res2, Ok(None)));
+    }
+
+    #[test]
+    fn test_s09_f2_conflict_seen_write_seq_zero_triggers_rollback_tombstone() {
+        let dir = TempDir::new().unwrap();
+        let db = SyncDb::open(&dir.path().join("sync.redb"), "").unwrap();
+        let cfg = Config::default();
+        let quarter = humoco_proto::encode_quarter(2031, 3).unwrap();
+        let now = 1_795_000_000u64;
+
+        let lock_sk = {
+            let rt = db.raw_db().begin_read().unwrap();
+            let meta = rt.open_table(SERVER_META).unwrap();
+            load_lock_signing_key_read(&meta).unwrap()
+        };
+        let lock_pub = lock_sk.verifying_key().to_bytes();
+        let aid = [0x61; 32];
+        let bkt = derive_bucket(&aid, &lock_pub);
+        let mut kr = LockReceipt {
+            kind: LockReceiptKind::ConflictSeen,
+            lock_pub,
+            bucket: bkt,
+            slot: [0x62; 32],
+            child_lock: [0x63; 32],
+            entry_hash: [0x64; 32],
+            retain_until_quarter: quarter,
+            write_seq: 0,
+            bucket_head: compute_bucket_init_head(&bkt, quarter),
+            recipient_nonce: [0x65; 32],
+            sig: [0u8; 64],
+        };
+        kr.sig = lock_sk.sign(&kr.digest()).to_bytes();
+
+        let dummy_sk = SigningKey::from_bytes(&[77u8; 32]);
+        let slot = humoco_proto::derive_slot(&aid, &[0x66; 32]);
+        let pow = humoco_proto::solve_lock_pow(&slot, &[0x67; 32], 0, 8, 0, 100_000).unwrap();
+        let entry = LockEntry {
+            slot,
+            parent_slot: [0u8; 32],
+            output_branch: 0,
+            depth: 0,
+            child_lock: [0x67; 32],
+            sender_pubkey: dummy_sk.verifying_key().to_bytes(),
+            receiver_pubkey_hash: [0x68; 32],
+            change_pubkey_hash: None,
+            causal_sig: [0u8; 64],
+            root_mig_sig: Some([0u8; 64]),
+            encrypted_payload: [0u8; 265],
+            pow_nonce: pow,
+        };
+
+        let (code, body) = db
+            .process_lock_batch(
+                &cfg,
+                LockBatchRequest {
+                    anchor_id: aid,
+                    bucket: bkt,
+                    recipient_nonce: [0xCD; 32],
                     entries: vec![entry.to_wire_hex().unwrap()],
                     manifest: None,
                     genesis_ticket: None,

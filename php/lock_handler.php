@@ -99,7 +99,7 @@ function lock_purge_after_secs(int $q): ?int {
     [$y, $qn] = $d;
     $ny = ($qn === 4) ? $y + 1 : $y;
     $nm = ($qn === 4) ? 1 : ($qn * 3 + 1);
-    return (new DateTimeImmutable(sprintf('%04d-%02d-01 00:00:00', $ny, $nm), new DateTimeZone('UTC')))->getTimestamp() + 30 * 86400;
+    return (new DateTimeImmutable('1970-01-01 00:00:00', new DateTimeZone('UTC')))->setDate($ny, $nm, 1)->setTime(0, 0, 0)->getTimestamp() + 30 * 86400;
 }
 function lock_paths(string $dataDir): array {
     $meta = $dataDir . '/.locks_meta';
@@ -410,7 +410,7 @@ function lock_verify_receipt(array $r, string $expectedLock32, string $expectedB
     $eh = lock_hex_bytes($r['entry_hash'] ?? null, 32); $bh = lock_hex_bytes($r['bucket_head'] ?? null, 32);
     $rn = lock_hex_bytes($r['recipient_nonce'] ?? null, 32); $sig = lock_hex_bytes($r['sig'] ?? null, 64);
     $q = $r['retain_until_quarter'] ?? null; $ws = $r['write_seq'] ?? null;
-    if ($lp !== $expectedLock32 || $bk !== $expectedBucket32 || $sl === null || $cl === null || $eh === null || $bh === null || $rn === null || $rn === str_repeat("\0", 32) || $sig === null || !is_int($q) || lock_decode_quarter($q) === null || !is_int($ws) || $ws <= 0) return false;
+    if ($lp !== $expectedLock32 || $bk !== $expectedBucket32 || $sl === null || $cl === null || $eh === null || $bh === null || $rn === null || $rn === str_repeat("\0", 32) || $sig === null || !is_int($q) || lock_decode_quarter($q) === null || !is_int($ws) || $ws < 0 || ($kb === 0 && $ws === 0)) return false;
     return lock_verify_sig($lp, $sig, hash('sha256', 'HUMOCO_LOCK_RECEIPT_V1' . chr($kb) . $lp . $bk . $sl . $cl . $eh . pack('v', $q) . pack('P', $ws) . $bh . $rn, true));
 }
 
@@ -514,7 +514,7 @@ function lock_handle_batch(array $cfg, array $keys, string $dataDir, int $now): 
 
     $a32 = lock_hex_bytes($req['anchor_id'] ?? null, 32); $b32 = lock_hex_bytes($req['bucket'] ?? null, 32);
     $rn32 = lock_hex_bytes($req['recipient_nonce'] ?? null, 32); $rawEntries = $req['entries'] ?? null;
-    if ($a32 === null || $b32 === null || $rn32 === null || $rn32 === str_repeat("\0", 32) || !is_array($rawEntries) || count($rawEntries) < 1 || count($rawEntries) > 64) lock_fail(400, 'Invalid lock batch request JSON');
+    if ($a32 === null || $b32 === null || $rn32 === null || $rn32 === str_repeat("\0", 32) || !is_array($rawEntries) || !array_is_list($rawEntries) || count($rawEntries) < 1 || count($rawEntries) > 64) lock_fail(400, 'Invalid lock batch request JSON');
     if ($b32 !== hash('sha256', 'HUMOCO_SYNC_BUCKET_V1' . $a32 . $keys['pk32'], true)) lock_fail(400, 'bucket does not match derive_bucket(anchor_id, lock_pub)');
 
     $entries = [];
@@ -834,12 +834,18 @@ function lock_maybe_handle_request(array $config, string $configFile, string $da
             $ap = $del['admin_pub'] ?? null;
             $lp = $del['lock_pub'] ?? null;
             $ia = $del['issued_at'] ?? null;
-            if (!is_string($ap) || !is_string($lp) || preg_match('/\A[0-9a-f]{64}\z/', $ap) !== 1 || preg_match('/\A[0-9a-f]{64}\z/', $lp) !== 1
-                || $ap !== $adminPub || $lp !== $keys['pkHex'] || !lock_is_valid_url($wu) || !lock_is_valid_url($ru) || !is_int($ia) || $ia <= 0) {
+            $sig = lock_hex_bytes($del['sig'] ?? null, 64);
+            if (!is_string($ap) || !is_string($lp) || !is_string($wu) || !is_string($ru) || !is_int($ia) || $ia < 0
+                || preg_match('/\A[0-9a-f]{64}\z/', $ap) !== 1 || preg_match('/\A[0-9a-f]{64}\z/', $lp) !== 1 || $sig === null) {
                 lock_fail(400, 'Invalid lock delegation payload');
             }
-            $sig = lock_hex_bytes($del['sig'] ?? null, 64);
-            if ($sig === null || !lock_verify_sig(hex2bin($adminPub), $sig, "HUMOCO-LOCK-DELEGATE-V1\n{$adminPub}\n{$keys['pkHex']}\n{$wu}\n{$ru}\n{$ia}")) lock_fail(401, 'Invalid lock delegation signature');
+            if ($ap !== $adminPub) {
+                lock_fail(403, 'Delegation admin_pub does not match configured admin_pubkey');
+            }
+            if ($lp !== $keys['pkHex'] || !lock_is_valid_url($wu) || !lock_is_valid_url($ru) || $ia <= 0) {
+                lock_fail(400, 'Invalid lock delegation payload');
+            }
+            if (!lock_verify_sig(hex2bin($adminPub), $sig, "HUMOCO-LOCK-DELEGATE-V1\n{$adminPub}\n{$keys['pkHex']}\n{$wu}\n{$ru}\n{$ia}")) lock_fail(401, 'Invalid lock delegation signature');
             $cleanDel = ['admin_pub' => $ap, 'lock_pub' => $lp, 'write_url' => $wu, 'read_url' => $ru, 'issued_at' => $ia, 'sig' => $del['sig']];
             lock_write_json($p['meta'] . '/delegation.json', $cleanDel);
             lock_ok(200, $cleanDel);

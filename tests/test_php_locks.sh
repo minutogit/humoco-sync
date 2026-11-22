@@ -1346,4 +1346,302 @@ assert_contains "$B13_OUT" '"loop_alias_allow":false' "SYNC-S07-11: canonicalize
 assert_contains "$B13_OUT" '"non_loop_allow":true' "SYNC-S07-11: ::1 loopback stays isolated from ::2"
 
 echo ""
+echo "=== Test 14: SYNC-S09-07 & SYNC-S09-08 GC 9999-Q4, ConflictSeen write_seq=0, entries list & PUT ?lock_delegate status parity ==="
+B14_GC_OUT="$(php -r '
+  require $argv[1];
+  $base = $argv[2] . "/b14_gc";
+  $p = lock_paths($base);
+  $b99 = str_repeat("aa", 32); $b20 = str_repeat("bb", 32);
+  @mkdir($p["locks"] . "/9999-Q4/$b99", 0755, true);
+  @mkdir($p["locks"] . "/2026-Q1/$b20", 0755, true);
+  file_put_contents($p["locks"] . "/9999-Q4/$b99/" . str_repeat("11", 32) . ".lock", str_repeat("x", 605));
+  file_put_contents($p["locks"] . "/2026-Q1/$b20/" . str_repeat("22", 32) . ".lock", str_repeat("y", 605));
+  file_put_contents($p["meta"] . "/buckets/$b99.json", json_encode(["anchor_id" => str_repeat("01", 32), "retain_until_quarter" => 39999, "slots" => ["s1"], "conflicts" => []]));
+  file_put_contents($p["meta"] . "/buckets/$b20.json", json_encode(["anchor_id" => str_repeat("02", 32), "retain_until_quarter" => 8104, "slots" => ["s2"], "conflicts" => []]));
+  $purge9999 = lock_purge_after_secs(39999);
+  $exp = (new DateTimeImmutable("1970-01-01 00:00:00", new DateTimeZone("UTC")))->setDate(10000, 1, 1)->setTime(0, 0, 0)->getTimestamp() + 30 * 86400;
+  [$purgedB, ] = lock_run_gc($base, 1800000000);
+  echo json_encode([
+    "purge_match" => ($purge9999 === $exp),
+    "purged_b" => $purgedB,
+    "keep_9999" => is_dir($p["locks"] . "/9999-Q4/$b99"),
+    "drop_2026q1" => !is_dir($p["locks"] . "/2026-Q1"),
+  ]);
+' "${ROOT_DIR}/php/lock_handler.php" "$TMP_DIR")"
+
+assert_contains "$B14_GC_OUT" '"purge_match":true' "SYNC-S09-07: lock_purge_after_secs(39999) resolves 9999-Q4 without overflow exception"
+assert_contains "$B14_GC_OUT" '"purged_b":1' "SYNC-S09-07: GC purges exactly the 1 expired bucket alongside 9999-Q4"
+assert_contains "$B14_GC_OUT" '"keep_9999":true' "SYNC-S09-07: GC retains active 9999-Q4 directory"
+assert_contains "$B14_GC_OUT" '"drop_2026q1":true' "SYNC-S09-07: GC prunes expired 2026-Q1 directory alongside 9999-Q4"
+
+read -r B14_ADMIN_SK B14_ADMIN_PK <<< "$("$SERVER_BIN" sign-test keygen)"
+read -r B14_OTHER_SK B14_OTHER_PK <<< "$("$SERVER_BIN" sign-test keygen)"
+B14_PORT="$(pick_free_port)"
+B14_DOC="$TMP_DIR/b14_doc"
+start_php_server "$B14_DOC" "$B14_ADMIN_PK" 500 2 "$B14_PORT" "$TMP_DIR/b14.log" 0
+B14_URL="http://127.0.0.1:${B14_PORT}"
+B14_LP="$(curl -sf "${B14_URL}/sync.php?lock_selftest" | sed -n 's/.*"lock_pub":"\([0-9a-f]\{64\}\)".*/\1/p')"
+B14_ANCHOR="$("$SERVER_BIN" sign-test make-lock-sample --lock-pub "$B14_LP" --admin-pub "$B14_ADMIN_PK" --quarter "$QTR" --anchor-tag "b14-sync-s09" --variant anchor_id)"
+[[ "$(issue_ticket "$B14_URL" "$B14_ADMIN_SK" "$B14_ADMIN_PK" "$B14_ANCHOR" "$QTR" "$TMP_DIR/b14_ticket.json")" == "200" ]] || fail "B14 ticket issue failed"
+"$SERVER_BIN" sign-test make-lock-sample --lock-pub "$B14_LP" --admin-pub "$B14_ADMIN_PK" --quarter "$QTR" --ticket-json "$TMP_DIR/b14_ticket.json" --anchor-tag "b14-sync-s09" --variant "entry0" > "$TMP_DIR/b14_sample.json"
+
+B14_HTTP_OUT="$(php -r '
+  require $argv[8];
+  $u = $argv[1]; $doc = $argv[2]; $ask = $argv[3]; $apk = $argv[4]; $opk = $argv[5]; $lp = $argv[6]; $q = (int)$argv[7];
+  $sample = json_decode(file_get_contents($argv[9]), true);
+  $req = static function (string $method, string $url, string $body, array $hdrs = []): array {
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [CURLOPT_CUSTOMREQUEST => $method, CURLOPT_POSTFIELDS => $body, CURLOPT_HTTPHEADER => array_merge(["Content-Type: application/json"], $hdrs), CURLOPT_RETURNTRANSFER => true]);
+    $resp = curl_exec($ch); $code = curl_getinfo($ch, CURLINFO_HTTP_CODE); curl_close($ch);
+    return [$code, json_decode((string)$resp, true) ?: []];
+  };
+  $adminReq = static function (string $method, string $channel, string $body) use ($u, $ask, $apk, $req): array {
+    $ts = time(); $nonce = bin2hex(random_bytes(16));
+    $domain = ($method === "PUT" && $channel === "lock_delegate") ? "HUMOCO-DROP-ADMIN-V1\nPUT_LOCK_DELEGATE" : "HUMOCO-DROP-REQ-V1\n{$method}\n{$channel}\n";
+    $hdrs = [
+      "X-Drop-Pubkey: $apk",
+      "X-Drop-Timestamp: $ts",
+      "X-Drop-Nonce: $nonce",
+      "X-Drop-Signature: " . bin2hex(sodium_crypto_sign_detached("{$domain}\n{$ts}\n{$nonce}\n" . hash("sha256", $body), hex2bin($ask) . hex2bin($apk))),
+    ];
+    return $req($method, "$u/sync.php?$channel", $body, $hdrs);
+  };
+
+  $aHex = $sample["anchor_id"]; $a32 = hex2bin($aHex);
+  $bHex = $sample["bucket"]; $b32 = hex2bin($bHex);
+  $rnHex = $sample["recipient_nonce"]; $rn32 = hex2bin($rnHex);
+  $entryHex = $sample["entries"][0];
+  $parsedEntry = lock_parse_entry($entryHex);
+  if ($parsedEntry === null) throw new RuntimeException("sample entry failed lock_parse_entry");
+  $slot = $parsedEntry["slot"];
+  $childLock = $parsedEntry["childLock"];
+
+  // (a) Non-list entries object {"a": ...} MUST return 400 (NOT 200!)
+  [$assocCode, $assocBody] = $req("POST", "$u/sync.php?lock", json_encode([
+    "anchor_id" => $aHex, "bucket" => $bHex, "recipient_nonce" => $rnHex,
+    "entries" => ["a" => $entryHex], "manifest" => $sample["manifest"], "genesis_ticket" => $sample["genesis_ticket"], "known_head_receipt" => null,
+  ]));
+
+  // (b) Sign synthetic ConflictSeen(write_seq=0) and FirstWrite(write_seq=0) receipts using server lock key
+  $lk = lock_load_or_init_keys($doc . "/humoco_sync_data");
+  $lockSkBin = $lk["sk64"]; $lockPkBin = $lk["pk32"];
+  $mkRcpt = static function (string $kind, int $kb, int $ws) use ($lockSkBin, $lockPkBin, $b32, $slot, $childLock, $rn32, $q): array {
+    $eh = hash("sha3-256", "ENTRY", true); $bh = str_repeat("\x55", 32);
+    $pre = "HUMOCO_LOCK_RECEIPT_V1" . chr($kb) . $lockPkBin . $b32 . $slot . $childLock . $eh . pack("v", $q) . pack("P", $ws) . $bh . $rn32;
+    return [
+      "kind" => $kind, "lock_pub" => bin2hex($lockPkBin), "bucket" => bin2hex($b32),
+      "slot" => bin2hex($slot), "child_lock" => bin2hex($childLock), "entry_hash" => bin2hex($eh),
+      "retain_until_quarter" => $q, "write_seq" => $ws, "bucket_head" => bin2hex($bh),
+      "recipient_nonce" => bin2hex($rn32), "sig" => bin2hex(sodium_crypto_sign_detached(hash("sha256", $pre, true), $lockSkBin)),
+    ];
+  };
+  // Known head receipt on absent/cold bucket triggers 409 bucket_self_frozen for ConflictSeen write_seq=0,
+  // while FirstWrite write_seq=0 remains 401
+  $rcptFirstZero = $mkRcpt("first_write", 0, 0);
+  [$fwZeroCode, $fwZeroBody] = $req("POST", "$u/sync.php?lock", json_encode([
+    "anchor_id" => $aHex, "bucket" => $bHex, "recipient_nonce" => $rnHex,
+    "entries" => [$entryHex], "manifest" => $sample["manifest"], "genesis_ticket" => $sample["genesis_ticket"], "known_head_receipt" => $rcptFirstZero,
+  ]));
+  $rcptConflictZero = $mkRcpt("conflict_seen", 1, 0);
+  [$csZeroCode, $csZeroBody] = $req("POST", "$u/sync.php?lock", json_encode([
+    "anchor_id" => $aHex, "bucket" => $bHex, "recipient_nonce" => $rnHex,
+    "entries" => [$entryHex], "manifest" => $sample["manifest"], "genesis_ticket" => $sample["genesis_ticket"], "known_head_receipt" => $rcptConflictZero,
+  ]));
+
+  // (c) PUT ?lock_delegate status parity (403 mismatched admin_pub, 400 uppercase/malformed sig, 401 wrong hex sig)
+  $ia = time(); $wu = "https://example.invalid/sync.php"; $ru = "https://example.invalid/humoco_sync_data";
+  $delBadAdmin = json_encode([
+    "admin_pub" => $opk, "lock_pub" => $lp, "write_url" => $wu, "read_url" => $ru, "issued_at" => $ia,
+    "sig" => bin2hex(sodium_crypto_sign_detached("HUMOCO-LOCK-DELEGATE-V1\n{$opk}\n{$lp}\n{$wu}\n{$ru}\n{$ia}", hex2bin($ask) . hex2bin($apk))),
+  ]);
+  [$del403Code, ] = $adminReq("PUT", "lock_delegate", $delBadAdmin);
+
+  $validDelSig = bin2hex(sodium_crypto_sign_detached("HUMOCO-LOCK-DELEGATE-V1\n{$apk}\n{$lp}\n{$wu}\n{$ru}\n{$ia}", hex2bin($ask) . hex2bin($apk)));
+  $delUpperSig = json_encode(["admin_pub" => $apk, "lock_pub" => $lp, "write_url" => $wu, "read_url" => $ru, "issued_at" => $ia, "sig" => strtoupper($validDelSig)]);
+  [$del400Code, ] = $adminReq("PUT", "lock_delegate", $delUpperSig);
+
+  $wrongSig = str_repeat("ab", 64);
+  $delWrongSig = json_encode(["admin_pub" => $apk, "lock_pub" => $lp, "write_url" => $wu, "read_url" => $ru, "issued_at" => $ia, "sig" => $wrongSig]);
+  [$del401Code, ] = $adminReq("PUT", "lock_delegate", $delWrongSig);
+
+  echo json_encode([
+    "assoc_code" => $assocCode,
+    "cs_zero_code" => $csZeroCode,
+    "cs_zero_err" => $csZeroBody["error"] ?? "",
+    "fw_zero_code" => $fwZeroCode,
+    "del_403_code" => $del403Code,
+    "del_400_code" => $del400Code,
+    "del_401_code" => $del401Code,
+  ]);
+' "$B14_URL" "$B14_DOC" "$B14_ADMIN_SK" "$B14_ADMIN_PK" "$B14_OTHER_PK" "$B14_LP" "$QTR" "${ROOT_DIR}/php/lock_handler.php" "$TMP_DIR/b14_sample.json")"
+
+stop_php_server
+
+assert_contains "$B14_HTTP_OUT" '"assoc_code":400' "SYNC-S09-08: POST ?lock rejects associative JSON object for entries with 400"
+assert_contains "$B14_HTTP_OUT" '"cs_zero_code":409' "SYNC-S09-08: ConflictSeen receipt with write_seq=0 triggers 409 on absent bucket"
+assert_contains "$B14_HTTP_OUT" '"cs_zero_err":"bucket_self_frozen"' "SYNC-S09-08: ConflictSeen write_seq=0 returns bucket_self_frozen"
+assert_contains "$B14_HTTP_OUT" '"fw_zero_code":401' "SYNC-S09-08: FirstWrite receipt with write_seq=0 remains rejected with 401"
+assert_contains "$B14_HTTP_OUT" '"del_403_code":403' "SYNC-S09-08: PUT ?lock_delegate returns 403 on mismatched admin_pub"
+assert_contains "$B14_HTTP_OUT" '"del_400_code":400' "SYNC-S09-08: PUT ?lock_delegate returns 400 on uppercase/non-canonical sig"
+assert_contains "$B14_HTTP_OUT" '"del_401_code":401' "SYNC-S09-08: PUT ?lock_delegate returns 401 on wrong valid-hex sig"
+
+echo ""
+echo "=== Test 15: SYNC-S09-09 Cryptographic ticket/receipt/chain verification, output_branch=1 split-change spend & static .lock ETag/304/405 ==="
+read -r B15_ADMIN_SK B15_ADMIN_PK <<< "$("$SERVER_BIN" sign-test keygen)"
+B15_PORT="$(pick_free_port)"
+B15_DOC="$TMP_DIR/b15_doc"
+start_php_server "$B15_DOC" "$B15_ADMIN_PK" 500 2 "$B15_PORT" "$TMP_DIR/b15.log" 0
+B15_URL="http://127.0.0.1:${B15_PORT}"
+B15_LP="$(curl -sf "${B15_URL}/sync.php?lock_selftest" | sed -n 's/.*"lock_pub":"\([0-9a-f]\{64\}\)".*/\1/p')"
+
+B15_OUT="$(php -r '
+  require $argv[6];
+  $u = $argv[1]; $ask = $argv[2]; $apk = $argv[3]; $lp = $argv[4]; $q = (int)$argv[5];
+  $post = static function (string $url, string $body, array $hdrs = []): array {
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [CURLOPT_POST => true, CURLOPT_POSTFIELDS => $body, CURLOPT_HTTPHEADER => array_merge(["Content-Type: application/json"], $hdrs), CURLOPT_RETURNTRANSFER => true]);
+    $resp = curl_exec($ch); $code = curl_getinfo($ch, CURLINFO_HTTP_CODE); curl_close($ch);
+    return [$code, json_decode((string)$resp, true) ?: []];
+  };
+  $cKp = sodium_crypto_sign_seed_keypair(hash("sha256", "B15_CREATOR", true));
+  $cSk = sodium_crypto_sign_secretkey($cKp); $cPk = sodium_crypto_sign_publickey($cKp);
+  $s0Kp = sodium_crypto_sign_seed_keypair(hash("sha256", "B15_S0", true));
+  $s0Sk = sodium_crypto_sign_secretkey($s0Kp); $s0Pk = sodium_crypto_sign_publickey($s0Kp);
+  $r1Kp = sodium_crypto_sign_seed_keypair(hash("sha256", "B15_R1", true));
+  $r1Sk = sodium_crypto_sign_secretkey($r1Kp); $r1Pk = sodium_crypto_sign_publickey($r1Kp);
+  $c1Kp = sodium_crypto_sign_seed_keypair(hash("sha256", "B15_C1", true));
+  $c1Sk = sodium_crypto_sign_secretkey($c1Kp); $c1Pk = sodium_crypto_sign_publickey($c1Kp);
+
+  $sBin = hex2bin($apk) . hex2bin($lp) . "\x00";
+  $ms = 1794916800000;
+  $manifest = [
+    "revision" => 1, "threshold" => 1,
+    "servers" => [["write_url" => "$u/sync.php", "read_url" => "$u/humoco_sync_data", "admin_pub" => $apk, "lock_pub" => $lp, "nominated_by" => "creator"]],
+    "successors" => [], "authority" => ["creator_mig_pub" => bin2hex($cPk), "guarantor_mig_pubs" => []],
+    "migration_chain" => [], "issued_at_ms" => $ms, "retain_until_quarter" => $q,
+  ];
+  $a32 = hash("sha256", "HUMOCO_ANCHOR_MANIFEST_V1\x00" . pack("P", 1) . "\x01\x01" . $sBin . pack("v", 0) . $cPk . "\x00" . pack("P", $ms) . pack("v", $q), true);
+  $aHex = bin2hex($a32);
+  $lpBin = hex2bin($lp);
+  $b32 = hash("sha256", "HUMOCO_SYNC_BUCKET_V1" . $a32 . $lpBin, true);
+  $bHex = bin2hex($b32);
+
+  $tBody = json_encode(["anchor_id" => $aHex, "retain_until_quarter" => $q, "pow_timestamp" => null, "pow_nonce" => null]);
+  $ts = time(); $nonce = bin2hex(random_bytes(16));
+  $tSig = bin2hex(sodium_crypto_sign_detached("HUMOCO-DROP-REQ-V1\nPOST\nlock_ticket\n\n{$ts}\n{$nonce}\n" . hash("sha256", $tBody), hex2bin($ask) . hex2bin($apk)));
+  [$tc, $tResp] = $post("$u/sync.php?lock_ticket", $tBody, ["X-Drop-Pubkey: $apk", "X-Drop-Timestamp: $ts", "X-Drop-Nonce: $nonce", "X-Drop-Signature: $tSig"]);
+  $ticket = $tResp["ticket"] ?? [];
+  $tDig = hash("sha256", "HUMOCO_GENESIS_TICKET_V1" . $a32 . pack("v", (int)$ticket["retain_until_quarter"]) . pack("P", (int)$ticket["issued_at"]) . $lpBin, true);
+  $ticketSigOk = ($tc === 200) && sodium_crypto_sign_verify_detached(hex2bin($ticket["sig"]), $tDig, $lpBin);
+
+  $mkEntry = static function (string $dsTag, string $parentSlot, int $ob, int $depth, string $childLock, string $senderSk, string $senderPk, string $recvHash, ?string $chgHash, ?string $rootSk) use ($a32): array {
+    $slot = hash("sha256", "HUMOCO_SYNC_SLOT_V1" . $a32 . $dsTag, true);
+    $hasChg = $chgHash !== null ? 1 : 0; $chg32 = $chgHash ?? str_repeat("\0", 32);
+    $cDig = hash("sha256", "HUMOCO_CAUSAL_OUTPUT_V1" . $a32 . $slot . $parentSlot . chr($ob) . pack("V", $depth) . $childLock . $senderPk . $recvHash . chr($hasChg) . $chg32, true);
+    $cSig = sodium_crypto_sign_detached($cDig, $senderSk);
+    $hasRoot = $depth === 0 ? 1 : 0;
+    $rootSig = $depth === 0 ? sodium_crypto_sign_detached(hash("sha256", "HUMOCO_ROOT_MIG_AUTH_V1" . $a32 . $slot . $senderPk, true), $rootSk) : str_repeat("\0", 64);
+    $pn = 0; $powPre = "HUMOCO_LOCK_POW_V1" . $slot . $childLock . pack("V", $depth);
+    while (true) {
+      $pnLe = pack("P", $pn);
+      if (ord(hash("sha256", $powPre . $pnLe, true)[0]) === 0) break;
+      $pn++;
+    }
+    $wire = "HMLK\x01" . $slot . $parentSlot . chr($ob) . pack("V", $depth) . $childLock . $senderPk . $recvHash . chr($hasChg) . $chg32 . $cSig . chr($hasRoot) . $rootSig . str_repeat("\x5A", 265) . $pnLe;
+    $eh = hash("sha256", "HUMOCO_LOCK_ENTRY_V1" . substr($wire, 0, 597), true);
+    return ["slot" => $slot, "eh" => $eh, "hex" => bin2hex($wire), "wire" => $wire];
+  };
+
+  $sinkHash = str_repeat("\x99", 32);
+  $r1Hash = hash("sha3-256", $r1Pk, true); $c1Hash = hash("sha3-256", $c1Pk, true);
+  $eRoot = $mkEntry(str_repeat("\x10", 32), str_repeat("\0", 32), 0, 0, str_repeat("\xA0", 32), $s0Sk, $s0Pk, $r1Hash, $c1Hash, $cSk);
+  $eB0 = $mkEntry(str_repeat("\x20", 32), $eRoot["slot"], 0, 1, str_repeat("\xB0", 32), $r1Sk, $r1Pk, $sinkHash, null, null);
+  $eIllegalChg = $mkEntry(str_repeat("\x21", 32), $eB0["slot"], 1, 2, str_repeat("\xB1", 32), $c1Sk, $c1Pk, $sinkHash, null, null);
+  $eB1 = $mkEntry(str_repeat("\x30", 32), $eRoot["slot"], 1, 1, str_repeat("\xC0", 32), $c1Sk, $c1Pk, $r1Hash, null, null);
+  $eConflictB1 = $mkEntry(str_repeat("\x30", 32), $eRoot["slot"], 1, 1, str_repeat("\xC1", 32), $c1Sk, $c1Pk, $r1Hash, null, null);
+
+  $rn1 = random_bytes(32);
+  [$b1Code, $b1Resp] = $post("$u/sync.php?lock", json_encode([
+    "anchor_id" => $aHex, "bucket" => $bHex, "recipient_nonce" => bin2hex($rn1),
+    "entries" => [$eRoot["hex"], $eB0["hex"]], "manifest" => $manifest, "genesis_ticket" => $ticket, "known_head_receipt" => null,
+  ]));
+  $head0 = hash("sha256", "HUMOCO_BUCKET_INIT_V1" . $b32 . pack("v", $q), true);
+  $head1 = hash("sha256", "HUMOCO_BUCKET_STEP_V1" . $head0 . pack("P", 1) . $eRoot["slot"] . $eRoot["eh"], true);
+  $head2 = hash("sha256", "HUMOCO_BUCKET_STEP_V1" . $head1 . pack("P", 2) . $eB0["slot"] . $eB0["eh"], true);
+  $r1SigsOk = ($b1Code === 200) && count($b1Resp["receipts"] ?? []) === 2
+    && lock_verify_receipt($b1Resp["receipts"][0], $lpBin, $b32)
+    && lock_verify_receipt($b1Resp["receipts"][1], $lpBin, $b32)
+    && ($b1Resp["receipts"][0]["bucket_head"] ?? "") === bin2hex($head1)
+    && ($b1Resp["receipts"][1]["bucket_head"] ?? "") === bin2hex($head2);
+
+  // output_branch=1 on child with no change_pubkey_hash -> 422
+  [$illCode, ] = $post("$u/sync.php?lock", json_encode([
+    "anchor_id" => $aHex, "bucket" => $bHex, "recipient_nonce" => bin2hex(random_bytes(32)),
+    "entries" => [$eIllegalChg["hex"]], "manifest" => null, "genesis_ticket" => null, "known_head_receipt" => $b1Resp["receipts"][1],
+  ]));
+
+  // Valid output_branch=1 change spend -> write_seq=3 + verified receipt & bucket_head
+  [$b2Code, $b2Resp] = $post("$u/sync.php?lock", json_encode([
+    "anchor_id" => $aHex, "bucket" => $bHex, "recipient_nonce" => bin2hex(random_bytes(32)),
+    "entries" => [$eB1["hex"]], "manifest" => null, "genesis_ticket" => null, "known_head_receipt" => $b1Resp["receipts"][1],
+  ]));
+  $head3 = hash("sha256", "HUMOCO_BUCKET_STEP_V1" . $head2 . pack("P", 3) . $eB1["slot"] . $eB1["eh"], true);
+  $b1Ok = ($b2Code === 200) && count($b2Resp["receipts"] ?? []) === 1
+    && lock_verify_receipt($b2Resp["receipts"][0], $lpBin, $b32)
+    && ($b2Resp["receipts"][0]["write_seq"] ?? 0) === 3
+    && ($b2Resp["receipts"][0]["bucket_head"] ?? "") === bin2hex($head3);
+
+  // Double-spend on branch=1 slot -> verified ConflictSeen receipt & competing_entry
+  [$cfCode, $cfResp] = $post("$u/sync.php?lock", json_encode([
+    "anchor_id" => $aHex, "bucket" => $bHex, "recipient_nonce" => bin2hex(random_bytes(32)),
+    "entries" => [$eConflictB1["hex"]], "manifest" => null, "genesis_ticket" => null, "known_head_receipt" => $b2Resp["receipts"][0],
+  ]));
+  $cfOk = ($cfCode === 200) && ($cfResp["status"] ?? "") === "conflict"
+    && ($cfResp["conflict"]["competing_entry"] ?? "") === $eB1["hex"]
+    && ($cfResp["conflict"]["receipt"]["kind"] ?? "") === "conflict_seen"
+    && lock_verify_receipt($cfResp["conflict"]["receipt"], $lpBin, $b32);
+
+  // Static .lock ETag / Cache-Control: immutable / 304 / POST 405
+  $qStr = lock_format_quarter($q);
+  $fIdHex = hash("sha256", "HUMOCO_SYNC_FILE_V1" . $eB1["slot"] . $lpBin);
+  $staticUrl = "$u/humoco_sync_data/locks/$qStr/$bHex/$fIdHex.lock";
+  $ch = curl_init($staticUrl);
+  curl_setopt_array($ch, [CURLOPT_HEADER => true, CURLOPT_RETURNTRANSFER => true]);
+  $rawStatic = curl_exec($ch);
+  $sCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+  $hLen = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+  curl_close($ch);
+  $hdrs = strtolower(substr($rawStatic, 0, $hLen));
+  $body = substr($rawStatic, $hLen);
+  preg_match("/^etag:\s*(.+)$/mi", substr($rawStatic, 0, $hLen), $em);
+  $etag = isset($em[1]) ? trim($em[1]) : "";
+  $ch304 = curl_init($staticUrl);
+  curl_setopt_array($ch304, [CURLOPT_HTTPHEADER => ["If-None-Match: $etag"], CURLOPT_RETURNTRANSFER => true]);
+  curl_exec($ch304); $code304 = curl_getinfo($ch304, CURLINFO_HTTP_CODE); curl_close($ch304);
+  [$code405, ] = $post($staticUrl, "");
+
+  echo json_encode([
+    "ticket_sig_ok" => $ticketSigOk,
+    "r1_sigs_ok" => $r1SigsOk,
+    "ill_chg_code" => $illCode,
+    "b1_ok" => $b1Ok,
+    "cf_ok" => $cfOk,
+    "static_match" => ($sCode === 200 && $body === $eB1["wire"] && str_contains($hdrs, "immutable") && $etag !== ""),
+    "static_304" => $code304,
+    "static_405" => $code405,
+  ]);
+' "$B15_URL" "$B15_ADMIN_SK" "$B15_ADMIN_PK" "$B15_LP" "$QTR" "${ROOT_DIR}/php/lock_handler.php")"
+
+stop_php_server
+
+assert_contains "$B15_OUT" '"ticket_sig_ok":true' "SYNC-S09-09: PHP ?lock_ticket GenesisTicket.sig verifies cryptographically"
+assert_contains "$B15_OUT" '"r1_sigs_ok":true' "SYNC-S09-09: PHP FirstWrite LockReceipt sigs & bucket_head chain verify"
+assert_contains "$B15_OUT" '"ill_chg_code":422' "SYNC-S09-09: PHP rejects output_branch=1 when parent change_pubkey_hash=None (422)"
+assert_contains "$B15_OUT" '"b1_ok":true' "SYNC-S09-09: PHP valid output_branch=1 change spend advances write_seq=3 & head3"
+assert_contains "$B15_OUT" '"cf_ok":true' "SYNC-S09-09: PHP ConflictSeen receipt sig & competing_entry match on branch=1"
+assert_contains "$B15_OUT" '"static_match":true' "SYNC-S09-09: PHP static .lock returns exact 605B bytes with ETag & immutable"
+assert_contains "$B15_OUT" '"static_304":304' "SYNC-S09-09: PHP static .lock honors If-None-Match (304)"
+assert_contains "$B15_OUT" '"static_405":405' "SYNC-S09-09: PHP static .lock rejects POST with 405"
+
+echo ""
 echo "All PHP lock concurrency, rollback, quota & GC tests passed! (${PASS} assertions)"

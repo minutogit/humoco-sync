@@ -135,6 +135,94 @@ verify_slot_ack_json() {
   fi
 }
 
+verify_lock_crypto_json() {
+  local mode="$1"
+  local label_msg="$2"
+  shift 2
+  if command -v php >/dev/null 2>&1 && php -r 'exit(function_exists("sodium_crypto_sign_verify_detached") ? 0 : 1);' 2>/dev/null; then
+    if ! php -r '
+      $mode = $argv[1];
+      if ($mode === "selftest") {
+        $d = json_decode(file_get_contents($argv[2]), true);
+        if (!is_array($d) || !is_array($d["checks"] ?? null)) exit(1);
+        $c = $d["checks"];
+        $keys = ["ext_sodium","sha3_256","atomic_link_eexist","fsync","ignore_user_abort","storage_writable","inode_budget","fastcgi_finish_request"];
+        $vals = [];
+        foreach ($keys as $k) { if (!is_string($c[$k] ?? null)) exit(1); $vals[] = $c[$k]; }
+        $free = $d["free_inodes"] ?? null; if (!is_int($free)) exit(1);
+        $lp = $d["lock_pub"] ?? ""; $sig = $d["sig"] ?? ""; $rt = $d["runtime"] ?? "";
+        $ca = $d["checked_at"] ?? null; $ap = $d["all_passed"] ?? null;
+        if (!is_string($lp) || !is_string($sig) || !is_string($rt) || !is_int($ca) || !is_bool($ap)) exit(1);
+        if (preg_match("/\\A[0-9a-f]{64}\\z/", $lp) !== 1 || preg_match("/\\A[0-9a-f]{128}\\z/", $sig) !== 1) exit(1);
+        $msg = "HUMOCO-LOCK-SELFTEST-V1\n{$rt}\n{$ca}\n{$lp}\n" . ($ap ? "1" : "0") . "\n" . hash("sha256", implode(",", $vals) . "," . $free);
+        if (!sodium_crypto_sign_verify_detached(hex2bin($sig), $msg, hex2bin($lp))) exit(1);
+      } elseif ($mode === "probe") {
+        $d = json_decode(file_get_contents($argv[2]), true);
+        $expLp = $argv[3]; $expNonce = $argv[4];
+        if (!is_array($d) || ($d["probe_ok"] ?? false) !== true || ($d["lock_pub"] ?? "") !== $expLp || ($d["client_nonce"] ?? "") !== $expNonce) exit(1);
+        $st = $d["server_time"] ?? null; $sig = $d["sig"] ?? "";
+        if (!is_int($st) || !is_string($sig) || preg_match("/\\A[0-9a-f]{128}\\z/", $sig) !== 1) exit(1);
+        $msg = "HUMOCO-LOCK-PROBE-V1\n{$expLp}\n{$expNonce}\n{$st}";
+        if (!sodium_crypto_sign_verify_detached(hex2bin($sig), $msg, hex2bin($expLp))) exit(1);
+      } elseif ($mode === "ticket") {
+        $d = json_decode(file_get_contents($argv[2]), true);
+        $t = $d["ticket"] ?? null;
+        $expLp = $argv[3]; $expAnchor = $argv[4]; $expQ = (int)$argv[5];
+        if (!is_array($t) || ($t["lock_pub"] ?? "") !== $expLp || ($t["anchor_id"] ?? "") !== $expAnchor || ($t["retain_until_quarter"] ?? -1) !== $expQ) exit(1);
+        $ia = $t["issued_at"] ?? null; $sig = $t["sig"] ?? "";
+        if (!is_int($ia) || $ia <= 0 || !is_string($sig) || preg_match("/\\A[0-9a-f]{128}\\z/", $sig) !== 1) exit(1);
+        $dig = hash("sha256", "HUMOCO_GENESIS_TICKET_V1" . hex2bin($expAnchor) . pack("v", $expQ) . pack("P", $ia) . hex2bin($expLp), true);
+        if (!sodium_crypto_sign_verify_detached(hex2bin($sig), $dig, hex2bin($expLp))) exit(1);
+      } elseif ($mode === "batch" || $mode === "batch_retry") {
+        $resp = json_decode(file_get_contents($argv[2]), true);
+        $req = json_decode(file_get_contents($argv[3]), true);
+        $expLp = $argv[4];
+        if (!is_array($resp) || !is_array($req) || ($resp["status"] ?? "") !== "ok" || ($resp["bucket"] ?? "") !== ($req["bucket"] ?? "")) exit(1);
+        $q = (int)$resp["retain_until_quarter"]; $bBin = hex2bin($req["bucket"]);
+        $head = hash("sha256", "HUMOCO_BUCKET_INIT_V1" . $bBin . pack("v", $q), true);
+        $receipts = $resp["receipts"] ?? null; $entries = $req["entries"] ?? null;
+        if (!is_array($receipts) || !is_array($entries) || count($receipts) !== count($entries)) exit(1);
+        foreach ($receipts as $i => $r) {
+          if (!is_array($r) || ($r["kind"] ?? "") !== "first_write" || ($r["lock_pub"] ?? "") !== $expLp || ($r["bucket"] ?? "") !== $req["bucket"] || ($r["recipient_nonce"] ?? "") !== $req["recipient_nonce"]) exit(1);
+          $ws = $r["write_seq"] ?? null; $sig = $r["sig"] ?? "";
+          if (!is_int($ws) || $ws <= 0 || !is_string($sig) || preg_match("/\\A[0-9a-f]{128}\\z/", $sig) !== 1) exit(1);
+          $wBin = hex2bin($entries[$i]); if ($wBin === false || strlen($wBin) !== 605) exit(1);
+          $slotBin = substr($wBin, 5, 32);
+          $ehBin = hash("sha256", "HUMOCO_LOCK_ENTRY_V1" . substr($wBin, 0, 597), true);
+          $head = hash("sha256", "HUMOCO_BUCKET_STEP_V1" . $head . pack("P", $ws) . $slotBin . $ehBin, true);
+          if ($mode === "batch" && ($ws !== ($i + 1) || ($r["bucket_head"] ?? "") !== bin2hex($head))) exit(1);
+          $pre = "HUMOCO_LOCK_RECEIPT_V1\x00" . hex2bin($expLp) . $bBin . hex2bin($r["slot"]) . hex2bin($r["child_lock"]) . hex2bin($r["entry_hash"]) . pack("v", $q) . pack("P", $ws) . hex2bin($r["bucket_head"]) . hex2bin($req["recipient_nonce"]);
+          if (!sodium_crypto_sign_verify_detached(hex2bin($sig), hash("sha256", $pre, true), hex2bin($expLp))) exit(1);
+        }
+      } elseif ($mode === "conflict") {
+        $resp = json_decode(file_get_contents($argv[2]), true);
+        $cReq = json_decode(file_get_contents($argv[3]), true);
+        $oReq = json_decode(file_get_contents($argv[4]), true);
+        $expLp = $argv[5];
+        if (!is_array($resp) || !is_array($cReq) || !is_array($oReq) || ($resp["status"] ?? "") !== "conflict") exit(1);
+        $c = $resp["conflict"] ?? null;
+        if (!is_array($c) || ($c["entry_index"] ?? -1) !== 0) exit(1);
+        $compHex = $c["competing_entry"] ?? "";
+        if (!is_string($compHex) || strlen($compHex) !== 1210 || !in_array($compHex, $oReq["entries"] ?? [], true)) exit(1);
+        $compBin = hex2bin($compHex);
+        $r = $c["receipt"] ?? null;
+        if (!is_array($r) || ($r["kind"] ?? "") !== "conflict_seen" || ($r["lock_pub"] ?? "") !== $expLp || ($r["bucket"] ?? "") !== ($cReq["bucket"] ?? "") || ($r["recipient_nonce"] ?? "") !== ($cReq["recipient_nonce"] ?? "")) exit(1);
+        if (($r["slot"] ?? "") !== bin2hex(substr($compBin, 5, 32)) || ($r["child_lock"] ?? "") !== bin2hex(substr($compBin, 74, 32))) exit(1);
+        $eh = hash("sha256", "HUMOCO_LOCK_ENTRY_V1" . substr($compBin, 0, 597), true);
+        if (($r["entry_hash"] ?? "") !== bin2hex($eh)) exit(1);
+        $q = (int)$r["retain_until_quarter"]; $ws = (int)$r["write_seq"]; $sig = $r["sig"] ?? "";
+        $pre = "HUMOCO_LOCK_RECEIPT_V1\x01" . hex2bin($expLp) . hex2bin($r["bucket"]) . hex2bin($r["slot"]) . hex2bin($r["child_lock"]) . $eh . pack("v", $q) . pack("P", $ws) . hex2bin($r["bucket_head"]) . hex2bin($r["recipient_nonce"]);
+        if (!sodium_crypto_sign_verify_detached(hex2bin($sig), hash("sha256", $pre, true), hex2bin($expLp))) exit(1);
+      } else {
+        exit(1);
+      }
+    ' "$mode" "$@"; then
+      fail "$label_msg"
+    fi
+    ok "$label_msg"
+  fi
+}
+
 run_blackbox_protocol_suite() {
   local label="$1"
   local base_url="$2"
@@ -719,6 +807,7 @@ run_blackbox_protocol_suite() {
 
   local selftest_json lock_pub_bb
   selftest_json="$(curl -sf "${endpoint}?lock_selftest")"
+  printf '%s' "$selftest_json" > "$TMP_ROOT/selftest_get_${label}.json"
   assert_contains "$selftest_json" '"all_passed":true' "GET ?lock_selftest reports all_passed=true"
   lock_pub_bb="$(printf '%s' "$selftest_json" | sed -n 's/.*"lock_pub":"\([0-9a-f]\{64\}\)".*/\1/p')"
   if [[ ${#lock_pub_bb} -ne 64 ]]; then
@@ -726,6 +815,29 @@ run_blackbox_protocol_suite() {
   else
     ok "Extracted 64-hex lock_pub from ?lock_selftest"
   fi
+  verify_lock_crypto_json "selftest" "GET ?lock_selftest SelftestReport Ed25519 sig verifies" "$TMP_ROOT/selftest_get_${label}.json"
+
+  # POST ?lock_selftest live run (403 non-admin, 405 wrong method, 200 admin + verified sig)
+  ts="$(date +%s)"
+  nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-admin --sk "$friend_sk" --action POST_LOCK_SELFTEST --ts "$ts" --nonce "$nonce")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+    -H "X-Drop-Pubkey: $friend_pk" \
+    -H "X-Drop-Timestamp: $ts" \
+    -H "X-Drop-Nonce: $nonce" \
+    -H "X-Drop-Signature: $sig" \
+    "${endpoint}?lock_selftest")" "403" "POST ?lock_selftest rejects non-admin pubkey (403)"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "${endpoint}?lock_selftest")" "405" "DELETE ?lock_selftest returns 405"
+  ts="$(date +%s)"
+  nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-admin --sk "$admin_sk" --action POST_LOCK_SELFTEST --ts "$ts" --nonce "$nonce")"
+  assert_eq "$(curl -s -o "$TMP_ROOT/selftest_post_${label}.json" -w '%{http_code}' -X POST \
+    -H "X-Drop-Pubkey: $admin_pk" \
+    -H "X-Drop-Timestamp: $ts" \
+    -H "X-Drop-Nonce: $nonce" \
+    -H "X-Drop-Signature: $sig" \
+    "${endpoint}?lock_selftest")" "200" "POST ?lock_selftest live admin re-check succeeds (200)"
+  verify_lock_crypto_json "selftest" "POST ?lock_selftest SelftestReport Ed25519 sig verifies" "$TMP_ROOT/selftest_post_${label}.json"
 
   if [[ "$label" == "php" ]]; then
     local kl_code
@@ -737,12 +849,36 @@ run_blackbox_protocol_suite() {
     fi
   fi
 
-  # PUT ?lock_delegate (admin-signed + inner HUMOCO-LOCK-DELEGATE-V1)
-  local issued_bb
+  # PUT ?lock_delegate (403 mismatched admin_pub, 400 uppercase sig, 401 bad sig, 200 valid + ?info delegation check)
+  local issued_bb del_sig_orig del_sig_upper del_sig_bad
   issued_bb="$(date +%s)"
   "$helper_bin" sign-test sign-lock-delegate --sk "$admin_sk" --lock-pub "$lock_pub_bb" --write-url "$endpoint" --read-url "$data_url" --issued "$issued_bb" > "$TMP_ROOT/lock_delegate.json"
-  ts="$(date +%s)"
-  nonce="$(rand_nonce)"
+  del_sig_orig="$(sed -n 's/.*"sig":"\([0-9a-f]\{128\}\)".*/\1/p' "$TMP_ROOT/lock_delegate.json")"
+  del_sig_upper="$(printf '%s' "$del_sig_orig" | tr 'a-f' 'A-F')"
+  del_sig_bad="$(printf '%s' "$del_sig_orig" | sed 's/^0/1/; t; s/^./0/')"
+
+  sed "s/\"admin_pub\":\"${admin_pk}\"/\"admin_pub\":\"${friend_pk}\"/" "$TMP_ROOT/lock_delegate.json" > "$TMP_ROOT/lock_delegate_403.json"
+  ts="$(date +%s)"; nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-admin --sk "$admin_sk" --action PUT_LOCK_DELEGATE --ts "$ts" --nonce "$nonce" --body-file "$TMP_ROOT/lock_delegate_403.json")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+    -H "X-Drop-Pubkey: $admin_pk" -H "X-Drop-Timestamp: $ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig" \
+    --data-binary "@$TMP_ROOT/lock_delegate_403.json" "${endpoint}?lock_delegate")" "403" "PUT ?lock_delegate rejects mismatched admin_pub with 403"
+
+  sed "s/\"sig\":\"${del_sig_orig}\"/\"sig\":\"${del_sig_upper}\"/" "$TMP_ROOT/lock_delegate.json" > "$TMP_ROOT/lock_delegate_400.json"
+  ts="$(date +%s)"; nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-admin --sk "$admin_sk" --action PUT_LOCK_DELEGATE --ts "$ts" --nonce "$nonce" --body-file "$TMP_ROOT/lock_delegate_400.json")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+    -H "X-Drop-Pubkey: $admin_pk" -H "X-Drop-Timestamp: $ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig" \
+    --data-binary "@$TMP_ROOT/lock_delegate_400.json" "${endpoint}?lock_delegate")" "400" "PUT ?lock_delegate rejects uppercase inner sig with 400"
+
+  sed "s/\"sig\":\"${del_sig_orig}\"/\"sig\":\"${del_sig_bad}\"/" "$TMP_ROOT/lock_delegate.json" > "$TMP_ROOT/lock_delegate_401.json"
+  ts="$(date +%s)"; nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-admin --sk "$admin_sk" --action PUT_LOCK_DELEGATE --ts "$ts" --nonce "$nonce" --body-file "$TMP_ROOT/lock_delegate_401.json")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+    -H "X-Drop-Pubkey: $admin_pk" -H "X-Drop-Timestamp: $ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig" \
+    --data-binary "@$TMP_ROOT/lock_delegate_401.json" "${endpoint}?lock_delegate")" "401" "PUT ?lock_delegate rejects invalid inner Ed25519 sig with 401"
+
+  ts="$(date +%s)"; nonce="$(rand_nonce)"
   sig="$("$helper_bin" sign-test sign-admin --sk "$admin_sk" --action PUT_LOCK_DELEGATE --ts "$ts" --nonce "$nonce" --body-file "$TMP_ROOT/lock_delegate.json")"
   assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
     -H "X-Drop-Pubkey: $admin_pk" \
@@ -751,14 +887,24 @@ run_blackbox_protocol_suite() {
     -H "X-Drop-Signature: $sig" \
     --data-binary "@$TMP_ROOT/lock_delegate.json" \
     "${endpoint}?lock_delegate")" "200" "PUT ?lock_delegate persists signed admin delegation"
+  local info_after_del
+  info_after_del="$(curl -sf "${endpoint}?info")"
+  assert_contains "$info_after_del" "\"write_url\":\"${endpoint}\"" "GET ?info includes persisted delegation.write_url"
+  assert_contains "$info_after_del" "\"read_url\":\"${data_url}\"" "GET ?info includes persisted delegation.read_url"
 
-  # Zero-write WAF probe
+  # Zero-write WAF probe (valid sig, invalid zero-nonce 400, GET 405)
   local probe_nonce probe_resp
   probe_nonce="$(rand_nonce)$(rand_nonce)"
   probe_resp="$(curl -sf -X POST -H 'Content-Type: application/json' \
     -d "{\"probe\":true,\"client_nonce\":\"${probe_nonce}\"}" \
     "${endpoint}?lock")"
+  printf '%s' "$probe_resp" > "$TMP_ROOT/probe_resp_${label}.json"
   assert_contains "$probe_resp" '"probe_ok":true' "POST ?lock WAF probe returns signed probe_ok"
+  verify_lock_crypto_json "probe" "POST ?lock WAF probe Ed25519 sig verifies" "$TMP_ROOT/probe_resp_${label}.json" "$lock_pub_bb" "$probe_nonce"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+    -d '{"probe":true,"client_nonce":"0000000000000000000000000000000000000000000000000000000000000000"}' \
+    "${endpoint}?lock")" "400" "POST ?lock probe rejects all-zero client_nonce (400)"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "${endpoint}?lock")" "405" "GET ?lock returns 405"
 
   # Grant friend_pk 'lock' channel membership & request GenesisTicket
   printf '{"pubkeys":["%s"]}' "$friend_pk" > "$TMP_ROOT/lock_members.json"
@@ -784,9 +930,32 @@ run_blackbox_protocol_suite() {
     ok "HEAD with X-Channel: lock omits X-Slot-Occupied"
   fi
 
-  local bb_quarter=8125 anchor_bb
+  local bb_quarter=8125 anchor_bb unauth_tkt_sk unauth_tkt_pk sig_bad_tkt
   anchor_bb="$("$helper_bin" sign-test make-lock-sample --lock-pub "$lock_pub_bb" --admin-pub "$admin_pk" --quarter "$bb_quarter" --variant anchor_id)"
   printf '{"anchor_id":"%s","retain_until_quarter":%s,"pow_timestamp":null,"pow_nonce":null}' "$anchor_bb" "$bb_quarter" > "$TMP_ROOT/ticket_req.json"
+
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "${endpoint}?lock_ticket")" "405" "GET ?lock_ticket returns 405"
+  read -r unauth_tkt_sk unauth_tkt_pk <<< "$("$helper_bin" sign-test keygen)"
+  ts="$(date +%s)"; nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-member --sk "$unauth_tkt_sk" --method POST --channel lock_ticket --ts "$ts" --nonce "$nonce" --body-file "$TMP_ROOT/ticket_req.json")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+    -H "X-Drop-Pubkey: $unauth_tkt_pk" -H "X-Drop-Timestamp: $ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig" \
+    -H 'Content-Type: application/json' --data-binary "@$TMP_ROOT/ticket_req.json" "${endpoint}?lock_ticket")" "403" "POST ?lock_ticket rejects unauthorized member (403)"
+
+  ts="$(date +%s)"; nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-member --sk "$friend_sk" --method POST --channel lock_ticket --ts "$ts" --nonce "$nonce" --body-file "$TMP_ROOT/ticket_req.json")"
+  sig_bad_tkt="$(printf '%s' "$sig" | sed 's/^0/1/; t; s/^./0/')"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+    -H "X-Drop-Pubkey: $friend_pk" -H "X-Drop-Timestamp: $ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig_bad_tkt" \
+    -H 'Content-Type: application/json' --data-binary "@$TMP_ROOT/ticket_req.json" "${endpoint}?lock_ticket")" "401" "POST ?lock_ticket rejects tampered signature (401)"
+
+  printf '{"anchor_id":"%s","retain_until_quarter":9000,"pow_timestamp":null,"pow_nonce":null}' "$anchor_bb" > "$TMP_ROOT/ticket_req_422.json"
+  ts="$(date +%s)"; nonce="$(rand_nonce)"
+  sig="$("$helper_bin" sign-test sign-member --sk "$friend_sk" --method POST --channel lock_ticket --ts "$ts" --nonce "$nonce" --body-file "$TMP_ROOT/ticket_req_422.json")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+    -H "X-Drop-Pubkey: $friend_pk" -H "X-Drop-Timestamp: $ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $sig" \
+    -H 'Content-Type: application/json' --data-binary "@$TMP_ROOT/ticket_req_422.json" "${endpoint}?lock_ticket")" "422" "POST ?lock_ticket rejects excess quarter (422)"
+
   ts="$(date +%s)"
   nonce="$(rand_nonce)"
   sig="$("$helper_bin" sign-test sign-member --sk "$friend_sk" --method POST --channel lock_ticket --ts "$ts" --nonce "$nonce" --body-file "$TMP_ROOT/ticket_req.json")"
@@ -798,26 +967,73 @@ run_blackbox_protocol_suite() {
     -H 'Content-Type: application/json' \
     --data-binary "@$TMP_ROOT/ticket_req.json" \
     "${endpoint}?lock_ticket")" "200" "POST ?lock_ticket issues signed GenesisTicket"
+  verify_lock_crypto_json "ticket" "POST ?lock_ticket GenesisTicket Ed25519 sig verifies" "$TMP_ROOT/ticket_resp.json" "$lock_pub_bb" "$anchor_bb" "$bb_quarter"
 
-  # Submit unauthenticated PoS batch (depth=0 + depth=1), verify idempotency, conflict, and 605B static read
+  # Submit unauthenticated PoS batch (depth=0 + depth=1), verify receipts, bucket_head chain, idempotency, conflict, and error paths
   "$helper_bin" sign-test make-lock-sample --lock-pub "$lock_pub_bb" --admin-pub "$admin_pk" --quarter "$bb_quarter" --ticket-json "$TMP_ROOT/ticket_resp.json" --variant init > "$TMP_ROOT/lock_batch.json"
+  local bb_bucket
+  bb_bucket="$(sed -n 's/.*"bucket":"\([0-9a-f]\{64\}\)".*/\1/p' "$TMP_ROOT/lock_batch.json")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+    -d "{\"anchor_id\":\"${anchor_bb}\",\"bucket\":\"${bb_bucket}\",\"recipient_nonce\":\"$(rand_nonce)$(rand_nonce)\",\"entries\":{\"a\":\"00\"},\"manifest\":null,\"genesis_ticket\":null,\"known_head_receipt\":null}" \
+    "${endpoint}?lock")" "400" "POST ?lock rejects associative JSON entries object (400)"
+
   local lock_batch_resp
   lock_batch_resp="$(curl -sf -X POST -H 'Content-Type: application/json' --data-binary "@$TMP_ROOT/lock_batch.json" "${endpoint}?lock")"
+  printf '%s' "$lock_batch_resp" > "$TMP_ROOT/lock_batch_resp_${label}.json"
   assert_contains "$lock_batch_resp" '"status":"ok"' "POST ?lock commits batch with FirstWrite receipts"
+  verify_lock_crypto_json "batch" "POST ?lock FirstWrite receipts & bucket_head chain verify" "$TMP_ROOT/lock_batch_resp_${label}.json" "$TMP_ROOT/lock_batch.json" "$lock_pub_bb"
 
   local lock_retry_resp
   lock_retry_resp="$(curl -sf -X POST -H 'Content-Type: application/json' --data-binary "@$TMP_ROOT/lock_batch.json" "${endpoint}?lock")"
+  printf '%s' "$lock_retry_resp" > "$TMP_ROOT/lock_retry_resp_${label}.json"
   assert_contains "$lock_retry_resp" '"write_seq":2' "POST ?lock retry is idempotent at write_seq=2"
+  verify_lock_crypto_json "batch_retry" "POST ?lock idempotent retry FirstWrite receipt sigs verify" "$TMP_ROOT/lock_retry_resp_${label}.json" "$TMP_ROOT/lock_batch.json" "$lock_pub_bb"
 
   "$helper_bin" sign-test make-lock-sample --lock-pub "$lock_pub_bb" --admin-pub "$admin_pk" --quarter "$bb_quarter" --ticket-json "$TMP_ROOT/ticket_resp.json" --variant conflict > "$TMP_ROOT/lock_conflict.json"
   local lock_conflict_resp
   lock_conflict_resp="$(curl -sf -X POST -H 'Content-Type: application/json' --data-binary "@$TMP_ROOT/lock_conflict.json" "${endpoint}?lock")"
+  printf '%s' "$lock_conflict_resp" > "$TMP_ROOT/lock_conflict_resp_${label}.json"
   assert_contains "$lock_conflict_resp" '"status":"conflict"' "POST ?lock double-spend returns ConflictSeen"
+  verify_lock_crypto_json "conflict" "POST ?lock ConflictSeen sig & competing_entry match verified" "$TMP_ROOT/lock_conflict_resp_${label}.json" "$TMP_ROOT/lock_conflict.json" "$TMP_ROOT/lock_batch.json" "$lock_pub_bb"
 
-  local lock_read_rel static_len
+  # Tampered known_head_receipt -> 401 (no freeze), corrupted causal_sig -> 422
+  local bad_rcpt bad_rcpt_json
+  bad_rcpt="$(printf '%s' "$lock_conflict_resp" | sed -n 's/.*"receipt":\({[^}]*}\).*/\1/p' | sed 's/"sig":"0/"sig":"1/; t; s/"sig":"[0-9a-f]/"sig":"0/')"
+  sed "s/\"known_head_receipt\":null/\"known_head_receipt\":${bad_rcpt}/" "$TMP_ROOT/lock_conflict.json" > "$TMP_ROOT/lock_bad_rcpt_${label}.json"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' --data-binary "@$TMP_ROOT/lock_bad_rcpt_${label}.json" "${endpoint}?lock")" "401" "POST ?lock rejects forged known_head_receipt (401)"
+
+  awk '{
+    idx = index($0, "\"entries\":[\"");
+    if (idx > 0) {
+      pos = idx + 12 + 420;
+      ch = substr($0, pos, 1);
+      rep = (ch == "a") ? "b" : "a";
+      print substr($0, 1, pos - 1) rep substr($0, pos + 1);
+    } else { print $0; }
+  }' "$TMP_ROOT/lock_conflict.json" > "$TMP_ROOT/lock_bad_causal_${label}.json"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' --data-binary "@$TMP_ROOT/lock_bad_causal_${label}.json" "${endpoint}?lock")" "422" "POST ?lock rejects corrupted causal_sig with 422"
+
+  # Static .lock read: exact 605B bytes, ETag, Cache-Control: immutable, If-None-Match 304, POST 405
+  local lock_read_rel static_len static_etag static_hdrs
   lock_read_rel="$("$helper_bin" sign-test make-lock-sample --lock-pub "$lock_pub_bb" --admin-pub "$admin_pk" --quarter "$bb_quarter" --variant read_path)"
-  static_len="$(curl -sf "${data_url}/${lock_read_rel}" | wc -c | tr -d ' ')"
+  static_len="$(curl -sf -D "$TMP_ROOT/lock_static_hdrs_${label}.txt" -o "$TMP_ROOT/lock_static_${label}.bin" "${data_url}/${lock_read_rel}" && wc -c < "$TMP_ROOT/lock_static_${label}.bin" | tr -d ' ')"
   assert_eq "$static_len" "605" "Static lock read returns exact 605-byte wire entry"
+  static_hdrs="$(tr -d '\r' < "$TMP_ROOT/lock_static_hdrs_${label}.txt" | tr '[:upper:]' '[:lower:]')"
+  assert_contains "$static_hdrs" "etag:" "Static lock read includes ETag header"
+  assert_contains "$static_hdrs" "immutable" "Static lock read includes Cache-Control: immutable"
+  static_etag="$(sed -n 's/^etag: *\([^ ].*\)/\1/p' <<<"$static_hdrs" | head -n 1)"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -H "If-None-Match: $static_etag" "${data_url}/${lock_read_rel}")" "304" "Static lock read honors If-None-Match -> 304"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X POST "${data_url}/${lock_read_rel}")" "405" "POST to static .lock endpoint returns 405"
+
+  # DELETE ?account Lock-Channel immunity
+  local del_bb_sk del_bb_pk del_bb_sig
+  read -r del_bb_sk del_bb_pk <<< "$("$helper_bin" sign-test keygen)"
+  ts="$(date +%s)"; nonce="$(rand_nonce)"
+  del_bb_sig="$("$helper_bin" sign-test sign-member --sk "$del_bb_sk" --method DELETE_ACCOUNT --ts "$ts" --nonce "$nonce")"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
+    -H "X-Drop-Pubkey: $del_bb_pk" -H "X-Drop-Timestamp: $ts" -H "X-Drop-Nonce: $nonce" -H "X-Drop-Signature: $del_bb_sig" \
+    "${endpoint}?account")" "200" "DELETE ?account succeeds without touching Lock Channel"
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' "${data_url}/${lock_read_rel}")" "200" "Static 605B .lock file survives DELETE ?account"
 
   echo "=== Group 11 ($label): Rotation Pre-Freeze, Veto & Timelock Parity ==="
   local s2_dum_sk s2_dum_pk anchor_g11

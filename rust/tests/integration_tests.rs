@@ -11005,3 +11005,639 @@ async fn test_s04_static_lock_non_ascii_quarter_no_panic() {
         .expect("HEAD with non-ASCII 7-byte quarter must return HTTP 404 without panicking");
     assert_eq!(head_res.status().as_u16(), 404);
 }
+
+fn verify_selftest_report_sig(report: &serde_json::Value) {
+    let runtime = report["runtime"].as_str().unwrap();
+    let checked_at = report["checked_at"].as_u64().unwrap();
+    let lock_pub = report["lock_pub"].as_str().unwrap();
+    let all_passed = report["all_passed"].as_bool().unwrap();
+    let free_inodes = report["free_inodes"].as_u64().unwrap();
+    let c = &report["checks"];
+    let checks_line = format!(
+        "{},{},{},{},{},{},{},{},{}",
+        c["ext_sodium"].as_str().unwrap(),
+        c["sha3_256"].as_str().unwrap(),
+        c["atomic_link_eexist"].as_str().unwrap(),
+        c["fsync"].as_str().unwrap(),
+        c["ignore_user_abort"].as_str().unwrap(),
+        c["storage_writable"].as_str().unwrap(),
+        c["inode_budget"].as_str().unwrap(),
+        c["fastcgi_finish_request"].as_str().unwrap(),
+        free_inodes
+    );
+    let checks_digest_hex = sha256_hex(checks_line.as_bytes());
+    let msg = humoco_sync_server::crypto::format_lock_selftest_signature_message(
+        runtime,
+        checked_at,
+        lock_pub,
+        all_passed,
+        &checks_digest_hex,
+    );
+    assert!(
+        humoco_sync_server::crypto::verify_ed25519_hex(
+            lock_pub,
+            report["sig"].as_str().unwrap(),
+            msg.as_bytes(),
+        ),
+        "SelftestReport Ed25519 signature must verify cleanly"
+    );
+}
+
+#[tokio::test]
+async fn test_s09_f2_lock_channel_cryptographic_and_adversarial_parity() {
+    let (admin_sk, admin_pk) = gen_keypair();
+    let (outsider_sk, outsider_pk) = gen_keypair();
+    let (other_sk, other_pk) = gen_keypair();
+
+    let mut cfg = base_hybrid_config(&admin_pk);
+    cfg.lock.max_inodes = 5;
+    cfg.lock.allow_pow_tickets = false;
+    cfg.lock.pow_base_bits = 8;
+    let srv = TestServer::start(cfg).await;
+
+    // 1. SelftestReport signature parity (GET + admin POST + non-admin 403 + wrong method 405)
+    let st_get: serde_json::Value = srv
+        .client
+        .get(format!("{}/sync.php?lock_selftest", srv.base_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(st_get["all_passed"], true);
+    verify_selftest_report_sig(&st_get);
+    let lock_pub_hex = st_get["lock_pub"].as_str().unwrap().to_string();
+    let lock_pub_bytes: [u8; 32] = hex::decode(&lock_pub_hex).unwrap().try_into().unwrap();
+
+    let ts_st = unix_now() as i64;
+    let nonce_st = random_hex(16);
+    let st_msg = humoco_sync_server::crypto::format_admin_post_lock_selftest_message(
+        ts_st,
+        &nonce_st,
+        humoco_sync_server::crypto::EMPTY_SHA256_HEX,
+    );
+    let st_nonadmin = srv
+        .client
+        .post(format!("{}/sync.php?lock_selftest", srv.base_url))
+        .header("X-Drop-Pubkey", &outsider_pk)
+        .header("X-Drop-Timestamp", ts_st.to_string())
+        .header("X-Drop-Nonce", &nonce_st)
+        .header(
+            "X-Drop-Signature",
+            hex::encode(outsider_sk.sign(st_msg.as_bytes()).to_bytes()),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(st_nonadmin.status().as_u16(), 403);
+
+    let st_del = srv
+        .client
+        .delete(format!("{}/sync.php?lock_selftest", srv.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(st_del.status().as_u16(), 405);
+
+    let nonce_st2 = random_hex(16);
+    let st_msg2 = humoco_sync_server::crypto::format_admin_post_lock_selftest_message(
+        ts_st,
+        &nonce_st2,
+        humoco_sync_server::crypto::EMPTY_SHA256_HEX,
+    );
+    let st_post_resp = srv
+        .client
+        .post(format!("{}/sync.php?lock_selftest", srv.base_url))
+        .header("X-Drop-Pubkey", &admin_pk)
+        .header("X-Drop-Timestamp", ts_st.to_string())
+        .header("X-Drop-Nonce", &nonce_st2)
+        .header(
+            "X-Drop-Signature",
+            hex::encode(admin_sk.sign(st_msg2.as_bytes()).to_bytes()),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(st_post_resp.status().as_u16(), 200);
+    let st_post: serde_json::Value = st_post_resp.json().await.unwrap();
+    verify_selftest_report_sig(&st_post);
+
+    // 2. PUT ?lock_delegate error codes (403 mismatched admin_pub, 400 bad url/uppercase sig, 401 wrong sig) & GET ?info persistence
+    let issued_at = unix_now();
+    let del_write = format!("{}/sync.php", srv.base_url);
+    let del_read = format!("{}/humoco_sync_data", srv.base_url);
+    let send_delegate = |body_bytes: Vec<u8>| {
+        let srv = &srv;
+        let admin_sk = &admin_sk;
+        let admin_pk = &admin_pk;
+        async move {
+            let ts = unix_now() as i64;
+            let nonce = random_hex(16);
+            let msg = humoco_sync_server::crypto::format_admin_put_lock_delegate_message(
+                ts,
+                &nonce,
+                &sha256_hex(&body_bytes),
+            );
+            srv.client
+                .put(format!("{}/sync.php?lock_delegate", srv.base_url))
+                .header("X-Drop-Pubkey", admin_pk)
+                .header("X-Drop-Timestamp", ts.to_string())
+                .header("X-Drop-Nonce", &nonce)
+                .header(
+                    "X-Drop-Signature",
+                    hex::encode(admin_sk.sign(msg.as_bytes()).to_bytes()),
+                )
+                .body(body_bytes)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }
+    };
+
+    let bad_admin_msg = humoco_sync_server::crypto::format_lock_delegate_signature_message(
+        &other_pk,
+        &lock_pub_hex,
+        &del_write,
+        &del_read,
+        issued_at,
+    );
+    assert_eq!(
+        send_delegate(
+            serde_json::to_vec(&serde_json::json!({
+                "admin_pub": other_pk,
+                "lock_pub": lock_pub_hex,
+                "write_url": del_write,
+                "read_url": del_read,
+                "issued_at": issued_at,
+                "sig": hex::encode(other_sk.sign(bad_admin_msg.as_bytes()).to_bytes()),
+            }))
+            .unwrap()
+        )
+        .await,
+        403
+    );
+
+    let ok_del_msg = humoco_sync_server::crypto::format_lock_delegate_signature_message(
+        &admin_pk,
+        &lock_pub_hex,
+        &del_write,
+        &del_read,
+        issued_at,
+    );
+    let valid_del_sig = hex::encode(admin_sk.sign(ok_del_msg.as_bytes()).to_bytes());
+    assert_eq!(
+        send_delegate(
+            serde_json::to_vec(&serde_json::json!({
+                "admin_pub": admin_pk,
+                "lock_pub": lock_pub_hex,
+                "write_url": del_write,
+                "read_url": del_read,
+                "issued_at": issued_at,
+                "sig": valid_del_sig.to_ascii_uppercase(),
+            }))
+            .unwrap()
+        )
+        .await,
+        400
+    );
+    assert_eq!(
+        send_delegate(
+            serde_json::to_vec(&serde_json::json!({
+                "admin_pub": admin_pk,
+                "lock_pub": lock_pub_hex,
+                "write_url": del_write,
+                "read_url": "ftp://invalid.example/data",
+                "issued_at": issued_at,
+                "sig": valid_del_sig,
+            }))
+            .unwrap()
+        )
+        .await,
+        400
+    );
+    assert_eq!(
+        send_delegate(
+            serde_json::to_vec(&serde_json::json!({
+                "admin_pub": admin_pk,
+                "lock_pub": lock_pub_hex,
+                "write_url": del_write,
+                "read_url": del_read,
+                "issued_at": issued_at,
+                "sig": "ab".repeat(64),
+            }))
+            .unwrap()
+        )
+        .await,
+        401
+    );
+    assert_eq!(
+        send_delegate(
+            serde_json::to_vec(&serde_json::json!({
+                "admin_pub": admin_pk,
+                "lock_pub": lock_pub_hex,
+                "write_url": del_write,
+                "read_url": del_read,
+                "issued_at": issued_at,
+                "sig": valid_del_sig,
+            }))
+            .unwrap()
+        )
+        .await,
+        200
+    );
+
+    let info_del: serde_json::Value = srv
+        .client
+        .get(format!("{}/sync.php?info", srv.base_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(info_del["lock"]["delegation"]["write_url"], del_write);
+    assert_eq!(info_del["lock"]["delegation"]["read_url"], del_read);
+    assert_eq!(info_del["lock"]["delegation"]["sig"], valid_del_sig);
+    assert_eq!(info_del["lock"]["inode_warning"], false);
+
+    // 3. Probe malformed nonce (400), GET ?lock (405), GET ?lock_ticket (405), outsider non-PoW ?lock_ticket (403)
+    assert_eq!(
+        srv.client
+            .post(format!("{}/sync.php?lock", srv.base_url))
+            .json(&serde_json::json!({ "probe": true, "client_nonce": "00".repeat(32) }))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        400
+    );
+    assert_eq!(
+        srv.client
+            .get(format!("{}/sync.php?lock", srv.base_url))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        405
+    );
+    assert_eq!(
+        srv.client
+            .get(format!("{}/sync.php?lock_ticket", srv.base_url))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        405
+    );
+
+    let quarter = humoco_proto::encode_quarter(2031, 2).unwrap();
+    let (creator_mig_sk, _creator_mig_pk_hex) = gen_keypair();
+    let creator_mig_pub = creator_mig_sk.verifying_key().to_bytes();
+    let manifest = build_single_server_manifest(
+        hex::decode(&admin_pk).unwrap().try_into().unwrap(),
+        lock_pub_bytes,
+        creator_mig_pub,
+        quarter,
+    );
+    let anchor_id = manifest.rev1_anchor_id().unwrap();
+    let bucket = humoco_proto::derive_bucket(&anchor_id, &lock_pub_bytes);
+
+    let (outsider_code, _) = fetch_ticket_signed(&srv, &outsider_sk, anchor_id, quarter).await;
+    assert_eq!(outsider_code, 403);
+
+    // 4. Valid GenesisTicket + verify GenesisTicket::verify()
+    let (tkt_code, tkt_val) = fetch_ticket_signed(&srv, &admin_sk, anchor_id, quarter).await;
+    assert_eq!(tkt_code, 200);
+    let ticket: humoco_proto::GenesisTicket =
+        serde_json::from_value(tkt_val["ticket"].clone()).unwrap();
+    assert!(
+        ticket.verify(),
+        "GenesisTicket returned over HTTP must pass Ed25519 + retention verification"
+    );
+    assert_eq!(ticket.lock_pub, lock_pub_bytes);
+
+    // 5. Prepare keys for root (depth=0) -> split outputs (branch=0 receiver, branch=1 change) & 422 adversarial checks
+    let (s0_sk, _) = gen_keypair();
+    let (recv1_sk, _) = gen_keypair();
+    let (chg1_sk, _) = gen_keypair();
+    let (wrong_mig_sk, _) = gen_keypair();
+
+    let recv1_hash = humoco_proto::hash_pubkey_sha3(recv1_sk.verifying_key().as_bytes());
+    let chg1_hash = humoco_proto::hash_pubkey_sha3(chg1_sk.verifying_key().as_bytes());
+    let sink_hash = [0x99u8; 32];
+
+    let root_entry = sign_lock_entry_helper(
+        anchor_id,
+        [0x10; 32],
+        [0u8; 32],
+        0,
+        0,
+        [0xA0; 32],
+        &s0_sk,
+        recv1_hash,
+        Some(chg1_hash),
+        Some(&creator_mig_sk),
+        8,
+    );
+
+    // 5a. Non-list entries JSON object -> 400
+    let assoc_resp = srv
+        .client
+        .post(format!("{}/sync.php?lock", srv.base_url))
+        .json(&serde_json::json!({
+            "anchor_id": hex::encode(anchor_id),
+            "bucket": hex::encode(bucket),
+            "recipient_nonce": "11".repeat(32),
+            "entries": { "a": root_entry.to_wire_hex().unwrap() },
+            "manifest": manifest,
+            "genesis_ticket": ticket,
+            "known_head_receipt": serde_json::Value::Null,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(assoc_resp.status().as_u16(), 400);
+
+    // 5b. 422 PoW fail, 422 causal_sig fail, 422 root_mig_sig fail, 422 missing parent at depth=1
+    let mut bad_pow = root_entry.clone();
+    for candidate in 0u64..10_000 {
+        let h =
+            humoco_proto::compute_lock_pow_hash(&bad_pow.slot, &bad_pow.child_lock, 0, candidate);
+        if !humoco_proto::check_pow_difficulty(&h, 8) {
+            bad_pow.pow_nonce = candidate;
+            break;
+        }
+    }
+    let mut bad_causal = root_entry.clone();
+    bad_causal.causal_sig[0] ^= 0xff;
+    let bad_root_sig = sign_lock_entry_helper(
+        anchor_id,
+        [0x11; 32],
+        [0u8; 32],
+        0,
+        0,
+        [0xA1; 32],
+        &s0_sk,
+        recv1_hash,
+        None,
+        Some(&wrong_mig_sk),
+        8,
+    );
+    let missing_parent = sign_lock_entry_helper(
+        anchor_id, [0x12; 32], [0x77; 32], 0, 1, [0xA2; 32], &recv1_sk, sink_hash, None, None, 8,
+    );
+
+    for bad_e in [&bad_pow, &bad_causal, &bad_root_sig, &missing_parent] {
+        let r = srv
+            .client
+            .post(format!("{}/sync.php?lock", srv.base_url))
+            .json(&serde_json::json!({
+                "anchor_id": hex::encode(anchor_id),
+                "bucket": hex::encode(bucket),
+                "recipient_nonce": "12".repeat(32),
+                "entries": [bad_e.to_wire_hex().unwrap()],
+                "manifest": manifest,
+                "genesis_ticket": ticket,
+                "known_head_receipt": serde_json::Value::Null,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 422);
+    }
+
+    // 6. Commit root (write_seq=1) + child on output_branch=0 (write_seq=2) + child on output_branch=1 (write_seq=3)
+    // First batch: root + branch0 (2 inodes = 40%)
+    let child_b0 = sign_lock_entry_helper(
+        anchor_id,
+        [0x20; 32],
+        root_entry.slot,
+        0,
+        1,
+        [0xB0; 32],
+        &recv1_sk,
+        sink_hash,
+        None, // No change output!
+        None,
+        8,
+    );
+    let batch1_resp = srv
+        .client
+        .post(format!("{}/sync.php?lock", srv.base_url))
+        .json(&serde_json::json!({
+            "anchor_id": hex::encode(anchor_id),
+            "bucket": hex::encode(bucket),
+            "recipient_nonce": "21".repeat(32),
+            "entries": [root_entry.to_wire_hex().unwrap(), child_b0.to_wire_hex().unwrap()],
+            "manifest": manifest,
+            "genesis_ticket": ticket,
+            "known_head_receipt": serde_json::Value::Null,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(batch1_resp.status().as_u16(), 200);
+    let b1_json: serde_json::Value = batch1_resp.json().await.unwrap();
+    let r1: Vec<humoco_proto::LockReceipt> =
+        serde_json::from_value(b1_json["receipts"].clone()).unwrap();
+    assert_eq!(r1.len(), 2);
+    assert!(r1[0].verify_signature() && r1[1].verify_signature());
+    let head0 = humoco_proto::compute_bucket_init_head(&bucket, quarter);
+    let head1 = humoco_proto::compute_bucket_step_head(
+        &head0,
+        1,
+        &root_entry.slot,
+        &root_entry.entry_hash().unwrap(),
+    );
+    let head2 = humoco_proto::compute_bucket_step_head(
+        &head1,
+        2,
+        &child_b0.slot,
+        &child_b0.entry_hash().unwrap(),
+    );
+    assert_eq!(r1[0].write_seq, 1);
+    assert_eq!(r1[0].bucket_head, head1);
+    assert_eq!(r1[1].write_seq, 2);
+    assert_eq!(r1[1].bucket_head, head2);
+
+    // Attempt output_branch=1 on child_b0 which has change_pubkey_hash=None -> 422
+    let illegal_change_child = sign_lock_entry_helper(
+        anchor_id,
+        [0x21; 32],
+        child_b0.slot,
+        1,
+        2,
+        [0xB1; 32],
+        &chg1_sk,
+        sink_hash,
+        None,
+        None,
+        8,
+    );
+    assert_eq!(
+        srv.client
+            .post(format!("{}/sync.php?lock", srv.base_url))
+            .json(&serde_json::json!({
+                "anchor_id": hex::encode(anchor_id),
+                "bucket": hex::encode(bucket),
+                "recipient_nonce": "22".repeat(32),
+                "entries": [illegal_change_child.to_wire_hex().unwrap()],
+                "manifest": serde_json::Value::Null,
+                "genesis_ticket": serde_json::Value::Null,
+                "known_head_receipt": r1[1],
+            }))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        422
+    );
+
+    // Spend valid output_branch=1 (change output) of root_entry -> 3/5 inodes = 60% -> inode_warning still false
+    let child_b1 = sign_lock_entry_helper(
+        anchor_id,
+        [0x30; 32],
+        root_entry.slot,
+        1,
+        1,
+        [0xC0; 32],
+        &chg1_sk,
+        recv1_hash,
+        None,
+        None,
+        8,
+    );
+    let b2_resp = srv
+        .client
+        .post(format!("{}/sync.php?lock", srv.base_url))
+        .json(&serde_json::json!({
+            "anchor_id": hex::encode(anchor_id),
+            "bucket": hex::encode(bucket),
+            "recipient_nonce": "23".repeat(32),
+            "entries": [child_b1.to_wire_hex().unwrap()],
+            "manifest": serde_json::Value::Null,
+            "genesis_ticket": serde_json::Value::Null,
+            "known_head_receipt": r1[1],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(b2_resp.status().as_u16(), 200);
+    let b2_json: serde_json::Value = b2_resp.json().await.unwrap();
+    let r2: Vec<humoco_proto::LockReceipt> =
+        serde_json::from_value(b2_json["receipts"].clone()).unwrap();
+    assert_eq!(r2.len(), 1);
+    assert!(r2[0].verify_signature());
+    let head3 = humoco_proto::compute_bucket_step_head(
+        &head2,
+        3,
+        &child_b1.slot,
+        &child_b1.entry_hash().unwrap(),
+    );
+    assert_eq!(r2[0].write_seq, 3);
+    assert_eq!(r2[0].bucket_head, head3);
+
+    let info_60: serde_json::Value = srv
+        .client
+        .get(format!("{}/sync.php?info", srv.base_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(info_60["lock"]["used_inodes"], 3);
+    assert_eq!(info_60["lock"]["inode_warning"], false);
+
+    // 7. 4th slot reaches 4/5 = 80% -> inode_warning becomes true! Also verify static .lock 605B + ETag + 304 + 405
+    let grand_child = sign_lock_entry_helper(
+        anchor_id,
+        [0x40; 32],
+        child_b1.slot,
+        0,
+        2,
+        [0xD0; 32],
+        &recv1_sk,
+        sink_hash,
+        None,
+        None,
+        8,
+    );
+    let b3_resp = srv
+        .client
+        .post(format!("{}/sync.php?lock", srv.base_url))
+        .json(&serde_json::json!({
+            "anchor_id": hex::encode(anchor_id),
+            "bucket": hex::encode(bucket),
+            "recipient_nonce": "24".repeat(32),
+            "entries": [grand_child.to_wire_hex().unwrap()],
+            "manifest": serde_json::Value::Null,
+            "genesis_ticket": serde_json::Value::Null,
+            "known_head_receipt": r2[0],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(b3_resp.status().as_u16(), 200);
+
+    let info_80: serde_json::Value = srv
+        .client
+        .get(format!("{}/sync.php?info", srv.base_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(info_80["lock"]["used_inodes"], 4);
+    assert_eq!(info_80["lock"]["inode_warning"], true);
+
+    let q_str = humoco_proto::format_quarter(quarter).unwrap();
+    let file_id = humoco_proto::derive_slot_file_id(&child_b1.slot, &lock_pub_bytes);
+    let lock_url = format!(
+        "{}/humoco_sync_data/locks/{}/{}/{}.lock",
+        srv.base_url,
+        q_str,
+        hex::encode(bucket),
+        hex::encode(file_id)
+    );
+    let get_static = srv.client.get(&lock_url).send().await.unwrap();
+    assert_eq!(get_static.status().as_u16(), 200);
+    let etag = get_static
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let cc = get_static
+        .headers()
+        .get("cache-control")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(cc.contains("immutable"), "static .lock Cache-Control: {cc}");
+    let wire_bytes = get_static.bytes().await.unwrap();
+    let expected_wire = hex::decode(child_b1.to_wire_hex().unwrap()).unwrap();
+    assert_eq!(wire_bytes.as_ref(), expected_wire.as_slice());
+
+    let static_304 = srv
+        .client
+        .get(&lock_url)
+        .header("If-None-Match", &etag)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(static_304.status().as_u16(), 304);
+
+    let static_405 = srv.client.post(&lock_url).send().await.unwrap();
+    assert_eq!(static_405.status().as_u16(), 405);
+}
