@@ -8297,6 +8297,22 @@ fn test_s08_deployment_hardening_invariants() {
         !dockerfile.contains("2>/dev/null || cargo build --release"),
         "Dockerfile must not fall back past --locked build failures"
     );
+    let builder_rust_ver = dockerfile
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("FROM rust:"))
+        .and_then(|rest| rest.split(['-', ' ']).next())
+        .and_then(|ver| {
+            let mut parts = ver.split('.');
+            let major: u32 = parts.next()?.parse().ok()?;
+            let minor: u32 = parts.next()?.parse().ok()?;
+            Some((major, minor))
+        })
+        .expect("Dockerfile must specify a FROM rust:<major>.<minor> builder tag");
+    assert!(
+        builder_rust_ver >= (1, 88),
+        "Dockerfile builder Rust toolchain {:?} is older than required MSRV (1, 88) for Cargo.lock (icu_* 2.4.0) and usize::is_multiple_of",
+        builder_rust_ver
+    );
 
     let compose = include_str!("../../docker/docker-compose.yml");
     assert!(compose.contains("additional_contexts:"));

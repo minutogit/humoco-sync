@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # Multi-stage build for humoco-sync-server (BuildKit context `humoco-proto` -> ../../humoco-proto)
-FROM rust:1.86-bookworm AS builder
+FROM rust:1.94-bookworm AS builder
 
 WORKDIR /workspace/humoco-sync/rust
 COPY --from=humoco-proto Cargo.toml /workspace/humoco-proto/
