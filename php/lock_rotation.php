@@ -316,6 +316,24 @@ function lock_restore_non_proposal_freeze_state(array $r): string|array {
     return is_array($sf) ? ['self_frozen' => $sf] : 'active';
 }
 
+function lock_manifests_share_chain_prefix(array $existing, array $incoming): bool {
+    $exRev = $existing['revision'] ?? null;
+    $incRev = $incoming['revision'] ?? null;
+    if (!is_int($exRev) || !is_int($incRev) || $incRev < $exRev) return false;
+    $exChain = $existing['migration_chain'] ?? null;
+    $incChain = $incoming['migration_chain'] ?? null;
+    if (!is_array($exChain) || !is_array($incChain) || count($incChain) < count($exChain)) return false;
+    foreach ($exChain as $idx => $eCert) {
+        $iCert = $incChain[$idx] ?? null;
+        if (!is_array($eCert) || !is_array($iCert)) return false;
+        $eDig = is_array($eCert['proposal'] ?? null) ? lock_proposal_digest($eCert['proposal']) : null;
+        $iDig = is_array($iCert['proposal'] ?? null) ? lock_proposal_digest($iCert['proposal']) : null;
+        if ($eDig === null || $iDig === null || !hash_equals($eDig, $iDig)) return false;
+        if (($eCert['imported_state_hash'] ?? null) !== ($iCert['imported_state_hash'] ?? null)) return false;
+    }
+    return true;
+}
+
 function lock_bootstrap_anchor(array $cfg, array $keys, array $p, string $aHex, string $bHex, mixed $m, int $now, bool $allowColdBootstrap = true): array {
     if ($m !== null && !is_array($m)) lock_fail(400, 'Invalid current_manifest');
     $bFile = $p['meta'] . "/buckets/{$bHex}.json";
@@ -334,8 +352,7 @@ function lock_bootstrap_anchor(array $cfg, array $keys, array $p, string $aHex, 
     $q = (int)$m['retain_until_quarter'];
     if ($q > $cfg['max_retention_quarter']) lock_fail(422, 'Manifest retain_until_quarter exceeds server limit');
     if ($b === null) {
-        $bucketFiles = glob($p['meta'] . '/buckets/*.json') ?: [];
-        if (count($bucketFiles) >= $cfg['max_buckets']) lock_fail(507, 'Lock bucket budget exhausted');
+        if (lock_bucket_count($p) >= $cfg['max_buckets']) lock_fail(507, 'Lock bucket budget exhausted');
         if (lock_used_inodes_get($p) >= $cfg['max_inodes']) lock_fail(507, 'Lock inode budget exhausted');
         $b = ['anchor_id' => $aHex, 'retain_until_quarter' => $q, 'creator_mig_pub' => $m['authority']['creator_mig_pub'], 'write_seq' => 0, 'bucket_head' => hash('sha256', 'HUMOCO_BUCKET_INIT_V1' . hex2bin($bHex) . pack('v', $q)), 'freeze_state' => 'active', 'slots' => [], 'conflicts' => [], 'output_claims' => []];
         lock_write_json($bFile, $b);
@@ -639,25 +656,48 @@ function lock_handle_import(array $cfg, array $keys, string $dataDir, int $now):
     $ackedAt = lock_with_lock($p['meta'] . "/buckets/{$bHex}.lockdir", static function () use ($cfg, $keys, $p, $m, $prop, $a32, $b32, $aHex, $bHex, $pHashHex, $impHashHex, $q, $qStr, $slotsResolved, $outClaims, $now): int {
         $bFile = $p['meta'] . "/buckets/{$bHex}.json"; $rFile = $p['meta'] . "/rotations/{$aHex}.json";
         $existingR = lock_read_json($rFile);
-        if ($existingR !== null && (int)$prop['to_rev'] <= (int)$existingR['active_manifest']['revision']) lock_fail(409, 'Target revision has already been finalized');
+        if ($existingR !== null) {
+            if ((int)$prop['to_rev'] <= (int)$existingR['active_manifest']['revision']) lock_fail(409, 'Target revision has already been finalized');
+            if (!lock_manifests_share_chain_prefix($existingR['active_manifest'], $m)) lock_fail(409, 'Active manifest conflicts with finalized history on this server');
+        }
         $r = $existingR ?? ['active_manifest' => $m, 'last_creator_activity_secs' => min($now, intdiv((int)$m['issued_at_ms'], 1000)), 'voted_proposals_by_rev' => [], 'vetoed_proposal_hashes' => [], 'imported_proposal' => null];
         if (in_array($pHashHex, $r['vetoed_proposal_hashes'] ?? [], true)) lock_fail(409, 'Proposal was vetoed on this server');
         $ei = $r['imported_proposal'] ?? null;
         if (is_array($ei) && $ei['proposal_hash'] === $pHashHex && (int)$ei['to_rev'] === (int)$prop['to_rev'] && $ei['imported_state_hash'] === $impHashHex) return (int)$ei['acked_at'];
-        $oldB = lock_read_json($bFile); $oldInodes = $oldB ? (count($oldB['slots'] ?? []) + count($oldB['conflicts'] ?? [])) : 0; $newInodes = count($slotsResolved);
+        $oldB = lock_read_json($bFile);
+        if ($oldB === null && lock_bucket_count($p) >= $cfg['max_buckets']) lock_fail(507, 'Lock bucket budget exhausted');
+        $oldInodes = $oldB ? (count($oldB['slots'] ?? []) + count($oldB['conflicts'] ?? [])) : 0; $newInodes = count($slotsResolved);
         $used = max(0, lock_used_inodes_get($p) - $oldInodes);
         if ($newInodes > 0 && ($used + $newInodes) > $cfg['max_inodes'] && $oldB === null && $used >= $cfg['max_inodes']) lock_fail(507, 'Lock inode budget exhausted');
         $slotDir = $p['locks'] . "/{$qStr}/{$bHex}";
         if (!is_dir($slotDir) && !mkdir($slotDir, 0755, true) && !is_dir($slotDir)) lock_fail(500, 'Failed to create target slot dir');
-        foreach (glob("{$slotDir}/*.lock") ?: [] as $oldF) @unlink($oldF);
-        $bh = hash('sha256', 'HUMOCO_BUCKET_INIT_V1' . $b32 . pack('v', $q), true); $ws = 0; $newSlots = []; $newConflicts = [];
+        $prevSingleHashes = [];
+        if ($oldB !== null) {
+            foreach (($oldB['slots'] ?? []) as $prevFHex) {
+                $prevWire = @file_get_contents("{$slotDir}/{$prevFHex}.lock");
+                if ($prevWire !== false && strlen($prevWire) === LOCK_ENTRY_WIRE_LEN) {
+                    $prevSingleHashes[substr($prevWire, 5, 32)] = hash('sha256', 'HUMOCO_LOCK_ENTRY_V1' . substr($prevWire, 0, LOCK_ENTRY_ID_LEN), true);
+                }
+            }
+            $ws = $oldB['write_seq'] ?? null;
+            $bh = lock_hex_bytes($oldB['bucket_head'] ?? null, 32);
+            if (!is_int($ws) || $ws < 0 || $bh === null) lock_fail(500, 'Corrupted stored bucket head state');
+        } else {
+            $ws = 0;
+            $bh = hash('sha256', 'HUMOCO_BUCKET_INIT_V1' . $b32 . pack('v', $q), true);
+        }
+        $newSlots = []; $newConflicts = []; $keptFiles = [];
         foreach ($slotsResolved as $s32 => $item) {
             $sHex = bin2hex($s32);
             if ($item[0] === 'single') {
                 $e = $item[1]; $fHex = hash('sha256', 'HUMOCO_SYNC_FILE_V1' . $s32 . $keys['pk32']);
                 if (!lock_atomic_write("{$slotDir}/{$fHex}.lock", $e['wire'])) lock_fail(500, 'Failed to persist imported slot');
-                $newSlots[$sHex] = $fHex; $ws++;
-                $bh = hash('sha256', 'HUMOCO_BUCKET_STEP_V1' . $bh . pack('P', $ws) . $s32 . $e['entryHash'], true);
+                $keptFiles["{$fHex}.lock"] = true;
+                $newSlots[$sHex] = $fHex;
+                if (!isset($prevSingleHashes[$s32]) || $prevSingleHashes[$s32] !== $e['entryHash']) {
+                    $ws++;
+                    $bh = hash('sha256', 'HUMOCO_BUCKET_STEP_V1' . $bh . pack('P', $ws) . $s32 . $e['entryHash'], true);
+                }
             } else $newConflicts[$sHex] = array_map(static fn($e) => $e['hex'], $item[1]);
         }
         $fState = 'active';
@@ -671,6 +711,9 @@ function lock_handle_import(array $cfg, array $keys, string $dataDir, int $now):
         $r['imported_proposal'] = ['proposal_hash' => $pHashHex, 'to_rev' => (int)$prop['to_rev'], 'imported_state_hash' => $impHashHex, 'acked_at' => $now];
         lock_write_json($rFile, $r);
         if (!file_exists($p['anchors'] . "/{$aHex}.bin")) lock_write_json($p['anchors'] . "/{$aHex}.bin", $m);
+        foreach (glob("{$slotDir}/*.lock") ?: [] as $oldF) {
+            if (!isset($keptFiles[basename($oldF)])) @unlink($oldF);
+        }
         return $now;
     });
 
@@ -723,18 +766,14 @@ function lock_handle_commit(array $cfg, array $keys, string $dataDir, int $now):
         $b32 = hash('sha256', 'HUMOCO_SYNC_BUCKET_V1' . $a32 . $keys['pk32'], true); $bHex = bin2hex($b32);
         $inNew = in_array($keys['pkHex'], $comms[count($comms) - 1]['members'], true);
 
-        $newState = lock_with_lock($p['meta'] . "/buckets/{$bHex}.lockdir", static function () use ($p, $keys, $nm, $aHex, $bHex, $b32, $q, $inNew, $lpHashHex, $latest, $now) {
+        $newState = lock_with_lock($p['meta'] . "/buckets/{$bHex}.lockdir", static function () use ($cfg, $p, $keys, $nm, $aHex, $bHex, $b32, $q, $inNew, $lpHashHex, $latest, $now) {
             $bFile = $p['meta'] . "/buckets/{$bHex}.json"; $rFile = $p['meta'] . "/rotations/{$aHex}.json";
             $existingR = lock_read_json($rFile);
             if ($existingR !== null) {
                 $exRev = (int)$existingR['active_manifest']['revision'];
                 if ((int)$nm['revision'] < $exRev) lock_fail(409, 'Cannot downgrade active manifest revision');
+                if (!lock_manifests_share_chain_prefix($existingR['active_manifest'], $nm)) lock_fail(409, 'Manifest migration_chain conflicts with finalized history on this server');
                 if ((int)$nm['revision'] === $exRev) {
-                    $exChain = $existingR['active_manifest']['migration_chain'] ?? [];
-                    $exLatest = !empty($exChain) ? $exChain[count($exChain) - 1] : null;
-                    $exDig = is_array($exLatest['proposal'] ?? null) ? lock_proposal_digest($exLatest['proposal']) : null;
-                    $sameTransition = is_array($exLatest) && $exDig !== null && bin2hex($exDig) === $lpHashHex && ($exLatest['imported_state_hash'] ?? null) === $latest['imported_state_hash'];
-                    if (!$sameTransition) lock_fail(409, 'Conflicting manifest already finalized at this revision');
                     $existingB = lock_read_json($bFile);
                     if ($existingB !== null) return $existingB['freeze_state'];
                 }
@@ -746,10 +785,12 @@ function lock_handle_commit(array $cfg, array $keys, string $dataDir, int $now):
                 $imp = $r['imported_proposal'] ?? null;
                 if (!is_array($imp) || $imp['proposal_hash'] !== $lpHashHex || (int)$imp['to_rev'] !== (int)$nm['revision'] || $imp['imported_state_hash'] !== $latest['imported_state_hash']) lock_fail(409, 'Target server must complete ?lock_import for this revision before Finalize');
             }
+            $existingB = lock_read_json($bFile);
+            if ($existingB === null && lock_bucket_count($p) >= $cfg['max_buckets']) lock_fail(507, 'Lock bucket budget exhausted');
             $r['active_manifest'] = $nm; $r['imported_proposal'] = null;
             lock_write_json($rFile, $r);
             lock_write_json($p['anchors'] . "/{$aHex}.bin", $nm);
-            $b = lock_read_json($bFile) ?? ['anchor_id' => $aHex, 'retain_until_quarter' => $q, 'creator_mig_pub' => $nm['authority']['creator_mig_pub'], 'write_seq' => 0, 'bucket_head' => hash('sha256', 'HUMOCO_BUCKET_INIT_V1' . $b32 . pack('v', $q)), 'freeze_state' => 'active', 'slots' => [], 'conflicts' => [], 'output_claims' => []];
+            $b = $existingB ?? ['anchor_id' => $aHex, 'retain_until_quarter' => $q, 'creator_mig_pub' => $nm['authority']['creator_mig_pub'], 'write_seq' => 0, 'bucket_head' => hash('sha256', 'HUMOCO_BUCKET_INIT_V1' . $b32 . pack('v', $q)), 'freeze_state' => 'active', 'slots' => [], 'conflicts' => [], 'output_claims' => []];
             $b['freeze_state'] = $inNew ? ((is_array($b['freeze_state']) && isset($b['freeze_state']['self_frozen'])) ? $b['freeze_state'] : lock_restore_non_proposal_freeze_state($r)) : ['epoch_frozen' => ['committed_rev' => (int)$nm['revision'], 'frozen_at' => $now]];
             lock_write_json($bFile, $b);
             return $b['freeze_state'];

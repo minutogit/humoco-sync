@@ -155,6 +155,9 @@ function lock_has_existing_buckets(array $p): bool {
     }
     return false;
 }
+function lock_bucket_count(array $p): int {
+    return count(glob($p['meta'] . '/buckets/*.json') ?: []);
+}
 
 function lock_load_or_init_keys(string $dataDir): array {
     $p = lock_paths($dataDir);
@@ -202,6 +205,22 @@ function lock_used_inodes_add(array $p, int $delta): int {
     });
 }
 
+function lock_rate_limit_ip_key(string $rawIp): string {
+    $packed = @inet_pton($rawIp);
+    if ($packed === false || strlen($packed) !== 16) {
+        return $rawIp;
+    }
+    if (substr($packed, 0, 12) === "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff") {
+        $v4 = @inet_ntop(substr($packed, 12, 4));
+        return $v4 !== false ? $v4 : $rawIp;
+    }
+    if ($packed === "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01") {
+        return '::1';
+    }
+    $masked = @inet_ntop(substr($packed, 0, 8) . str_repeat("\0", 8));
+    return $masked !== false ? $masked : $rawIp;
+}
+
 function lock_ip_ratelimit_allow(array $p, bool $disable): bool {
     if ($disable) return true;
     $pepFile = $p['meta'] . '/pepper.bin';
@@ -212,7 +231,7 @@ function lock_ip_ratelimit_allow(array $p, bool $disable): bool {
         $fp = @fopen($rlFile, 'c+b');
         if ($fp === false) return true;
         if ((fstat($fp)['size'] ?? 0) < 65564) { fseek($fp, 0); fwrite($fp, "<?php __halt_compiler(); ?>\n" . str_repeat("\0", 65536)); }
-        $ip = (string)($_SERVER['REMOTE_ADDR'] ?? '127.0.0.1');
+        $ip = lock_rate_limit_ip_key((string)($_SERVER['REMOTE_ADDR'] ?? '127.0.0.1'));
         $h = hash_hmac('sha256', $ip, gmdate('Y-m-d') . '|' . $pep, true);
         $idx = unpack('V', substr($h, 0, 4))[1] & 4095;
         $tag = unpack('V', substr($h, 4, 4))[1] ?: 1;
@@ -474,6 +493,7 @@ function lock_handle_ticket(array $cfg, array $keys, string $configFile, string 
             });
         }
     }
+    if ($b === null && lock_bucket_count($p) >= $cfg['max_buckets']) lock_fail(507, 'Lock bucket budget exhausted');
     if (lock_used_inodes_get($p) >= $cfg['max_inodes']) lock_fail(507, 'Lock inode budget exhausted');
     $dig = hash('sha256', 'HUMOCO_GENESIS_TICKET_V1' . $a32 . pack('v', $q) . pack('P', $now) . $keys['pk32'], true);
     lock_ok(200, ['ticket' => ['anchor_id' => $req['anchor_id'], 'retain_until_quarter' => $q, 'issued_at' => $now, 'lock_pub' => $keys['pkHex'], 'sig' => bin2hex(lock_sign($keys['sk64'], $dig))]]);
@@ -540,6 +560,7 @@ function lock_handle_batch(array $cfg, array $keys, string $dataDir, int $now): 
             $tDig = is_int($tIss) && $tIss > 0 ? hash('sha256', 'HUMOCO_GENESIS_TICKET_V1' . $a32 . pack('v', $q) . pack('P', $tIss) . $keys['pk32'], true) : '';
             if (($t['anchor_id'] ?? '') !== $aHex || ($t['lock_pub'] ?? '') !== $keys['pkHex'] || ($t['retain_until_quarter'] ?? -1) !== $q || $tSig === null || $tDig === '' || !lock_verify_sig($keys['pk32'], $tSig, $tDig)) lock_fail(401, 'Invalid or mismatched GenesisTicket');
             if ($q > $cfg['max_retention_quarter']) lock_fail(422, 'Manifest retain_until_quarter exceeds server limit');
+            if (lock_bucket_count($p) >= $cfg['max_buckets']) lock_fail(507, 'Lock bucket budget exhausted');
             if (lock_used_inodes_get($p) >= $cfg['max_inodes']) lock_fail(507, 'Lock inode budget exhausted');
             $b = ['anchor_id' => $aHex, 'retain_until_quarter' => $q, 'creator_mig_pub' => $m['authority']['creator_mig_pub'], 'write_seq' => 0, 'bucket_head' => hash('sha256', 'HUMOCO_BUCKET_INIT_V1' . $b32 . pack('v', $q)), 'freeze_state' => 'active', 'slots' => [], 'conflicts' => [], 'output_claims' => []];
             $newManifest = $m;

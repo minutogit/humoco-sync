@@ -722,7 +722,7 @@ B9_OUT="$(php -r '
   };
   $migKp1 = sodium_crypto_sign_keypair();
   $migSk1 = sodium_crypto_sign_secretkey($migKp1); $migPk1 = bin2hex(sodium_crypto_sign_publickey($migKp1));
-  $t0 = time();
+  $t0 = time() - 10;
   $mkMan = static function (int $issuedMs) use ($url, $adminPkHex, $lpHex, $migPk1, $qtr): array {
     $srv = ["write_url" => "$url/sync.php", "read_url" => "$url/humoco_sync_data", "admin_pub" => $adminPkHex, "lock_pub" => $lpHex, "nominated_by" => "creator"];
     $m = ["revision" => 1, "threshold" => 1, "servers" => [$srv], "successors" => [], "authority" => ["creator_mig_pub" => $migPk1, "guarantor_mig_pubs" => []], "migration_chain" => [], "issued_at_ms" => $issuedMs, "retain_until_quarter" => $qtr];
@@ -763,6 +763,587 @@ assert_contains "$B9_OUT" '"forged_hb_code":401' "SYNC-S07-07: forged cold heart
 assert_contains "$B9_OUT" '"buckets_after_forged_hb":0' "SYNC-S07-07: forged cold heartbeat leaves 0 buckets on disk"
 assert_contains "$B9_OUT" '"ok_hb_code":200' "SYNC-S07-07: valid cold heartbeat succeeds within max_buckets=1"
 assert_contains "$B9_OUT" '"cap_hb_code":507' "SYNC-S07-07: second cold bucket beyond max_buckets=1 returns 507"
+
+stop_php_server
+
+echo "--- Test 10 (SYNC-S07-08): max_buckets cap across ticket, batch, import & finalize (tombstone exempt) ---"
+read -r B10_ADMIN_SK B10_ADMIN_PK <<< "$("$SERVER_BIN" sign-test keygen)"
+read -r B10T_ADMIN_SK B10T_ADMIN_PK <<< "$("$SERVER_BIN" sign-test keygen)"
+read -r B10U_ADMIN_SK B10U_ADMIN_PK <<< "$("$SERVER_BIN" sign-test keygen)"
+B10_PORT="$(pick_free_port)"
+B10_DOC="$TMP_DIR/b10_doc"
+start_php_server "$B10_DOC" "$B10_ADMIN_PK" 50 1 "$B10_PORT" "$TMP_DIR/b10.log" 0
+B10_PID="$PHP_PID"; PHP_PID=""
+B10T_PORT=$((B10_PORT + 1))
+while (echo >/dev/tcp/127.0.0.1/"$B10T_PORT") 2>/dev/null; do B10T_PORT=$((B10T_PORT + 1)); done
+B10T_DOC="$TMP_DIR/b10t_doc"
+start_php_server "$B10T_DOC" "$B10T_ADMIN_PK" 50 1 "$B10T_PORT" "$TMP_DIR/b10t.log" 0
+B10T_PID="$PHP_PID"; PHP_PID=""
+B10U_PORT=$((B10T_PORT + 1))
+while (echo >/dev/tcp/127.0.0.1/"$B10U_PORT") 2>/dev/null; do B10U_PORT=$((B10U_PORT + 1)); done
+B10U_DOC="$TMP_DIR/b10u_doc"
+start_php_server "$B10U_DOC" "$B10U_ADMIN_PK" 50 1 "$B10U_PORT" "$TMP_DIR/b10u.log" 0
+B10U_PID="$PHP_PID"; PHP_PID=""
+cleanup_b10() {
+  for xp in "${B10_PID:-}" "${B10T_PID:-}" "${B10U_PID:-}"; do
+    if [[ -n "$xp" ]] && kill -0 "$xp" 2>/dev/null; then
+      kill "$xp" 2>/dev/null || true
+      wait "$xp" 2>/dev/null || true
+    fi
+  done
+  cleanup_with_rot
+}
+trap cleanup_b10 EXIT
+
+php -r '
+  $c = file_get_contents($argv[1]);
+  $c = str_replace("'\''max_inodes'\'' => 50,", "'\''max_inodes'\'' => 50,\n        '\''max_buckets'\'' => 1,", $c);
+  file_put_contents($argv[1], $c);
+' "$B10_DOC/config.php"
+
+B10_URL="http://127.0.0.1:${B10_PORT}"
+B10T_URL="http://127.0.0.1:${B10T_PORT}"
+B10U_URL="http://127.0.0.1:${B10U_PORT}"
+B10_LP="$(curl -sf "${B10_URL}/sync.php?lock_selftest" | sed -n 's/.*"lock_pub":"\([0-9a-f]\{64\}\)".*/\1/p')"
+B10T_LP="$(curl -sf "${B10T_URL}/sync.php?lock_selftest" | sed -n 's/.*"lock_pub":"\([0-9a-f]\{64\}\)".*/\1/p')"
+B10U_LP="$(curl -sf "${B10U_URL}/sync.php?lock_selftest" | sed -n 's/.*"lock_pub":"\([0-9a-f]\{64\}\)".*/\1/p')"
+
+B10_OUT="$(php -r '
+  $u1 = $argv[1]; $sk1 = $argv[2]; $pk1 = $argv[3]; $lp1 = $argv[4]; $doc1 = $argv[5];
+  $u2 = $argv[6]; $pk2 = $argv[7]; $lp2 = $argv[8];
+  $u3 = $argv[9]; $pk3 = $argv[10]; $lp3 = $argv[11];
+  $q = (int)$argv[12];
+  $post = static function (string $u, string $body, array $hdrs = []): array {
+    $ch = curl_init($u);
+    curl_setopt_array($ch, [CURLOPT_POST => true, CURLOPT_POSTFIELDS => $body, CURLOPT_HTTPHEADER => array_merge(["Content-Type: application/json"], $hdrs), CURLOPT_RETURNTRANSFER => true]);
+    $resp = curl_exec($ch); $code = curl_getinfo($ch, CURLINFO_HTTP_CODE); curl_close($ch);
+    return [$code, json_decode((string)$resp, true) ?: []];
+  };
+  $issueT = static function (string $u, string $sk, string $pk, string $aHex, int $q) use ($post): array {
+    $body = json_encode(["anchor_id" => $aHex, "retain_until_quarter" => $q, "pow_timestamp" => null, "pow_nonce" => null]);
+    $ts = time(); $nonce = bin2hex(random_bytes(16));
+    $msg = "HUMOCO-DROP-REQ-V1\nPOST\nlock_ticket\n\n{$ts}\n{$nonce}\n" . hash("sha256", $body);
+    $sig = bin2hex(sodium_crypto_sign_detached($msg, hex2bin($sk) . hex2bin($pk)));
+    return $post("$u/sync.php?lock_ticket", $body, ["X-Drop-Pubkey: $pk", "X-Drop-Timestamp: $ts", "X-Drop-Nonce: $nonce", "X-Drop-Signature: $sig"]);
+  };
+  $cKp = sodium_crypto_sign_seed_keypair(hash("sha256", "B10_CREATOR", true));
+  $cSk = sodium_crypto_sign_secretkey($cKp); $cPk = bin2hex(sodium_crypto_sign_publickey($cKp));
+  $mkSrv = static fn(string $u, string $ap, string $lp) => ["write_url" => "$u/sync.php", "read_url" => "$u/humoco_sync_data", "admin_pub" => $ap, "lock_pub" => $lp, "nominated_by" => "creator"];
+  $mkMan = static function (array $srvs, int $thr, int $ms) use ($cPk, $q): array {
+    $m = ["revision" => 1, "threshold" => $thr, "servers" => $srvs, "successors" => [], "authority" => ["creator_mig_pub" => $cPk, "guarantor_mig_pubs" => []], "migration_chain" => [], "issued_at_ms" => $ms, "retain_until_quarter" => $q];
+    $sBin = ""; foreach ($srvs as $s) $sBin .= hex2bin($s["admin_pub"]) . hex2bin($s["lock_pub"]) . "\x00";
+    $pre = "HUMOCO_ANCHOR_MANIFEST_V1\x00" . pack("P", 1) . chr($thr) . chr(count($srvs)) . $sBin . pack("v", 0) . hex2bin($cPk) . "\x00" . pack("P", $ms) . pack("v", $q);
+    return [bin2hex(hash("sha256", $pre, true)), $m];
+  };
+  $mkProp = static function (string $aHex, int $from, int $to, int $thr, array $srvs, int $ts) use ($cSk, $q): array {
+    $sBin = ""; foreach ($srvs as $s) $sBin .= hex2bin($s["admin_pub"]) . hex2bin($s["lock_pub"]) . "\x00";
+    $pDig = hash("sha256", "HUMOCO_MIGRATION_PROP_V1" . hex2bin($aHex) . pack("P", $from) . pack("P", $to) . chr($thr) . chr(count($srvs)) . $sBin . pack("v", 0) . pack("v", $q) . pack("P", $ts) . "\x00", true);
+    return ["anchor_id" => $aHex, "from_rev" => $from, "to_rev" => $to, "new_threshold" => $thr, "new_servers" => $srvs, "new_successors" => [], "retain_until_quarter" => $q, "proposed_at" => $ts, "initiator" => ["kind" => "creator"], "proposer_sig" => bin2hex(sodium_crypto_sign_detached($pDig, $cSk)), "guarantor_cosigs" => []];
+  };
+  $genKp = sodium_crypto_sign_seed_keypair(str_repeat(chr(41), 32));
+  $genSk = sodium_crypto_sign_secretkey($genKp); $genPk = sodium_crypto_sign_publickey($genKp);
+  $mkRoot = static function (string $aHex) use ($cSk, $genSk, $genPk): string {
+    $a32 = hex2bin($aHex);
+    $slot = hash("sha256", "HUMOCO_SYNC_SLOT_V1" . $a32 . str_repeat(chr(0x11), 32), true);
+    $cl = str_repeat(chr(0x22), 32); $rh = hash("sha3-256", str_repeat(chr(0x33), 32), true);
+    $cd = hash("sha256", "HUMOCO_CAUSAL_OUTPUT_V1" . $a32 . $slot . str_repeat("\0", 32) . "\x00" . pack("V", 0) . $cl . $genPk . $rh . "\x00" . str_repeat("\0", 32), true);
+    $csig = sodium_crypto_sign_detached($cd, $genSk);
+    $rmd = hash("sha256", "HUMOCO_ROOT_MIG_AUTH_V1" . $a32 . $slot . $genPk, true);
+    $rsig = sodium_crypto_sign_detached($rmd, $cSk);
+    for ($n = 0;; $n++) { $h = hash("sha256", "HUMOCO_LOCK_POW_V1" . $slot . $cl . pack("V", 0) . pack("P", $n), true); if (ord($h[0]) === 0) break; }
+    return bin2hex("HMLK\x01" . $slot . str_repeat("\0", 32) . "\x00" . pack("V", 0) . $cl . $genPk . $rh . "\x00" . str_repeat("\0", 32) . $csig . "\x01" . $rsig . str_repeat("\x55", 265) . pack("P", $n));
+  };
+
+  $s1 = $mkSrv($u1, $pk1, $lp1); $s2 = $mkSrv($u2, $pk2, $lp2); $s3 = $mkSrv($u3, $pk3, $lp3);
+  $t0 = time() - 10;
+  [$aid1, $m1] = $mkMan([$s1], 1, $t0 * 1000);
+  [$aid2, $m2] = $mkMan([$s1], 1, ($t0 + 1) * 1000);
+  [$aid3, $m3] = $mkMan([$s1], 1, ($t0 + 2) * 1000);
+  [$aidImp, $mImp] = $mkMan([$s2], 1, ($t0 + 3) * 1000);
+  [$aidFin, $mFin] = $mkMan([$s1, $s2, $s3], 2, ($t0 + 4) * 1000);
+
+  // Pre-issue ticket for aid2 and aid3 before max_buckets=1 is reached, and capture a signed receipt for aid3 then wipe aid3 bucket to simulate rollback!
+  [, $t2Res] = $issueT($u1, $sk1, $pk1, $aid2, $q);
+  [, $t3Res] = $issueT($u1, $sk1, $pk1, $aid3, $q);
+  $b3Hex = hash("sha256", "HUMOCO_SYNC_BUCKET_V1" . hex2bin($aid3) . hex2bin($lp1));
+  [$c3Init, $b3Res] = $post("$u1/sync.php?lock", json_encode(["anchor_id" => $aid3, "bucket" => $b3Hex, "recipient_nonce" => bin2hex(random_bytes(32)), "entries" => [$mkRoot($aid3)], "manifest" => $m3, "genesis_ticket" => $t3Res["ticket"], "known_head_receipt" => null]));
+  if ($c3Init !== 200) throw new RuntimeException("aid3 init failed $c3Init");
+  $kr3 = $b3Res["receipts"][0];
+  // Wipe aid3 from u1 so max_buckets starts at 0 again
+  @unlink("$doc1/humoco_sync_data/.locks_meta/buckets/$b3Hex.json");
+  @unlink("$doc1/humoco_sync_data/.locks_meta/rotations/$aid3.json");
+  @unlink("$doc1/humoco_sync_data/anchors/$aid3.bin");
+  foreach (glob("$doc1/humoco_sync_data/locks/*/$b3Hex/*.lock") ?: [] as $f) @unlink($f);
+
+  // Fill u1 max_buckets=1 with aid1
+  [, $t1Res] = $issueT($u1, $sk1, $pk1, $aid1, $q);
+  $b1Hex = hash("sha256", "HUMOCO_SYNC_BUCKET_V1" . hex2bin($aid1) . hex2bin($lp1));
+  [$c1, ] = $post("$u1/sync.php?lock", json_encode(["anchor_id" => $aid1, "bucket" => $b1Hex, "recipient_nonce" => bin2hex(random_bytes(32)), "entries" => [$mkRoot($aid1)], "manifest" => $m1, "genesis_ticket" => $t1Res["ticket"], "known_head_receipt" => null]));
+  if ($c1 !== 200) throw new RuntimeException("fill u1 failed $c1");
+
+  // 1) POST ?lock_ticket unseen aid2 on full u1 -> 507
+  [$tCapCode, ] = $issueT($u1, $sk1, $pk1, $aid2, $q);
+  // 2) POST ?lock_ticket existing aid1 on full u1 -> 200
+  [$tExistCode, ] = $issueT($u1, $sk1, $pk1, $aid1, $q);
+  // 3) POST ?lock unseen aid2 with pre-issued ticket on full u1 -> 507
+  $b2Hex = hash("sha256", "HUMOCO_SYNC_BUCKET_V1" . hex2bin($aid2) . hex2bin($lp1));
+  [$bCapCode, ] = $post("$u1/sync.php?lock", json_encode(["anchor_id" => $aid2, "bucket" => $b2Hex, "recipient_nonce" => bin2hex(random_bytes(32)), "entries" => [$mkRoot($aid2)], "manifest" => $m2, "genesis_ticket" => $t2Res["ticket"], "known_head_receipt" => null]));
+  // 4) POST ?lock known_head_receipt tombstone for missing aid3 on full u1 -> 409 bucket_self_frozen
+  [$tombCode, $tombBody] = $post("$u1/sync.php?lock", json_encode(["anchor_id" => $aid3, "bucket" => $b3Hex, "recipient_nonce" => bin2hex(random_bytes(32)), "entries" => [$mkRoot($aid3)], "manifest" => null, "genesis_ticket" => null, "known_head_receipt" => $kr3]));
+  @unlink("$doc1/humoco_sync_data/.locks_meta/buckets/$b3Hex.json");
+
+  // 5) POST ?lock_import for unseen aidImp ([u2] -> [u2, u1]) on full u1 -> 507
+  $propImp = $mkProp($aidImp, 1, 2, 2, [$s2, $s1], $t0);
+  [$cPrImp, $prImp] = $post("$u2/sync.php?lock_freeze", json_encode(["action" => "propose", "proposal" => $propImp, "current_manifest" => $mImp]));
+  if ($cPrImp !== 200) throw new RuntimeException("propose aidImp failed $cPrImp");
+  [$impCapCode, ] = $post("$u1/sync.php?lock_import", json_encode(["anchor_id" => $aidImp, "active_manifest" => $mImp, "proposal" => $propImp, "snapshots" => [$prImp["snapshot_export"]], "quorum_certificates" => []]));
+
+  // 6) POST ?lock_commit finalize for unseen aidFin ([u1, u2, u3] -> [u2, u3], retiring u1) on full u1 -> 507 + 0 files created on u1
+  $propFin = $mkProp($aidFin, 1, 2, 2, [$s2, $s3], $t0);
+  [, $prFin2] = $post("$u2/sync.php?lock_freeze", json_encode(["action" => "propose", "proposal" => $propFin, "current_manifest" => $mFin]));
+  [, $prFin3] = $post("$u3/sync.php?lock_freeze", json_encode(["action" => "propose", "proposal" => $propFin, "current_manifest" => $mFin]));
+  $impFinReq = json_encode(["anchor_id" => $aidFin, "active_manifest" => $mFin, "proposal" => $propFin, "snapshots" => [$prFin2["snapshot_export"], $prFin3["snapshot_export"]], "quorum_certificates" => []]);
+  [, $iFin2] = $post("$u2/sync.php?lock_import", $impFinReq);
+  [, $iFin3] = $post("$u3/sync.php?lock_import", $impFinReq);
+  $acksFin = [$iFin2["import_ack"], $iFin3["import_ack"]];
+  $ishFin = $iFin2["import_ack"]["imported_state_hash"];
+  [, $scFin2] = $post("$u2/sync.php?lock_commit", json_encode(["action" => "sign_commit", "anchor_id" => $aidFin, "proposal" => $propFin, "imported_state_hash" => $ishFin, "import_acks" => $acksFin]));
+  [, $scFin3] = $post("$u3/sync.php?lock_commit", json_encode(["action" => "sign_commit", "anchor_id" => $aidFin, "proposal" => $propFin, "imported_state_hash" => $ishFin, "import_acks" => $acksFin]));
+  $mFin2 = ["revision" => 2, "threshold" => 2, "servers" => [$s2, $s3], "successors" => [], "authority" => $mFin["authority"], "migration_chain" => [["anchor_id" => $aidFin, "genesis_manifest" => $mFin, "proposal" => $propFin, "imported_state_hash" => $ishFin, "import_acks" => $acksFin, "commit_sigs" => [$scFin2["committee_signature"], $scFin3["committee_signature"]]]], "issued_at_ms" => $t0 * 1000, "retain_until_quarter" => $q];
+  [$finCapCode, ] = $post("$u1/sync.php?lock_commit", json_encode(["action" => "finalize", "anchor_id" => $aidFin, "new_manifest" => $mFin2]));
+  $finRotLeak = file_exists("$doc1/humoco_sync_data/.locks_meta/rotations/$aidFin.json") ? 1 : 0;
+  $finAncLeak = file_exists("$doc1/humoco_sync_data/anchors/$aidFin.bin") ? 1 : 0;
+
+  // 7) Existing bucket aid1 rotation ([u1] -> [u1, u2]) succeeds end-to-end on full u1 -> 200
+  $prop12 = $mkProp($aid1, 1, 2, 2, [$s1, $s2], $t0);
+  [, $pr12] = $post("$u1/sync.php?lock_freeze", json_encode(["action" => "propose", "proposal" => $prop12]));
+  $imp12Req = json_encode(["anchor_id" => $aid1, "active_manifest" => $m1, "proposal" => $prop12, "snapshots" => [$pr12["snapshot_export"]], "quorum_certificates" => []]);
+  [$impExistCode, $i1_12] = $post("$u1/sync.php?lock_import", $imp12Req);
+  [, $i2_12] = $post("$u2/sync.php?lock_import", $imp12Req);
+  $acks12 = [$i1_12["import_ack"], $i2_12["import_ack"]];
+  $ish12 = $i1_12["import_ack"]["imported_state_hash"];
+  [, $sc1_12] = $post("$u1/sync.php?lock_commit", json_encode(["action" => "sign_commit", "anchor_id" => $aid1, "proposal" => $prop12, "imported_state_hash" => $ish12, "import_acks" => $acks12]));
+  $m1_2 = ["revision" => 2, "threshold" => 2, "servers" => [$s1, $s2], "successors" => [], "authority" => $m1["authority"], "migration_chain" => [["anchor_id" => $aid1, "genesis_manifest" => $m1, "proposal" => $prop12, "imported_state_hash" => $ish12, "import_acks" => $acks12, "commit_sigs" => [$sc1_12["committee_signature"]]]], "issued_at_ms" => $t0 * 1000, "retain_until_quarter" => $q];
+  [$finExistCode, ] = $post("$u1/sync.php?lock_commit", json_encode(["action" => "finalize", "anchor_id" => $aid1, "new_manifest" => $m1_2]));
+  echo json_encode([
+    "t_cap" => $tCapCode,
+    "t_exist" => $tExistCode,
+    "b_cap" => $bCapCode,
+    "tomb_code" => $tombCode,
+    "tomb_err" => $tombBody["error"] ?? "",
+    "imp_cap" => $impCapCode,
+    "fin_cap" => $finCapCode,
+    "fin_rot_leak" => $finRotLeak,
+    "fin_anc_leak" => $finAncLeak,
+    "imp_exist" => $impExistCode,
+    "fin_exist" => $finExistCode,
+  ]);
+' "$B10_URL" "$B10_ADMIN_SK" "$B10_ADMIN_PK" "$B10_LP" "$B10_DOC" "$B10T_URL" "$B10T_ADMIN_PK" "$B10T_LP" "$B10U_URL" "$B10U_ADMIN_PK" "$B10U_LP" "$QTR")"
+
+assert_contains "$B10_OUT" '"t_cap":507' "SYNC-S07-08: POST ?lock_ticket rejects unseen bucket past max_buckets=1 (507)"
+assert_contains "$B10_OUT" '"t_exist":200' "SYNC-S07-08: POST ?lock_ticket allows existing bucket at max_buckets=1 (200)"
+assert_contains "$B10_OUT" '"b_cap":507' "SYNC-S07-08: POST ?lock rejects unseen bucket creation past max_buckets=1 (507)"
+assert_contains "$B10_OUT" '"tomb_code":409' "SYNC-S07-08: known_head_receipt rollback tombstone stays exempt from max_buckets=1 (409)"
+assert_contains "$B10_OUT" '"tomb_err":"bucket_self_frozen"' "SYNC-S07-08: rollback tombstone returns bucket_self_frozen"
+assert_contains "$B10_OUT" '"imp_cap":507' "SYNC-S07-08: POST ?lock_import rejects unseen bucket past max_buckets=1 (507)"
+assert_contains "$B10_OUT" '"fin_cap":507' "SYNC-S07-08: POST ?lock_commit finalize rejects unseen bucket past max_buckets=1 (507)"
+assert_contains "$B10_OUT" '"fin_rot_leak":0' "SYNC-S07-08: rejected finalize leaves 0 rotation metadata files"
+assert_contains "$B10_OUT" '"fin_anc_leak":0' "SYNC-S07-08: rejected finalize leaves 0 static anchor files"
+assert_contains "$B10_OUT" '"imp_exist":200' "SYNC-S07-08: POST ?lock_import allows existing bucket rotation at max_buckets=1 (200)"
+assert_contains "$B10_OUT" '"fin_exist":200' "SYNC-S07-08: POST ?lock_commit finalize allows existing bucket rotation at max_buckets=1 (200)"
+
+for xp in "${B10_PID:-}" "${B10T_PID:-}" "${B10U_PID:-}"; do
+  if [[ -n "$xp" ]] && kill -0 "$xp" 2>/dev/null; then
+    kill "$xp" 2>/dev/null || true
+    wait "$xp" 2>/dev/null || true
+  fi
+done
+B10_PID=""; B10T_PID=""; B10U_PID=""
+
+echo "--- Test 11 (SYNC-S07-09): lock_import preserves monotonic (write_seq, bucket_head) against pre-rotation receipts ---"
+read -r B11_1_SK B11_1_PK <<< "$("$SERVER_BIN" sign-test keygen)"
+read -r B11_2_SK B11_2_PK <<< "$("$SERVER_BIN" sign-test keygen)"
+read -r B11_3_SK B11_3_PK <<< "$("$SERVER_BIN" sign-test keygen)"
+B11_1_PORT="$(pick_free_port)"
+B11_1_DOC="$TMP_DIR/b11_1_doc"
+start_php_server "$B11_1_DOC" "$B11_1_PK" 50000 1 "$B11_1_PORT" "$TMP_DIR/b11_1.log" 0
+B11_1_PID="$PHP_PID"; PHP_PID=""
+B11_2_PORT=$((B11_1_PORT + 1))
+while (echo >/dev/tcp/127.0.0.1/"$B11_2_PORT") 2>/dev/null; do B11_2_PORT=$((B11_2_PORT + 1)); done
+B11_2_DOC="$TMP_DIR/b11_2_doc"
+start_php_server "$B11_2_DOC" "$B11_2_PK" 50000 1 "$B11_2_PORT" "$TMP_DIR/b11_2.log" 0
+B11_2_PID="$PHP_PID"; PHP_PID=""
+B11_3_PORT=$((B11_2_PORT + 1))
+while (echo >/dev/tcp/127.0.0.1/"$B11_3_PORT") 2>/dev/null; do B11_3_PORT=$((B11_3_PORT + 1)); done
+B11_3_DOC="$TMP_DIR/b11_3_doc"
+start_php_server "$B11_3_DOC" "$B11_3_PK" 50000 1 "$B11_3_PORT" "$TMP_DIR/b11_3.log" 0
+B11_3_PID="$PHP_PID"; PHP_PID=""
+cleanup_b11() {
+  for xp in "${B11_1_PID:-}" "${B11_2_PID:-}" "${B11_3_PID:-}"; do
+    if [[ -n "$xp" ]] && kill -0 "$xp" 2>/dev/null; then
+      kill "$xp" 2>/dev/null || true
+      wait "$xp" 2>/dev/null || true
+    fi
+  done
+  cleanup_b10
+}
+trap cleanup_b11 EXIT
+
+B11_1_URL="http://127.0.0.1:${B11_1_PORT}"
+B11_2_URL="http://127.0.0.1:${B11_2_PORT}"
+B11_3_URL="http://127.0.0.1:${B11_3_PORT}"
+B11_1_LP="$(curl -sf "${B11_1_URL}/sync.php?lock_selftest" | sed -n 's/.*"lock_pub":"\([0-9a-f]\{64\}\)".*/\1/p')"
+B11_2_LP="$(curl -sf "${B11_2_URL}/sync.php?lock_selftest" | sed -n 's/.*"lock_pub":"\([0-9a-f]\{64\}\)".*/\1/p')"
+B11_3_LP="$(curl -sf "${B11_3_URL}/sync.php?lock_selftest" | sed -n 's/.*"lock_pub":"\([0-9a-f]\{64\}\)".*/\1/p')"
+
+B11_OUT="$(php -r '
+  $u1 = $argv[1]; $sk1 = $argv[2]; $pk1 = $argv[3]; $lp1 = $argv[4];
+  $u2 = $argv[5]; $sk2 = $argv[6]; $pk2 = $argv[7]; $lp2 = $argv[8];
+  $u3 = $argv[9]; $pk3 = $argv[10]; $lp3 = $argv[11];
+  $q = (int)$argv[12];
+  $post = static function (string $u, string $body, array $hdrs = []): array {
+    $ch = curl_init($u);
+    curl_setopt_array($ch, [CURLOPT_POST => true, CURLOPT_POSTFIELDS => $body, CURLOPT_HTTPHEADER => array_merge(["Content-Type: application/json"], $hdrs), CURLOPT_RETURNTRANSFER => true]);
+    $resp = curl_exec($ch); $code = curl_getinfo($ch, CURLINFO_HTTP_CODE); curl_close($ch);
+    return [$code, json_decode((string)$resp, true) ?: []];
+  };
+  $issueT = static function (string $u, string $sk, string $pk, string $aHex, int $q) use ($post): array {
+    $body = json_encode(["anchor_id" => $aHex, "retain_until_quarter" => $q, "pow_timestamp" => null, "pow_nonce" => null]);
+    $ts = time(); $nonce = bin2hex(random_bytes(16));
+    $msg = "HUMOCO-DROP-REQ-V1\nPOST\nlock_ticket\n\n{$ts}\n{$nonce}\n" . hash("sha256", $body);
+    $sig = bin2hex(sodium_crypto_sign_detached($msg, hex2bin($sk) . hex2bin($pk)));
+    return $post("$u/sync.php?lock_ticket", $body, ["X-Drop-Pubkey: $pk", "X-Drop-Timestamp: $ts", "X-Drop-Nonce: $nonce", "X-Drop-Signature: $sig"]);
+  };
+  $cKp = sodium_crypto_sign_seed_keypair(hash("sha256", "B11_CREATOR", true));
+  $cSk = sodium_crypto_sign_secretkey($cKp); $cPk = bin2hex(sodium_crypto_sign_publickey($cKp));
+  $mkSrv = static fn(string $u, string $ap, string $lp) => ["write_url" => "$u/sync.php", "read_url" => "$u/humoco_sync_data", "admin_pub" => $ap, "lock_pub" => $lp, "nominated_by" => "creator"];
+  $mkMan = static function (array $srvs, int $thr, int $ms) use ($cPk, $q): array {
+    $m = ["revision" => 1, "threshold" => $thr, "servers" => $srvs, "successors" => [], "authority" => ["creator_mig_pub" => $cPk, "guarantor_mig_pubs" => []], "migration_chain" => [], "issued_at_ms" => $ms, "retain_until_quarter" => $q];
+    $sBin = ""; foreach ($srvs as $s) $sBin .= hex2bin($s["admin_pub"]) . hex2bin($s["lock_pub"]) . "\x00";
+    $pre = "HUMOCO_ANCHOR_MANIFEST_V1\x00" . pack("P", 1) . chr($thr) . chr(count($srvs)) . $sBin . pack("v", 0) . hex2bin($cPk) . "\x00" . pack("P", $ms) . pack("v", $q);
+    return [bin2hex(hash("sha256", $pre, true)), $m];
+  };
+  $mkProp = static function (string $aHex, int $from, int $to, int $thr, array $srvs, int $ts) use ($cSk, $q): array {
+    $sBin = ""; foreach ($srvs as $s) $sBin .= hex2bin($s["admin_pub"]) . hex2bin($s["lock_pub"]) . "\x00";
+    $pDig = hash("sha256", "HUMOCO_MIGRATION_PROP_V1" . hex2bin($aHex) . pack("P", $from) . pack("P", $to) . chr($thr) . chr(count($srvs)) . $sBin . pack("v", 0) . pack("v", $q) . pack("P", $ts) . "\x00", true);
+    return ["anchor_id" => $aHex, "from_rev" => $from, "to_rev" => $to, "new_threshold" => $thr, "new_servers" => $srvs, "new_successors" => [], "retain_until_quarter" => $q, "proposed_at" => $ts, "initiator" => ["kind" => "creator"], "proposer_sig" => bin2hex(sodium_crypto_sign_detached($pDig, $cSk)), "guarantor_cosigs" => []];
+  };
+  $mkEntry = static function (string $aHex, string $dsTag32, string $pSlot32, int $ob, int $depth, string $senderSk, string $senderPk, string $recvHash, ?string $rootSk) use ($cSk): array {
+    $a32 = hex2bin($aHex);
+    $slot = hash("sha256", "HUMOCO_SYNC_SLOT_V1" . $a32 . $dsTag32, true);
+    $cl = $dsTag32;
+    $cd = hash("sha256", "HUMOCO_CAUSAL_OUTPUT_V1" . $a32 . $slot . $pSlot32 . chr($ob) . pack("V", $depth) . $cl . $senderPk . $recvHash . "\x00" . str_repeat("\0", 32), true);
+    $csig = sodium_crypto_sign_detached($cd, $senderSk);
+    $hasRoot = ($depth === 0) ? "\x01" : "\x00";
+    $rsig = ($depth === 0) ? sodium_crypto_sign_detached(hash("sha256", "HUMOCO_ROOT_MIG_AUTH_V1" . $a32 . $slot . $senderPk, true), $rootSk) : str_repeat("\0", 64);
+    for ($n = 0;; $n++) { $h = hash("sha256", "HUMOCO_LOCK_POW_V1" . $slot . $cl . pack("V", $depth) . pack("P", $n), true); if (ord($h[0]) === 0) break; }
+    $wire = "HMLK\x01" . $slot . $pSlot32 . chr($ob) . pack("V", $depth) . $cl . $senderPk . $recvHash . "\x00" . str_repeat("\0", 32) . $csig . $hasRoot . $rsig . str_repeat("\x33", 265) . pack("P", $n);
+    return [$slot, bin2hex($wire)];
+  };
+
+  $s1 = $mkSrv($u1, $pk1, $lp1); $s2 = $mkSrv($u2, $pk2, $lp2); $s3 = $mkSrv($u3, $pk3, $lp3);
+  $t0 = time() - 10;
+  [$aid, $m1] = $mkMan([$s1], 1, $t0 * 1000);
+  $b1Hex = hash("sha256", "HUMOCO_SYNC_BUCKET_V1" . hex2bin($aid) . hex2bin($lp1));
+  [, $tRes] = $issueT($u1, $sk1, $pk1, $aid, $q);
+
+  // Pick two root entries A and B where slotB < slotA, and write A first then B second!
+  $k0 = sodium_crypto_sign_seed_keypair(str_repeat(chr(61), 32));
+  $k1 = sodium_crypto_sign_seed_keypair(str_repeat(chr(62), 32));
+  $k2 = sodium_crypto_sign_seed_keypair(str_repeat(chr(63), 32));
+  $r0Sk = sodium_crypto_sign_secretkey($k0); $r0Pk = sodium_crypto_sign_publickey($k0);
+  $r1Sk = sodium_crypto_sign_secretkey($k1); $r1Pk = sodium_crypto_sign_publickey($k1);
+  $r2Hash = hash("sha3-256", sodium_crypto_sign_publickey($k2), true);
+  $r1Hash = hash("sha3-256", $r1Pk, true);
+
+  [$slotA, $hexA] = $mkEntry($aid, str_repeat("\x11", 32), str_repeat("\0", 32), 0, 0, $r0Sk, $r0Pk, $r1Hash, $cSk);
+  [$slotB, $hexB] = $mkEntry($aid, str_repeat("\x22", 32), str_repeat("\0", 32), 0, 0, $r0Sk, $r0Pk, $r1Hash, $cSk);
+  if (strcmp($slotB, $slotA) >= 0) {
+    // Swap so $slotB < $slotA lexicographically
+    [$slotA, $hexA, $slotB, $hexB] = [$slotB, $hexB, $slotA, $hexA];
+  }
+  [$cA, ] = $post("$u1/sync.php?lock", json_encode(["anchor_id" => $aid, "bucket" => $b1Hex, "recipient_nonce" => bin2hex(random_bytes(32)), "entries" => [$hexA], "manifest" => $m1, "genesis_ticket" => $tRes["ticket"], "known_head_receipt" => null]));
+  [$cB, $resB] = $post("$u1/sync.php?lock", json_encode(["anchor_id" => $aid, "bucket" => $b1Hex, "recipient_nonce" => bin2hex(random_bytes(32)), "entries" => [$hexB], "manifest" => null, "genesis_ticket" => null, "known_head_receipt" => null]));
+  if ($cA !== 200 || $cB !== 200) throw new RuntimeException("pre-rotation writes failed $cA/$cB");
+  $kr2 = $resB["receipts"][0]; // write_seq=2, bucket_head from A->B order
+
+  // Rotate [u1] -> [u1, u2] (0s pure growth)
+  $prop12 = $mkProp($aid, 1, 2, 2, [$s1, $s2], $t0);
+  [, $pr12] = $post("$u1/sync.php?lock_freeze", json_encode(["action" => "propose", "proposal" => $prop12]));
+  $imp12Req = json_encode(["anchor_id" => $aid, "active_manifest" => $m1, "proposal" => $prop12, "snapshots" => [$pr12["snapshot_export"]], "quorum_certificates" => []]);
+  [, $i1] = $post("$u1/sync.php?lock_import", $imp12Req);
+  [, $i2] = $post("$u2/sync.php?lock_import", $imp12Req);
+  $acks = [$i1["import_ack"], $i2["import_ack"]]; $ish = $i1["import_ack"]["imported_state_hash"];
+  [, $sc1] = $post("$u1/sync.php?lock_commit", json_encode(["action" => "sign_commit", "anchor_id" => $aid, "proposal" => $prop12, "imported_state_hash" => $ish, "import_acks" => $acks]));
+  $m2 = ["revision" => 2, "threshold" => 2, "servers" => [$s1, $s2], "successors" => [], "authority" => $m1["authority"], "migration_chain" => [["anchor_id" => $aid, "genesis_manifest" => $m1, "proposal" => $prop12, "imported_state_hash" => $ish, "import_acks" => $acks, "commit_sigs" => [$sc1["committee_signature"]]]], "issued_at_ms" => $t0 * 1000, "retain_until_quarter" => $q];
+  $post("$u1/sync.php?lock_commit", json_encode(["action" => "finalize", "anchor_id" => $aid, "new_manifest" => $m2]));
+  $post("$u2/sync.php?lock_commit", json_encode(["action" => "finalize", "anchor_id" => $aid, "new_manifest" => $m2]));
+
+  // Submit spend entryC (child of A) to u1 presenting genuine pre-rotation receipt kr2!
+  [, $hexC] = $mkEntry($aid, str_repeat("\x33", 32), $slotA, 0, 1, $r1Sk, $r1Pk, $r2Hash, null);
+  [$afterCode, $afterBody] = $post("$u1/sync.php?lock", json_encode(["anchor_id" => $aid, "bucket" => $b1Hex, "recipient_nonce" => bin2hex(random_bytes(32)), "entries" => [$hexC], "manifest" => null, "genesis_ticket" => null, "known_head_receipt" => $kr2]));
+
+  // Also test missing-slot catchup on u2 in [u1, u2] -> [u1, u2, u3] when u2 has A+B (seq=2) and u1 adds C (seq=3): u2 advances 2->3 and keeps kr2 valid!
+  // Let us write entryC to u2 without kr2? Wait: u2 got C? Actually u2 was active too! Let us write entryC to u2 (without writing to u1, no we already wrote C to u1; let us write D (child of B) ONLY to u2, then rotate [u1,u2]->[u1,u2,u3], and present kr2 (seq=2) to u1 where u1 imported D and advanced 3->4? Wait: after entryC, u1 is at seq=3, kr3 is receipt from entryC!).
+  $kr3 = $afterBody["receipts"][0] ?? null;
+  $b2Hex = hash("sha256", "HUMOCO_SYNC_BUCKET_V1" . hex2bin($aid) . hex2bin($lp2));
+  [, $hexD] = $mkEntry($aid, str_repeat("\x44", 32), $slotB, 0, 1, $r1Sk, $r1Pk, $r2Hash, null);
+  $post("$u2/sync.php?lock", json_encode(["anchor_id" => $aid, "bucket" => $b2Hex, "recipient_nonce" => bin2hex(random_bytes(32)), "entries" => [$hexD], "manifest" => null, "genesis_ticket" => null, "known_head_receipt" => null]));
+  $prop23 = $mkProp($aid, 2, 3, 2, [$s1, $s2, $s3], $t0);
+  [, $pr23_1] = $post("$u1/sync.php?lock_freeze", json_encode(["action" => "propose", "proposal" => $prop23]));
+  [, $pr23_2] = $post("$u2/sync.php?lock_freeze", json_encode(["action" => "propose", "proposal" => $prop23]));
+  $imp23Req = json_encode(["anchor_id" => $aid, "active_manifest" => $m2, "proposal" => $prop23, "snapshots" => [$pr23_1["snapshot_export"], $pr23_2["snapshot_export"]], "quorum_certificates" => []]);
+  [, $i23_1] = $post("$u1/sync.php?lock_import", $imp23Req);
+  [, $i23_2] = $post("$u2/sync.php?lock_import", $imp23Req);
+  [, $i23_3] = $post("$u3/sync.php?lock_import", $imp23Req);
+  $acks23 = [$i23_1["import_ack"], $i23_2["import_ack"], $i23_3["import_ack"]]; $ish23 = $i23_1["import_ack"]["imported_state_hash"];
+  [, $sc23_1] = $post("$u1/sync.php?lock_commit", json_encode(["action" => "sign_commit", "anchor_id" => $aid, "proposal" => $prop23, "imported_state_hash" => $ish23, "import_acks" => $acks23]));
+  [, $sc23_2] = $post("$u2/sync.php?lock_commit", json_encode(["action" => "sign_commit", "anchor_id" => $aid, "proposal" => $prop23, "imported_state_hash" => $ish23, "import_acks" => $acks23]));
+  $m3 = ["revision" => 3, "threshold" => 2, "servers" => [$s1, $s2, $s3], "successors" => [], "authority" => $m1["authority"], "migration_chain" => array_merge($m2["migration_chain"], [["anchor_id" => $aid, "genesis_manifest" => null, "proposal" => $prop23, "imported_state_hash" => $ish23, "import_acks" => $acks23, "commit_sigs" => [$sc23_1["committee_signature"], $sc23_2["committee_signature"]]]]), "issued_at_ms" => $t0 * 1000, "retain_until_quarter" => $q];
+  $post("$u1/sync.php?lock_commit", json_encode(["action" => "finalize", "anchor_id" => $aid, "new_manifest" => $m3]));
+  // Present pre-rotation kr3 (write_seq=3) on u1 with retry of hexC (idempotent): u1 imported D so write_seq=4 >= 3 -> MUST return 200!
+  [$catchupCode, $catchupBody] = $post("$u1/sync.php?lock", json_encode(["anchor_id" => $aid, "bucket" => $b1Hex, "recipient_nonce" => bin2hex(random_bytes(32)), "entries" => [$hexC], "manifest" => null, "genesis_ticket" => null, "known_head_receipt" => $kr3]));
+
+  echo json_encode([
+    "after_code" => $afterCode,
+    "after_ws" => $afterBody["receipts"][0]["write_seq"] ?? -1,
+    "after_err" => $afterBody["error"] ?? "",
+    "catchup_code" => $catchupCode,
+    "catchup_ws" => $catchupBody["receipts"][0]["write_seq"] ?? -1,
+  ]);
+' "$B11_1_URL" "$B11_1_SK" "$B11_1_PK" "$B11_1_LP" "$B11_2_URL" "$B11_2_SK" "$B11_2_PK" "$B11_2_LP" "$B11_3_URL" "$B11_3_PK" "$B11_3_LP" "$QTR")"
+
+assert_contains "$B11_OUT" '"after_code":200' "SYNC-S07-09: pre-rotation known_head_receipt succeeds after out-of-order slot import (200)"
+assert_contains "$B11_OUT" '"after_ws":3' "SYNC-S07-09: post-rotation write_seq advances monotonically from 2 to 3"
+assert_contains "$B11_OUT" '"catchup_code":200' "SYNC-S07-09: pre-rotation receipt succeeds after union catchup import (200)"
+assert_contains "$B11_OUT" '"catchup_ws":4' "SYNC-S07-09: union catchup advances write_seq monotonically from 3 to 4"
+
+echo ""
+echo "=== Test 12: SYNC-S07-10 full migration_chain prefix consistency on lock_import & finalize ==="
+B12_OUT="$(php -r '
+  $u1 = $argv[1]; $sk1 = $argv[2]; $pk1 = $argv[3]; $lp1 = $argv[4];
+  $u2 = $argv[5]; $pk2 = $argv[6]; $lp2 = $argv[7];
+  $u3 = $argv[8]; $pk3 = $argv[9]; $lp3 = $argv[10];
+  $q = (int)$argv[11];
+  $post = static function (string $u, string $body, array $hdrs = []): array {
+    $ch = curl_init($u);
+    curl_setopt_array($ch, [CURLOPT_POST => true, CURLOPT_POSTFIELDS => $body, CURLOPT_HTTPHEADER => array_merge(["Content-Type: application/json"], $hdrs), CURLOPT_RETURNTRANSFER => true]);
+    $resp = curl_exec($ch); $code = curl_getinfo($ch, CURLINFO_HTTP_CODE); curl_close($ch);
+    return [$code, json_decode((string)$resp, true) ?: []];
+  };
+  $issueT = static function (string $u, string $sk, string $pk, string $aHex, int $q) use ($post): array {
+    $body = json_encode(["anchor_id" => $aHex, "retain_until_quarter" => $q, "pow_timestamp" => null, "pow_nonce" => null]);
+    $ts = time(); $nonce = bin2hex(random_bytes(16));
+    $msg = "HUMOCO-DROP-REQ-V1\nPOST\nlock_ticket\n\n{$ts}\n{$nonce}\n" . hash("sha256", $body);
+    $sig = bin2hex(sodium_crypto_sign_detached($msg, hex2bin($sk) . hex2bin($pk)));
+    return $post("$u/sync.php?lock_ticket", $body, ["X-Drop-Pubkey: $pk", "X-Drop-Timestamp: $ts", "X-Drop-Nonce: $nonce", "X-Drop-Signature: $sig"]);
+  };
+  $cKp = sodium_crypto_sign_seed_keypair(hash("sha256", "B12_CREATOR", true));
+  $cSk = sodium_crypto_sign_secretkey($cKp); $cPk = bin2hex(sodium_crypto_sign_publickey($cKp));
+  $mkSyn = static function (string $label): array {
+    $akp = sodium_crypto_sign_seed_keypair(hash("sha256", "B12_ADM_$label", true));
+    $lkp = sodium_crypto_sign_seed_keypair(hash("sha256", "B12_LCK_$label", true));
+    return [
+      "srv" => ["write_url" => "http://127.0.0.1:9/sync.php", "read_url" => "http://127.0.0.1:9/d", "admin_pub" => bin2hex(sodium_crypto_sign_publickey($akp)), "lock_pub" => bin2hex(sodium_crypto_sign_publickey($lkp)), "nominated_by" => "creator"],
+      "sk" => sodium_crypto_sign_secretkey($lkp),
+      "lp" => bin2hex(sodium_crypto_sign_publickey($lkp)),
+    ];
+  };
+  $syn4 = $mkSyn("S4"); $syn5 = $mkSyn("S5"); $syn6 = $mkSyn("S6");
+  $s1 = ["write_url" => "$u1/sync.php", "read_url" => "$u1/humoco_sync_data", "admin_pub" => $pk1, "lock_pub" => $lp1, "nominated_by" => "creator"];
+  $s2 = ["write_url" => "$u2/sync.php", "read_url" => "$u2/humoco_sync_data", "admin_pub" => $pk2, "lock_pub" => $lp2, "nominated_by" => "creator"];
+  $s3 = ["write_url" => "$u3/sync.php", "read_url" => "$u3/humoco_sync_data", "admin_pub" => $pk3, "lock_pub" => $lp3, "nominated_by" => "creator"];
+  $s4 = $syn4["srv"]; $s5 = $syn5["srv"]; $s6 = $syn6["srv"];
+
+  $t0 = time() - 10;
+  $m1 = ["revision" => 1, "threshold" => 2, "servers" => [$s1, $s4, $s5], "successors" => [], "authority" => ["creator_mig_pub" => $cPk, "guarantor_mig_pubs" => []], "migration_chain" => [], "issued_at_ms" => $t0 * 1000, "retain_until_quarter" => $q];
+  $sBin = ""; foreach ($m1["servers"] as $s) $sBin .= hex2bin($s["admin_pub"]) . hex2bin($s["lock_pub"]) . "\x00";
+  $aid = bin2hex(hash("sha256", "HUMOCO_ANCHOR_MANIFEST_V1\x00" . pack("P", 1) . chr(2) . chr(3) . $sBin . pack("v", 0) . hex2bin($cPk) . "\x00" . pack("P", $t0 * 1000) . pack("v", $q), true));
+  $a32 = hex2bin($aid);
+
+  $mkProp = static function (int $from, int $to, int $thr, array $srvs, int $ts) use ($aid, $a32, $cSk, $q): array {
+    $sb = ""; foreach ($srvs as $s) $sb .= hex2bin($s["admin_pub"]) . hex2bin($s["lock_pub"]) . "\x00";
+    $dig = hash("sha256", "HUMOCO_MIGRATION_PROP_V1" . $a32 . pack("P", $from) . pack("P", $to) . chr($thr) . chr(count($srvs)) . $sb . pack("v", 0) . pack("v", $q) . pack("P", $ts) . "\x00", true);
+    return ["anchor_id" => $aid, "from_rev" => $from, "to_rev" => $to, "new_threshold" => $thr, "new_servers" => $srvs, "new_successors" => [], "retain_until_quarter" => $q, "proposed_at" => $ts, "initiator" => ["kind" => "creator"], "proposer_sig" => bin2hex(sodium_crypto_sign_detached($dig, $cSk)), "guarantor_cosigs" => []];
+  };
+  $propDig = static function (array $prop) use ($a32): string {
+    $sb = ""; foreach ($prop["new_servers"] as $s) $sb .= hex2bin($s["admin_pub"]) . hex2bin($s["lock_pub"]) . "\x00";
+    return hash("sha256", "HUMOCO_MIGRATION_PROP_V1" . $a32 . pack("P", $prop["from_rev"]) . pack("P", $prop["to_rev"]) . chr($prop["new_threshold"]) . chr(count($prop["new_servers"])) . $sb . pack("v", 0) . pack("v", $prop["retain_until_quarter"]) . pack("P", $prop["proposed_at"]) . "\x00", true);
+  };
+  $mkSnap = static function (array $syn, int $fromRev, string $pDig, int $ts) use ($aid, $a32, $q): array {
+    $lp = hex2bin($syn["lp"]);
+    $bk = hash("sha256", "HUMOCO_SYNC_BUCKET_V1" . $a32 . $lp, true);
+    $bh = hash("sha256", "HUMOCO_BUCKET_INIT_V1" . $bk . pack("v", $q), true);
+    $sh = hash("sha256", "HUMOCO_FREEZE_STATE_V1" . $a32 . pack("P", $fromRev) . pack("P", 0) . pack("P", 0), true);
+    $pre = "HUMOCO_FREEZE_SNAP_V1" . $a32 . $bk . pack("P", $fromRev) . pack("v", $q) . pack("P", 0) . $bh . $sh . "\x01\x01" . $pDig . pack("P", $ts) . pack("P", 0) . $lp;
+    return [
+      "snapshot" => ["anchor_id" => $aid, "lock_pub" => $syn["lp"], "bucket" => bin2hex($bk), "from_rev" => $fromRev, "retain_until_quarter" => $q, "write_seq" => 0, "bucket_head" => bin2hex($bh), "state_hash" => bin2hex($sh), "permanent" => true, "proposal_hash" => bin2hex($pDig), "frozen_at" => $ts, "expires_at" => null, "sig" => bin2hex(sodium_crypto_sign_detached(hash("sha256", $pre, true), $syn["sk"]))],
+      "entries" => [], "conflicts" => [],
+    ];
+  };
+  $mkAck = static function (array $syn, string $pDig, int $toRev, string $ishHex, int $ts) use ($aid, $a32, $q): array {
+    $lp = hex2bin($syn["lp"]);
+    $dig = hash("sha256", "HUMOCO_IMPORT_ACK_V1" . $a32 . $pDig . pack("P", $toRev) . hex2bin($ishHex) . pack("v", $q) . $lp . pack("P", $ts), true);
+    return ["anchor_id" => $aid, "proposal_hash" => bin2hex($pDig), "to_rev" => $toRev, "imported_state_hash" => $ishHex, "retain_until_quarter" => $q, "lock_pub" => $syn["lp"], "acked_at" => $ts, "sig" => bin2hex(sodium_crypto_sign_detached($dig, $syn["sk"]))];
+  };
+  $mkCommitSig = static function (array $syn, string $pDig, int $toRev, string $ishHex, int $ts) use ($a32): array {
+    $dig = hash("sha256", "HUMOCO_MIGRATION_CERT_V1" . $a32 . $pDig . pack("P", $toRev) . hex2bin($ishHex), true);
+    return ["lock_pub" => $syn["lp"], "committed_at" => $ts, "sig" => bin2hex(sodium_crypto_sign_detached($dig, $syn["sk"]))];
+  };
+
+  // 1. Bootstrap m1 on u1 & u2, and pre-collect u1/u2 import_acks for forked branch B (m1 -> m2B with proposed_at = t0+1) before finalizing m2A.
+  [, $tRes] = $issueT($u1, $sk1, $pk1, $aid, $q);
+  $rkp = sodium_crypto_sign_seed_keypair(str_repeat(chr(71), 32));
+  $slot = hash("sha256", "HUMOCO_SYNC_SLOT_V1" . $a32 . str_repeat("\x12", 32), true);
+  $cl = str_repeat("\x12", 32);
+  $rHash = hash("sha3-256", sodium_crypto_sign_publickey($rkp), true);
+  $cd = hash("sha256", "HUMOCO_CAUSAL_OUTPUT_V1" . $a32 . $slot . str_repeat("\0", 32) . "\x00" . pack("V", 0) . $cl . sodium_crypto_sign_publickey($rkp) . $rHash . "\x00" . str_repeat("\0", 32), true);
+  $rsig = sodium_crypto_sign_detached(hash("sha256", "HUMOCO_ROOT_MIG_AUTH_V1" . $a32 . $slot . sodium_crypto_sign_publickey($rkp), true), $cSk);
+  for ($n = 0;; $n++) { $h = hash("sha256", "HUMOCO_LOCK_POW_V1" . $slot . $cl . pack("V", 0) . pack("P", $n), true); if (ord($h[0]) === 0) break; }
+  $hexE = bin2hex("HMLK\x01" . $slot . str_repeat("\0", 32) . "\x00" . pack("V", 0) . $cl . sodium_crypto_sign_publickey($rkp) . $rHash . "\x00" . str_repeat("\0", 32) . sodium_crypto_sign_detached($cd, sodium_crypto_sign_secretkey($rkp)) . "\x01" . $rsig . str_repeat("\x33", 265) . pack("P", $n));
+  $b1Hex = hash("sha256", "HUMOCO_SYNC_BUCKET_V1" . $a32 . hex2bin($lp1));
+  $post("$u1/sync.php?lock", json_encode(["anchor_id" => $aid, "bucket" => $b1Hex, "recipient_nonce" => bin2hex(random_bytes(32)), "entries" => [$hexE], "manifest" => $m1, "genesis_ticket" => $tRes["ticket"], "known_head_receipt" => null]));
+
+  $prop12A = $mkProp(1, 2, 3, [$s1, $s2, $s4, $s5], $t0);
+  $prop12B = $mkProp(1, 2, 3, [$s1, $s2, $s4, $s5], $t0 + 1); // same committee/thr, distinct proposed_at
+  $pd12A = $propDig($prop12A); $pd12B = $propDig($prop12B);
+  [, $pr12A] = $post("$u1/sync.php?lock_freeze", json_encode(["action" => "propose", "proposal" => $prop12A]));
+
+  // Collect u1/u2 import_acks for m2B using synthetic snapshots from s4+s5 (quorum=2) while u1/u2 are still rev 1.
+  $imp12BReq = json_encode(["anchor_id" => $aid, "active_manifest" => $m1, "proposal" => $prop12B, "snapshots" => [$mkSnap($syn4, 1, $pd12B, $t0), $mkSnap($syn5, 1, $pd12B, $t0)], "quorum_certificates" => []]);
+  [, $i1B] = $post("$u1/sync.php?lock_import", $imp12BReq);
+  [, $i2B] = $post("$u2/sync.php?lock_import", $imp12BReq);
+  $ish12B = $i1B["import_ack"]["imported_state_hash"];
+  $acks12B = [$i1B["import_ack"], $i2B["import_ack"], $mkAck($syn4, $pd12B, 2, $ish12B, $t0), $mkAck($syn5, $pd12B, 2, $ish12B, $t0)];
+  $m2B = ["revision" => 2, "threshold" => 3, "servers" => [$s1, $s2, $s4, $s5], "successors" => [], "authority" => $m1["authority"], "migration_chain" => [["anchor_id" => $aid, "genesis_manifest" => $m1, "proposal" => $prop12B, "imported_state_hash" => $ish12B, "import_acks" => $acks12B, "commit_sigs" => [$mkCommitSig($syn4, $pd12B, 2, $ish12B, $t0), $mkCommitSig($syn5, $pd12B, 2, $ish12B, $t0)]]], "issued_at_ms" => ($t0 + 1) * 1000, "retain_until_quarter" => $q];
+
+  // Construct standalone forked branch B2 (m1 -> m2B_alt=[s4,s5] -> m3B_alt=[s4,s5,s6] -> m4B_alt=[s4,s5]) completely in PHP!
+  $prop12BAlt = $mkProp(1, 2, 2, [$s4, $s5], $t0 + 2); $pd12BA = $propDig($prop12BAlt);
+  $ish12BA = bin2hex(hash("sha256", "HUMOCO_IMPORT_STATE_V1" . $a32 . pack("P", 2) . pack("P", 0), true));
+  $m2BAlt = ["revision" => 2, "threshold" => 2, "servers" => [$s4, $s5], "successors" => [], "authority" => $m1["authority"], "migration_chain" => [["anchor_id" => $aid, "genesis_manifest" => $m1, "proposal" => $prop12BAlt, "imported_state_hash" => $ish12BA, "import_acks" => [$mkAck($syn4, $pd12BA, 2, $ish12BA, $t0), $mkAck($syn5, $pd12BA, 2, $ish12BA, $t0)], "commit_sigs" => [$mkCommitSig($syn4, $pd12BA, 2, $ish12BA, $t0), $mkCommitSig($syn5, $pd12BA, 2, $ish12BA, $t0)]]], "issued_at_ms" => ($t0 + 2) * 1000, "retain_until_quarter" => $q];
+  $prop23BAlt = $mkProp(2, 3, 2, [$s4, $s5, $s6], $t0 + 2); $pd23BA = $propDig($prop23BAlt);
+  $ish23BA = bin2hex(hash("sha256", "HUMOCO_IMPORT_STATE_V1" . $a32 . pack("P", 3) . pack("P", 0), true));
+  $m3BAlt = ["revision" => 3, "threshold" => 2, "servers" => [$s4, $s5, $s6], "successors" => [], "authority" => $m1["authority"], "migration_chain" => array_merge($m2BAlt["migration_chain"], [["anchor_id" => $aid, "genesis_manifest" => null, "proposal" => $prop23BAlt, "imported_state_hash" => $ish23BA, "import_acks" => [$mkAck($syn4, $pd23BA, 3, $ish23BA, $t0), $mkAck($syn5, $pd23BA, 3, $ish23BA, $t0), $mkAck($syn6, $pd23BA, 3, $ish23BA, $t0)], "commit_sigs" => [$mkCommitSig($syn4, $pd23BA, 3, $ish23BA, $t0), $mkCommitSig($syn5, $pd23BA, 3, $ish23BA, $t0)]]]), "issued_at_ms" => ($t0 + 2) * 1000, "retain_until_quarter" => $q];
+  $prop34BFin = $mkProp(3, 4, 2, [$s4, $s5], $t0 + 3); $pd34BF = $propDig($prop34BFin);
+  $ish34BF = bin2hex(hash("sha256", "HUMOCO_IMPORT_STATE_V1" . $a32 . pack("P", 4) . pack("P", 0), true));
+  $m4BAlt = ["revision" => 4, "threshold" => 2, "servers" => [$s4, $s5], "successors" => [], "authority" => $m1["authority"], "migration_chain" => array_merge($m3BAlt["migration_chain"], [["anchor_id" => $aid, "genesis_manifest" => null, "proposal" => $prop34BFin, "imported_state_hash" => $ish34BF, "import_acks" => [$mkAck($syn4, $pd34BF, 4, $ish34BF, $t0), $mkAck($syn5, $pd34BF, 4, $ish34BF, $t0)], "commit_sigs" => [$mkCommitSig($syn4, $pd34BF, 4, $ish34BF, $t0), $mkCommitSig($syn5, $pd34BF, 4, $ish34BF, $t0)]]]), "issued_at_ms" => ($t0 + 3) * 1000, "retain_until_quarter" => $q];
+  $prop34BImp = $mkProp(3, 4, 3, [$s1, $s4, $s5, $s6], $t0 + 4); // pure growth adding s1 from m3BAlt (N=4 requires thr>=3)
+
+  // 2. Finalize canonical m2A on u1 & u2
+  $imp12AReq = json_encode(["anchor_id" => $aid, "active_manifest" => $m1, "proposal" => $prop12A, "snapshots" => [$pr12A["snapshot_export"], $mkSnap($syn4, 1, $pd12A, $t0)], "quorum_certificates" => []]);
+  [, $i1A] = $post("$u1/sync.php?lock_import", $imp12AReq);
+  [, $i2A] = $post("$u2/sync.php?lock_import", $imp12AReq);
+  $ish12A = $i1A["import_ack"]["imported_state_hash"];
+  $acks12A = [$i1A["import_ack"], $i2A["import_ack"], $mkAck($syn4, $pd12A, 2, $ish12A, $t0), $mkAck($syn5, $pd12A, 2, $ish12A, $t0)];
+  [, $sc1A] = $post("$u1/sync.php?lock_commit", json_encode(["action" => "sign_commit", "anchor_id" => $aid, "proposal" => $prop12A, "imported_state_hash" => $ish12A, "import_acks" => $acks12A]));
+  $m2A = ["revision" => 2, "threshold" => 3, "servers" => [$s1, $s2, $s4, $s5], "successors" => [], "authority" => $m1["authority"], "migration_chain" => [["anchor_id" => $aid, "genesis_manifest" => $m1, "proposal" => $prop12A, "imported_state_hash" => $ish12A, "import_acks" => $acks12A, "commit_sigs" => [$sc1A["committee_signature"], $mkCommitSig($syn4, $pd12A, 2, $ish12A, $t0)]]], "issued_at_ms" => $t0 * 1000, "retain_until_quarter" => $q];
+  $post("$u1/sync.php?lock_commit", json_encode(["action" => "finalize", "anchor_id" => $aid, "new_manifest" => $m2A]));
+  $post("$u2/sync.php?lock_commit", json_encode(["action" => "finalize", "anchor_id" => $aid, "new_manifest" => $m2A]));
+
+  // Test Case 1 (positive control): linear continuation m2A -> m3A MUST return 200
+  $prop23A = $mkProp(2, 3, 3, [$s1, $s2, $s3, $s4, $s5], $t0); $pd23A = $propDig($prop23A);
+  [, $pr23A1] = $post("$u1/sync.php?lock_freeze", json_encode(["action" => "propose", "proposal" => $prop23A]));
+  [, $pr23A2] = $post("$u2/sync.php?lock_freeze", json_encode(["action" => "propose", "proposal" => $prop23A]));
+  $imp23AReq = json_encode(["anchor_id" => $aid, "active_manifest" => $m2A, "proposal" => $prop23A, "snapshots" => [$pr23A1["snapshot_export"], $pr23A2["snapshot_export"], $mkSnap($syn4, 2, $pd23A, $t0)], "quorum_certificates" => []]);
+  [, $i23A1] = $post("$u1/sync.php?lock_import", $imp23AReq);
+  [, $i23A2] = $post("$u2/sync.php?lock_import", $imp23AReq);
+  [, $i23A3] = $post("$u3/sync.php?lock_import", $imp23AReq);
+  $ish23A = $i23A1["import_ack"]["imported_state_hash"];
+  $acks23A = [$i23A1["import_ack"], $i23A2["import_ack"], $i23A3["import_ack"], $mkAck($syn4, $pd23A, 3, $ish23A, $t0), $mkAck($syn5, $pd23A, 3, $ish23A, $t0)];
+  [, $sc23A1] = $post("$u1/sync.php?lock_commit", json_encode(["action" => "sign_commit", "anchor_id" => $aid, "proposal" => $prop23A, "imported_state_hash" => $ish23A, "import_acks" => $acks23A]));
+  [, $sc23A2] = $post("$u2/sync.php?lock_commit", json_encode(["action" => "sign_commit", "anchor_id" => $aid, "proposal" => $prop23A, "imported_state_hash" => $ish23A, "import_acks" => $acks23A]));
+  $cert1A = ["anchor_id" => $aid, "genesis_manifest" => null, "proposal" => $prop23A, "imported_state_hash" => $ish23A, "import_acks" => $acks23A, "commit_sigs" => [$sc23A1["committee_signature"], $sc23A2["committee_signature"], $mkCommitSig($syn4, $pd23A, 3, $ish23A, $t0)]];
+  $m3A = ["revision" => 3, "threshold" => 3, "servers" => [$s1, $s2, $s3, $s4, $s5], "successors" => [], "authority" => $m1["authority"], "migration_chain" => [$m2A["migration_chain"][0], $cert1A], "issued_at_ms" => $t0 * 1000, "retain_until_quarter" => $q];
+  [$linCode, ] = $post("$u1/sync.php?lock_commit", json_encode(["action" => "finalize", "anchor_id" => $aid, "new_manifest" => $m3A]));
+
+  // Test Case 2: finalize at rev 3 === exRev(3) where latest cert[1] matches cert1A but prefix cert[0] is cert0_B MUST return 409!
+  $m3SameTailFork = ["revision" => 3, "threshold" => 3, "servers" => [$s1, $s2, $s3, $s4, $s5], "successors" => [], "authority" => $m1["authority"], "migration_chain" => [$m2B["migration_chain"][0], $cert1A], "issued_at_ms" => $t0 * 1000, "retain_until_quarter" => $q];
+  [$finEqTailForkCode, ] = $post("$u1/sync.php?lock_commit", json_encode(["action" => "finalize", "anchor_id" => $aid, "new_manifest" => $m3SameTailFork]));
+
+  // Test Case 3: lock_import at rev 3 -> to_rev 4 with conflicting cert[0] MUST return 409
+  $pd34BI = $propDig($prop34BImp);
+  [$impForkCode, ] = $post("$u1/sync.php?lock_import", json_encode(["anchor_id" => $aid, "active_manifest" => $m3BAlt, "proposal" => $prop34BImp, "snapshots" => [$mkSnap($syn4, 3, $pd34BI, $t0), $mkSnap($syn5, 3, $pd34BI, $t0)], "quorum_certificates" => []]));
+
+  // Test Case 4: finalize at rev 4 > exRev(3) with conflicting cert[0] MUST return 409
+  [$finHigherForkCode, ] = $post("$u1/sync.php?lock_commit", json_encode(["action" => "finalize", "anchor_id" => $aid, "new_manifest" => $m4BAlt]));
+
+  echo json_encode([
+    "imp_fork" => $impForkCode,
+    "fin_higher_fork" => $finHigherForkCode,
+    "lin_ok" => $linCode,
+    "fin_eq_tail_fork" => $finEqTailForkCode,
+  ]);
+' "$B11_1_URL" "$B11_1_SK" "$B11_1_PK" "$B11_1_LP" "$B11_2_URL" "$B11_2_PK" "$B11_2_LP" "$B11_3_URL" "$B11_3_PK" "$B11_3_LP" "$QTR")"
+
+assert_contains "$B12_OUT" '"imp_fork":409' "SYNC-S07-10: lock_import rejects forked migration_chain prefix (409)"
+assert_contains "$B12_OUT" '"fin_higher_fork":409' "SYNC-S07-10: finalize rev > exRev rejects forked migration_chain prefix (409)"
+assert_contains "$B12_OUT" '"lin_ok":200' "SYNC-S07-10: valid linear continuation m2A -> m3A succeeds (200)"
+assert_contains "$B12_OUT" '"fin_eq_tail_fork":409' "SYNC-S07-10: finalize rev === exRev rejects forked prefix cert[0] even with matching latest cert[1] (409)"
+
+echo ""
+echo "=== Test 13: SYNC-S07-11 IPv4-mapped IPv6 & IPv6 /64 rate-limit normalization ==="
+B13_OUT="$(php -r '
+  require $argv[1];
+  $base = $argv[2];
+  $syncSec = static function (): void {
+    $f = microtime(true) - floor(microtime(true));
+    if ($f > 0.6) usleep((int)((1.02 - $f) * 1000000));
+  };
+  $mkPaths = static function (string $sub) use ($base): array {
+    $d = "$base/$sub";
+    $p = lock_paths($d);
+    @mkdir($p["meta"], 0755, true);
+    return $p;
+  };
+
+  // (a) IPv6 /64 prefix grouping: 60 calls across ::1..::3c exhausts 2001:db8:abcd:0001::/64; ::ffff::99 is blocked, distinct /64 is allowed
+  $syncSec();
+  $pA = $mkPaths("rl_a");
+  for ($i = 1; $i <= 60; $i++) {
+    $_SERVER["REMOTE_ADDR"] = sprintf("2001:db8:abcd:0001::%x", $i);
+    if (!lock_ip_ratelimit_allow($pA, false)) throw new RuntimeException("unexpected throttle at $i");
+  }
+  $_SERVER["REMOTE_ADDR"] = "2001:db8:abcd:0001:ffff::99";
+  $same64Allow = lock_ip_ratelimit_allow($pA, false);
+  $_SERVER["REMOTE_ADDR"] = "2001:db8:abcd:0002::1";
+  $other64Allow = lock_ip_ratelimit_allow($pA, false);
+
+  // (b) IPv4-mapped IPv6 normalization: ::ffff:198.51.100.7 shares bucket with 198.51.100.7 (and uppercase ::FFFF:C633:6407 if inet_pton supports it)
+  $syncSec();
+  $pB = $mkPaths("rl_b");
+  for ($i = 1; $i <= 60; $i++) {
+    $_SERVER["REMOTE_ADDR"] = ($i % 2 === 0) ? "::ffff:198.51.100.7" : "::FFFF:c633:6407";
+    if (!lock_ip_ratelimit_allow($pB, false)) throw new RuntimeException("unexpected mapped throttle at $i");
+  }
+  $_SERVER["REMOTE_ADDR"] = "198.51.100.7";
+  $mappedV4Allow = lock_ip_ratelimit_allow($pB, false);
+
+  // (c) ::1 loopback isolation from ::2
+  $syncSec();
+  $pC = $mkPaths("rl_c");
+  for ($i = 1; $i <= 60; $i++) {
+    $_SERVER["REMOTE_ADDR"] = "::1";
+    if (!lock_ip_ratelimit_allow($pC, false)) throw new RuntimeException("unexpected ::1 throttle at $i");
+  }
+  $_SERVER["REMOTE_ADDR"] = "0:0:0:0:0:0:0:1";
+  $loopAliasAllow = lock_ip_ratelimit_allow($pC, false);
+  $_SERVER["REMOTE_ADDR"] = "::2";
+  $nonLoopAllow = lock_ip_ratelimit_allow($pC, false);
+
+  echo json_encode([
+    "same64_allow" => $same64Allow,
+    "other64_allow" => $other64Allow,
+    "mapped_v4_allow" => $mappedV4Allow,
+    "loop_alias_allow" => $loopAliasAllow,
+    "non_loop_allow" => $nonLoopAllow,
+  ]);
+' "${ROOT_DIR}/php/lock_handler.php" "$TMP_DIR")"
+
+assert_contains "$B13_OUT" '"same64_allow":false' "SYNC-S07-11: IPv6 addresses in same /64 share lock rate-limit bucket"
+assert_contains "$B13_OUT" '"other64_allow":true' "SYNC-S07-11: IPv6 address in distinct /64 stays unthrottled"
+assert_contains "$B13_OUT" '"mapped_v4_allow":false' "SYNC-S07-11: ::ffff:a.b.c.d shares lock rate-limit bucket with IPv4"
+assert_contains "$B13_OUT" '"loop_alias_allow":false' "SYNC-S07-11: canonicalized ::1 shares bucket with 0:0:0:0:0:0:0:1"
+assert_contains "$B13_OUT" '"non_loop_allow":true' "SYNC-S07-11: ::1 loopback stays isolated from ::2"
 
 echo ""
 echo "All PHP lock concurrency, rollback, quota & GC tests passed! (${PASS} assertions)"
