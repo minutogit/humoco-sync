@@ -629,6 +629,9 @@ impl SyncDb {
                 heartbeat,
                 current_manifest,
             } => {
+                if heartbeat.timestamp_secs == 0 {
+                    return Err(DbError::http(400, "Invalid CreatorHeartbeat"));
+                }
                 if heartbeat.timestamp_secs > now_secs.saturating_add(60) {
                     return Err(DbError::http(400, "Heartbeat timestamp is in the future"));
                 }
@@ -826,6 +829,9 @@ impl SyncDb {
                 ))
             }
             LockFreezeRequest::Veto { veto } => {
+                if veto.vetoed_at == 0 {
+                    return Err(DbError::http(400, "Invalid MigrationVeto"));
+                }
                 if veto.vetoed_at > now_secs.saturating_add(60) {
                     return Err(DbError::http(400, "Veto timestamp is in the future"));
                 }

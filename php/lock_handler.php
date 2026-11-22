@@ -759,7 +759,7 @@ function lock_serve_static(string $filePath, string $ctype, string $cacheCtrl): 
     exit;
 }
 
-function lock_maybe_handle_cli_router(string $dataDir, string $dataDirSetting, string $configFile): void {
+function lock_maybe_handle_cli_router(string $dataDir, string $dataDirSetting, string $configFile, bool $lockEnabled): void {
     if (PHP_SAPI !== 'cli-server') return;
     $rawPath = (string)(parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/');
     $path = rawurldecode($rawPath);
@@ -769,10 +769,12 @@ function lock_maybe_handle_cli_router(string $dataDir, string $dataDirSetting, s
     $baseData = trim(str_replace('\\', '/', $dataDirSetting), '/');
     if (preg_match('#^/anchors/([0-9a-f]{64})\.bin$#', $path, $mx) || ($baseData !== '' && preg_match('#^/' . preg_quote($baseData, '#') . '/anchors/([0-9a-f]{64})\.bin$#', $path, $mx))) {
         if ($m !== 'GET' && $m !== 'HEAD') { http_response_code(405); header('Allow: GET, HEAD'); exit; }
+        if (!$lockEnabled) { http_response_code(404); exit; }
         lock_serve_static($dataDir . '/anchors/' . $mx[1] . '.bin', 'application/json', 'no-cache');
     }
     if ($baseData !== '' && preg_match('#^/' . preg_quote($baseData, '#') . '/locks/(\d{4}-Q[1-4])/([0-9a-f]{64})/([0-9a-f]{64})\.lock$#', $path, $lx)) {
         if ($m !== 'GET' && $m !== 'HEAD') { http_response_code(405); header('Allow: GET, HEAD'); exit; }
+        if (!$lockEnabled) { http_response_code(404); exit; }
         lock_serve_static($dataDir . "/locks/{$lx[1]}/{$lx[2]}/{$lx[3]}.lock", 'application/octet-stream', 'public, max-age=31536000, immutable');
     }
     if ($baseData !== '' && preg_match('#^/' . preg_quote($baseData, '#') . '/([^/]+)$#', $path, $dx)) {
@@ -791,14 +793,14 @@ function lock_maybe_handle_cli_router(string $dataDir, string $dataDirSetting, s
 
 function lock_maybe_handle_request(array $config, string $configFile, string $dataDir, string $dataDirSetting, bool $disableRateLimit): void {
     if (PHP_VERSION_ID < 80100) { http_response_code(500); header('Content-Type: application/json'); echo "{\"error\":\"PHP >= 8.1 required\"}\n"; exit; }
-    lock_maybe_handle_cli_router($dataDir, $dataDirSetting, $configFile);
+    $cfg = lock_cfg($config);
+    lock_maybe_handle_cli_router($dataDir, $dataDirSetting, $configFile, $cfg['enabled']);
     $method = strtoupper((string)($_SERVER['REQUEST_METHOD'] ?? 'GET'));
     $isLockRoute = isset($_GET['lock_selftest']) || isset($_GET['lock_delegate']) || isset($_GET['lock_ticket'])
         || isset($_GET['lock']) || isset($_GET['lock_freeze']) || isset($_GET['lock_import']) || isset($_GET['lock_commit']) || isset($_GET['__anchor']);
     if (!$isLockRoute) return;
     try {
         @ignore_user_abort(true); @set_time_limit(30);
-        $cfg = lock_cfg($config);
         $p = lock_paths($dataDir);
         if (isset($_GET['__anchor'])) {
             if ($method !== 'GET' && $method !== 'HEAD') { header('Allow: GET, HEAD'); lock_fail(405, 'Method not allowed'); }

@@ -2010,4 +2010,48 @@ assert_contains "$B16_OUT" '"unr_cs_ok":true' "SYNC-S09-12: unresolved split yie
 assert_contains "$B16_OUT" '"child_ok":200' "SYNC-S09-12: child spend on surviving conflict parent commits cleanly post-rotation (200)"
 
 echo ""
+echo "=== Test 17: S09-F3 CLI Router Gating When lock.enabled = false ==="
+read -r _B17_SK B17_PK <<< "$("$SERVER_BIN" sign-test keygen)"
+B17_PORT="$(pick_free_port)"
+B17_DOC="$TMP_DIR/b17_doc"
+mkdir -p "$B17_DOC/humoco_sync_data/anchors" "$B17_DOC/humoco_sync_data/locks/2031-Q2/$(printf 'aa%.0s' {1..32})"
+cp "${ROOT_DIR}/php/sync.php" "${ROOT_DIR}/php/lock_handler.php" "${ROOT_DIR}/php/lock_rotation.php" "${ROOT_DIR}/php/index.html" "${ROOT_DIR}/php/robots.txt" "$B17_DOC/"
+B17_AID="$(printf 'bb%.0s' {1..32})"
+B17_BKT="$(printf 'aa%.0s' {1..32})"
+B17_FILE="$(printf 'cc%.0s' {1..32})"
+echo '{"revision":1}' > "$B17_DOC/humoco_sync_data/anchors/${B17_AID}.bin"
+printf 'HMLK\x01' > "$B17_DOC/humoco_sync_data/locks/2031-Q2/${B17_BKT}/${B17_FILE}.lock"
+cat > "$B17_DOC/config.php" <<EOF
+<?php
+return [
+    'admin_pubkey' => '${B17_PK}',
+    'data_dir' => 'humoco_sync_data',
+    'max_members' => 300,
+    'max_total_storage_mb' => 64,
+    'disable_rate_limit' => true,
+    'channels' => ['card' => ['max_bytes' => 524288, 'ttl_days' => 0]],
+    'lock' => ['enabled' => false],
+];
+EOF
+PHP_CLI_SERVER_WORKERS=1 php -S "127.0.0.1:${B17_PORT}" -t "$B17_DOC" "$B17_DOC/sync.php" > "$TMP_DIR/b17.log" 2>&1 &
+PHP_PID=$!
+for _ in $(seq 1 40); do
+  if curl -sf "http://127.0.0.1:${B17_PORT}/sync.php?info" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.1
+done
+B17_C1="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${B17_PORT}/anchors/${B17_AID}.bin")"
+B17_C2="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${B17_PORT}/humoco_sync_data/anchors/${B17_AID}.bin")"
+B17_C3="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${B17_PORT}/humoco_sync_data/locks/2031-Q2/${B17_BKT}/${B17_FILE}.lock")"
+B17_C4="$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:${B17_PORT}/anchors/${B17_AID}.bin")"
+B17_C5="$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:${B17_PORT}/humoco_sync_data/locks/2031-Q2/${B17_BKT}/${B17_FILE}.lock")"
+stop_php_server
+assert_eq "$B17_C1" "404" "CLI router returns 404 for /anchors/<id>.bin when lock.enabled=false"
+assert_eq "$B17_C2" "404" "CLI router returns 404 for /<data_dir>/anchors/<id>.bin when lock.enabled=false"
+assert_eq "$B17_C3" "404" "CLI router returns 404 for /<data_dir>/locks/.../*.lock when lock.enabled=false"
+assert_eq "$B17_C4" "405" "CLI router rejects POST on /anchors/<id>.bin with 405"
+assert_eq "$B17_C5" "405" "CLI router rejects POST on /<data_dir>/locks/.../*.lock with 405"
+
+echo ""
 echo "All PHP lock concurrency, rollback, quota & GC tests passed! (${PASS} assertions)"

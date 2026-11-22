@@ -1238,6 +1238,17 @@ impl SyncDb {
 
             precondition.evaluate(live_existing.map(|em| em.etag.as_str()))?;
 
+            if max_user_count == 0 {
+                return Err(DbError::http(507, "Media user quota exceeded"));
+            }
+            let max_channel_bytes = cfg.media_channel_max_bytes();
+            if max_channel_bytes == 0 || (data.len() as u64) > max_channel_bytes {
+                return Err(DbError::http(
+                    507,
+                    "Media exceeds total media channel capacity",
+                ));
+            }
+
             let mut evicted = 0usize;
             // Evict user's own oldest media if per-user count or bytes exceeded
             loop {
@@ -1251,7 +1262,7 @@ impl SyncDb {
                         user_media.push(m);
                     }
                 }
-                let need_count = max_user_count > 0 && user_media.len() >= max_user_count;
+                let need_count = user_media.len() >= max_user_count;
                 let need_bytes = user_bytes.saturating_add(data.len() as u64) > max_user_bytes;
                 if !need_count && !need_bytes {
                     break;
@@ -1267,55 +1278,46 @@ impl SyncDb {
             }
 
             // Enforce media channel global cap
-            let max_channel_bytes = cfg.media_channel_max_bytes();
-            if max_channel_bytes > 0 {
-                if (data.len() as u64) > max_channel_bytes {
-                    return Err(DbError::http(
-                        507,
-                        "Media exceeds total media channel capacity",
-                    ));
+            let mut free_cache: BTreeMap<String, bool> = BTreeMap::new();
+            loop {
+                let mut all_media: Vec<(MediaMetaRecord, bool)> = Vec::new();
+                let mut total_media_bytes = 0u64;
+                for entry in media_meta.iter()? {
+                    let (_, val) = entry?;
+                    let m: MediaMetaRecord = serde_json::from_slice(val.value())?;
+                    if m.media_id != media_id {
+                        total_media_bytes = total_media_bytes.saturating_add(m.size as u64);
+                        let is_free = is_owner_free_pool(
+                            cfg,
+                            &admin_table,
+                            &reg_table,
+                            &mut free_cache,
+                            &m.owner_pubkey,
+                            now_secs,
+                        )?;
+                        all_media.push((m, is_free));
+                    }
                 }
-                let mut free_cache: BTreeMap<String, bool> = BTreeMap::new();
-                loop {
-                    let mut all_media: Vec<(MediaMetaRecord, bool)> = Vec::new();
-                    let mut total_media_bytes = 0u64;
-                    for entry in media_meta.iter()? {
-                        let (_, val) = entry?;
-                        let m: MediaMetaRecord = serde_json::from_slice(val.value())?;
-                        if m.media_id != media_id {
-                            total_media_bytes = total_media_bytes.saturating_add(m.size as u64);
-                            let is_free = is_owner_free_pool(
-                                cfg,
-                                &admin_table,
-                                &reg_table,
-                                &mut free_cache,
-                                &m.owner_pubkey,
-                                now_secs,
-                            )?;
-                            all_media.push((m, is_free));
-                        }
+                if total_media_bytes.saturating_add(data.len() as u64) <= max_channel_bytes {
+                    break;
+                }
+                all_media.sort_by_key(|(m, is_free)| {
+                    (
+                        !*is_free,
+                        m.last_access_at,
+                        m.created_at,
+                        m.media_id.clone(),
+                    )
+                });
+                if let Some((victim, victim_free)) = all_media.first() {
+                    if access.profile.is_free_pool && !*victim_free {
+                        return Err(DbError::http(507, "Free media pool exhausted"));
                     }
-                    if total_media_bytes.saturating_add(data.len() as u64) <= max_channel_bytes {
-                        break;
-                    }
-                    all_media.sort_by_key(|(m, is_free)| {
-                        (
-                            !*is_free,
-                            m.last_access_at,
-                            m.created_at,
-                            m.media_id.clone(),
-                        )
-                    });
-                    if let Some((victim, victim_free)) = all_media.first() {
-                        if access.profile.is_free_pool && !*victim_free {
-                            return Err(DbError::http(507, "Free media pool exhausted"));
-                        }
-                        media_meta.remove(victim.media_id.as_str())?;
-                        media_data.remove(victim.media_id.as_str())?;
-                        evicted += 1;
-                    } else {
-                        return Err(DbError::http(507, "Media channel quota exceeded"));
-                    }
+                    media_meta.remove(victim.media_id.as_str())?;
+                    media_data.remove(victim.media_id.as_str())?;
+                    evicted += 1;
+                } else {
+                    return Err(DbError::http(507, "Media channel quota exceeded"));
                 }
             }
 

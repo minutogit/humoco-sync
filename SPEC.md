@@ -168,7 +168,7 @@ HUMOCO-SLOT-ACK-V1\n<lock_pub>\n<pubkey>\n<prefix_or_empty>\n<channel>\n<etag>\n
 ## 3. Channel Priorities, Quotas & Eviction
 
 - **Priority 1 (`backup`, `post`, `wot`)** and **Priority 2 (`card`)**: Protected. When storage quota is tight, uploading Prio 1/2 slots automatically evicts the oldest **Priority 3 (`media`)** blobs via LRU before returning `507 Insufficient Storage`.
-- **Priority 3 (`media`)**: Ephemeral encrypted image blobs (`max_user_count`, `max_user_bytes`, `max_channel_mb`, plus `max_total_storage_mb`). Acts as a 3-stage ring buffer in both PHP and Rust: uploading a new `media` blob after upfront size feasibility checks automatically evicts the caller's oldest `media` blobs for per-user `max_user_count`/`max_user_bytes`, and globally oldest `media` blobs for `max_channel_mb` and `max_total_storage_mb`. Ownership is tracked per `media_id` (`403` if another or unauthorized pubkey attempts overwrite/delete). Never included in `index.json`.
+- **Priority 3 (`media`)**: Ephemeral encrypted image blobs (`max_user_count`, `max_user_bytes`, `max_channel_mb`, plus `max_total_storage_mb`). While `ttl_days = 0` disables expiry, media capacity limits (`max_user_count`, `max_user_bytes`, `max_channel_mb`) are strict fail-closed bounds (`0` immediately rejects `PUT media` with `507 Insufficient Storage` in both PHP and Rust without evicting existing blobs). Acts as a 3-stage ring buffer in both PHP and Rust: uploading a new `media` blob after upfront size feasibility checks automatically evicts the caller's oldest `media` blobs for per-user `max_user_count`/`max_user_bytes`, and globally oldest `media` blobs for `max_channel_mb` and `max_total_storage_mb`. Ownership is tracked per `media_id` (`403` if another or unauthorized pubkey attempts overwrite/delete). Never included in `index.json`.
 
 ---
 
@@ -427,7 +427,7 @@ The Lock Channel provides a blind, write-once, voucher-pinned collision registry
   1. configured `admin_pubkey`,
   2. an `admin_app` member on channel `lock`, or
   3. an active `registered` user whose account is not downgraded/disabled.
-  *(If server config enables `allow_pow_tickets = true`, an unauthenticated request carrying `pow_timestamp` (`|now - pow_timestamp| <= 300`) and `pow_nonce: u64` satisfying `leading_zero_bits(SHA-256(b"HUMOCO_LOCK_TICKET_POW_V1" || anchor_id (32B) || retain_until_quarter_le (2B) || pow_timestamp_le (8B) || pow_nonce_le (8B))) >= lock_ticket_pow_bits` is also accepted; the server records `SHA-256(pow_tuple)` in the 120s replay table to reject PoW replays.)*
+  *(If server config enables `allow_pow_tickets = true`, an unauthenticated request carrying `pow_timestamp` (`|now - pow_timestamp| <= 300`) and `pow_nonce: u64` satisfying `leading_zero_bits(SHA-256(b"HUMOCO_LOCK_TICKET_POW_V1" || anchor_id (32B) || retain_until_quarter_le (2B) || pow_timestamp_le (8B) || pow_nonce_le (8B))) >= lock_ticket_pow_bits` is also accepted; the server records `SHA-256(pow_tuple)` in the 600s replay table to reject PoW replays.)*
 - **Request JSON:**
   ```json
   {

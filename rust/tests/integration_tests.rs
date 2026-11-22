@@ -13,7 +13,7 @@ use humoco_sync_server::crypto::{
     format_delete_account_message, parse_member_message, random_hex, sha256_hex, unix_now,
     RevocationNotice, RevocationReplacementTarget,
 };
-use humoco_sync_server::db::ConditionalPrecondition;
+use humoco_sync_server::db::{ConditionalPrecondition, DbError};
 use humoco_sync_server::state::AppState;
 
 struct TestServer {
@@ -13652,4 +13652,152 @@ async fn test_s09_f4_web_register_admin_ui_and_admin_api_hardening() {
         .to_str()
         .unwrap()
         .contains("Rate+limit+exceeded"));
+}
+
+#[tokio::test]
+async fn test_parity_zero_media_caps_and_zero_rotation_timestamps() {
+    let (admin_sk, admin_pk) = gen_keypair();
+    let (user_sk, user_pk) = gen_keypair();
+    let now = unix_now() as i64;
+
+    // 1. Seed a live media blob under normal limits, then confirm max_user_count=0 -> 507
+    //    without evicting existing media (matching PHP's $maxUserCount < 1 check).
+    let mut cfg_seed = base_hybrid_config(&admin_pk);
+    cfg_seed.lock.enabled = true;
+    let srv_seed = TestServer::start(cfg_seed.clone()).await;
+    srv_seed
+        .state
+        .db
+        .put_admin_members(
+            &srv_seed.state.config,
+            "card",
+            std::slice::from_ref(&user_pk),
+            now as u64,
+        )
+        .unwrap();
+    let existing_media_id = sha256_hex(b"existing-media-blob");
+    let existing_bytes = vec![0xABu8; 64];
+    let put_existing_hdrs = sign_member_headers(
+        &user_sk,
+        "PUT",
+        "media",
+        "",
+        &existing_media_id,
+        now,
+        &existing_bytes,
+    );
+    let mut req_seed = srv_seed
+        .client
+        .put(format!("{}/sync.php", srv_seed.base_url))
+        .body(existing_bytes);
+    for (k, v) in put_existing_hdrs {
+        req_seed = req_seed.header(k, v);
+    }
+    assert_eq!(req_seed.send().await.unwrap().status().as_u16(), 200);
+
+    let mut cfg_zero_count = (*srv_seed.state.config).clone();
+    if let Some(prof) = cfg_zero_count.profiles.get_mut("friends") {
+        if let Some(mq) = prof.channels.get_mut("media") {
+            mq.max_user_count = Some(0);
+        }
+    }
+    let blocked_media_id = sha256_hex(b"blocked-zero-count");
+    let put_zero_count = srv_seed.state.db.put_media(
+        &cfg_zero_count,
+        &user_pk,
+        &blocked_media_id,
+        b"small-media",
+        &ConditionalPrecondition::None,
+        now as u64,
+    );
+    match put_zero_count {
+        Err(DbError::Http { status, .. }) => assert_eq!(
+            status, 507,
+            "max_user_count=0 must reject PUT media with 507 Insufficient Storage (PHP parity)"
+        ),
+        other => panic!("Expected 507 DbError::Http for max_user_count=0, got {other:?}"),
+    }
+    assert!(
+        srv_seed
+            .state
+            .db
+            .get_media_blob(&cfg_zero_count, &existing_media_id, now as u64)
+            .unwrap()
+            .is_some(),
+        "max_user_count=0 rejection must NOT evict existing user media"
+    );
+
+    // 2. media.max_channel_mb = 0 -> 507 without evicting existing user media
+    let mut cfg_zero_chan = (*srv_seed.state.config).clone();
+    cfg_zero_chan.media.max_channel_mb = 0;
+    let put_zero_chan = srv_seed.state.db.put_media(
+        &cfg_zero_chan,
+        &user_pk,
+        &blocked_media_id,
+        b"small-media",
+        &ConditionalPrecondition::None,
+        now as u64,
+    );
+    match put_zero_chan {
+        Err(DbError::Http { status, .. }) => assert_eq!(
+            status, 507,
+            "media.max_channel_mb=0 must reject PUT media with 507 Insufficient Storage (PHP parity)"
+        ),
+        other => panic!("Expected 507 DbError::Http for max_channel_mb=0, got {other:?}"),
+    }
+    assert!(
+        srv_seed
+            .state
+            .db
+            .get_media_blob(&cfg_zero_chan, &existing_media_id, now as u64)
+            .unwrap()
+            .is_some(),
+        "max_channel_mb=0 rejection must NOT evict existing media"
+    );
+
+    // 3. Explicit zero timestamps on ?lock_freeze heartbeat/veto -> 400 Bad Request (PHP parity)
+    let _ = admin_sk;
+    let anchor_hex = "aa".repeat(32);
+    let zero_hb = srv_seed
+        .client
+        .post(format!("{}/sync.php?lock_freeze", srv_seed.base_url))
+        .json(&serde_json::json!({
+            "action": "heartbeat",
+            "heartbeat": {
+                "anchor_id": anchor_hex,
+                "timestamp_secs": 0,
+                "sig": "11".repeat(64),
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        zero_hb.status().as_u16(),
+        400,
+        "heartbeat.timestamp_secs=0 must reject with 400 Bad Request (PHP parity)"
+    );
+
+    let zero_veto = srv_seed
+        .client
+        .post(format!("{}/sync.php?lock_freeze", srv_seed.base_url))
+        .json(&serde_json::json!({
+            "action": "veto",
+            "veto": {
+                "anchor_id": anchor_hex,
+                "from_rev": 1,
+                "proposal_hash": "22".repeat(32),
+                "vetoer_pub": "33".repeat(32),
+                "vetoed_at": 0,
+                "sig": "44".repeat(64),
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        zero_veto.status().as_u16(),
+        400,
+        "veto.vetoed_at=0 must reject with 400 Bad Request (PHP parity)"
+    );
 }
