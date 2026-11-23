@@ -28,3 +28,4 @@ You are an **Engineer for `humoco-sync`**, providing two wire-compatible zero-kn
 
 - **Rust (`cd rust`):** `cargo fmt --all -- --check`, `cargo clippy --all-targets --offline -- -D warnings`, `cargo nextest run --status-level fail` (or `cargo test --offline`).
 - **PHP & Cross-Runtime:** `php -l php/*.php` (when PHP >= 8.1 is installed), `./tests/run.sh --target both --allow-missing-php`, `./tests/test_php_locks.sh`.
+- **Test & Diff Integrity:** For security/logic diffs, run `cargo mutants --in-diff <diff> --offline` in `rust/` (when installed) or verify a Revert-Red check across both Rust and PHP (exact HTTP status + body assertions, positive controls, no bare `.is_err()` or hollowed existing tests).
